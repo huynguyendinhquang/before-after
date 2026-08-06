@@ -1,0 +1,73 @@
+{
+  "name": "viengut_case",
+  "width_mm": 297,
+  "height_mm": 210,
+  "background": "#ffffff",
+  "border_px": 2,
+  "border_color": "#1a1a1a",
+  "gap_label_mm": 1.2,
+  "label_pt": 10,
+  "title": {
+    "x_mm": 8,
+    "y_mm": 5,
+    "pt": 18,
+    "color": "#111111",
+    "default": "Patient - YYYY - ID - City"
+  },
+  "slots": [
+    {
+      "id": "portrait",
+      "x": 8,
+      "y": 18,
+      "w": 95,
+      "h": 175,
+      "fit": "cover",
+      "label": ""
+    },
+    {
+      "id": "clinical_1",
+      "x": 108,
+      "y": 18,
+      "w": 58,
+      "h": 78,
+      "fit": "cover",
+      "label": ""
+    },
+    {
+      "id": "clinical_2",
+      "x": 170,
+      "y": 18,
+      "w": 58,
+      "h": 78,
+      "fit": "cover",
+      "label": ""
+    },
+    {
+      "id": "clinical_3",
+      "x": 232,
+      "y": 18,
+      "w": 58,
+      "h": 78,
+      "fit": "cover",
+      "label": ""
+    },
+    {
+      "id": "xray_1",
+      "x": 108,
+      "y": 108,
+      "w": 90,
+      "h": 78,
+      "fit": "contain",
+      "label": ""
+    },
+    {
+      "id": "xray_2",
+      "x": 202,
+      "y": 108,
+      "w": 88,
+      "h": 78,
+      "fit": "contain",
+      "label": ""
+    }
+  ]
+}
