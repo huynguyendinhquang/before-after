@@ -6,6 +6,7 @@ import json
 import io
 import math
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ MAX_FONT_PT = 200
 
 
 def _is_finite_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return False
     try:
         return math.isfinite(value)
@@ -483,6 +484,7 @@ class CanvasRenderSpec:
     show_patient_name: bool = False
     show_birth_year: bool = False
     background: str = "#ffffff"
+    version: int | None = None
 
 
 # Names used by callers that describe the same persistence-independent data.
@@ -629,17 +631,19 @@ def cover_crop_normalized(
     try:
         source_width, source_height = work.size
         scale = max(target_width / source_width, target_height / source_height) * zoom
-        scaled_width = max(target_width, int(round(source_width * scale)))
-        scaled_height = max(target_height, int(round(source_height * scale)))
-        resized = work.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
-        try:
-            extra_x = scaled_width - target_width
-            extra_y = scaled_height - target_height
-            left = int(round(extra_x * (pan_x + 1.0) / 2.0))
-            top = int(round(extra_y * (pan_y + 1.0) / 2.0))
-            return resized.crop((left, top, left + target_width, top + target_height))
-        finally:
-            resized.close()
+        crop_width = max(1, int(round(target_width / scale)))
+        crop_height = max(1, int(round(target_height / scale)))
+        crop_width = min(source_width, crop_width)
+        crop_height = min(source_height, crop_height)
+        extra_x = source_width - crop_width
+        extra_y = source_height - crop_height
+        left = int(round(extra_x * (pan_x + 1.0) / 2.0))
+        top = int(round(extra_y * (pan_y + 1.0) / 2.0))
+        return work.resize(
+            (target_width, target_height),
+            Image.Resampling.LANCZOS,
+            box=(left, top, left + crop_width, top + crop_height),
+        )
     finally:
         work.close()
 

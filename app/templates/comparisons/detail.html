@@ -7,23 +7,26 @@
     <span class="muted">{{ 'Editor' if can_edit else 'Read-only' }}</span>
   </div>
   <p class="muted">Patient {{ patient.patient_id }} · {{ patient.name }} · {{ patient.birth_year }}</p>
+  <input id="current-version" type="hidden" value="{{ comparison_set.version }}">
+
   {% if comparison_set.lock_holder_id and not can_edit %}
     <p class="flash">This Set is being edited by {{ comparison_set.lock_holder.display_name }}. You can view it, but not save changes.</p>
   {% endif %}
 
   {% if can_edit %}
-  <form id="canvas-editor" data-save-url="{{ url_for('comparisons.save', set_pk=comparison_set.id) }}" data-heartbeat-url="{{ url_for('comparisons.lease_heartbeat', set_pk=comparison_set.id) }}" data-preview-url="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}">
+  <form id="canvas-editor" method="post" action="{{ url_for('comparisons.save', set_pk=comparison_set.id) }}" data-heartbeat-url="{{ url_for('comparisons.lease_heartbeat', set_pk=comparison_set.id) }}" data-preview-url="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
     <label for="set-title">Set title</label>
     <input id="set-title" name="title" value="{{ comparison_set.name }}" maxlength="200">
 
     <h2>Canvas and grid</h2>
     <label for="preset-key">Canvas preset</label>
     <select id="preset-key" name="preset_key">
-      {% for key, label in [('16:9', '16:9'), ('16:10', '16:10'), ('a4-landscape', 'A4 landscape'), ('a4-portrait', 'A4 portrait'), ('custom', 'Custom (mm)')] %}
-        <option value="{{ key }}"{% if comparison_set.preset_key == key %} selected{% endif %}>{{ label }}</option>
+      {% for key, dimensions in canvas_presets.items() %}
+        <option value="{{ key }}"{% if comparison_set.preset_key == key %} selected{% endif %}>{{ key|replace('-', ' ')|title }}</option>
       {% endfor %}
+      <option value="custom"{% if comparison_set.preset_key == 'custom' %} selected{% endif %}>Custom (mm)</option>
     </select>
     <label for="canvas-width">Canvas width (mm)</label>
     <input id="canvas-width" name="canvas_width_mm" type="number" min="0.01" step="0.01" value="{{ comparison_set.canvas_width_mm }}">
@@ -33,10 +36,10 @@
     <input id="frame-ratio" name="frame_ratio" type="number" min="0.01" step="0.01" value="{{ comparison_set.frame_ratio }}">
     <label for="columns">Columns</label>
     <input id="columns" name="columns" type="number" min="1" max="100" step="1" value="{{ comparison_set.columns }}">
-    <label><input type="checkbox" name="show_patient_id"{% if comparison_set.show_patient_id %} checked{% endif %}> Show Patient ID</label>
-    <label><input type="checkbox" name="show_patient_name"{% if comparison_set.show_patient_name %} checked{% endif %}> Show Patient name</label>
-    <label><input type="checkbox" name="show_birth_year"{% if comparison_set.show_birth_year %} checked{% endif %}> Show birth year</label>
-    <label><input type="checkbox" name="date_label_default"{% if comparison_set.date_label_default %} checked{% endif %}> Show Capture Date by default</label>
+    <label><input type="hidden" name="show_patient_id" value="false"><input type="checkbox" name="show_patient_id" value="true"{% if comparison_set.show_patient_id %} checked{% endif %}> Show Patient ID</label>
+    <label><input type="hidden" name="show_patient_name" value="false"><input type="checkbox" name="show_patient_name" value="true"{% if comparison_set.show_patient_name %} checked{% endif %}> Show Patient name</label>
+    <label><input type="hidden" name="show_birth_year" value="false"><input type="checkbox" name="show_birth_year" value="true"{% if comparison_set.show_birth_year %} checked{% endif %}> Show birth year</label>
+    <label><input type="hidden" name="date_label_default" value="false"><input type="checkbox" name="date_label_default" value="true"{% if comparison_set.date_label_default %} checked{% endif %}> Show Capture Date by default</label>
 
     <h2>Frames</h2>
     {% if comparison_set.frames %}
@@ -66,38 +69,43 @@
         </tbody>
       </table>
       <p class="muted">Use the existing Up/Down controls below to change order. Crop values are normalized and the server owns final geometry.</p>
-      <table>
-        <thead><tr><th>Frame</th><th>Order</th></tr></thead>
-        <tbody>
-        {% for frame in comparison_set.frames %}
-          <tr><td>{{ frame.capture.capture_date }} — {{ frame.capture.shot_type.name }}</td><td>
-            <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-              <input type="hidden" name="version" value="{{ comparison_set.version }}">
-              {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
-              <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
-              {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
-              {% if not loop.last %}<button type="submit" name="direction" value="down">Down</button>{% endif %}
-            </form>
-          </td></tr>
-        {% endfor %}
-        </tbody>
-      </table>
     {% else %}
       <p class="muted">No Frames in this Set yet.</p>
     {% endif %}
     <button type="submit">Save Canvas and Frames</button>
     <span id="save-status" class="muted" role="status"></span>
   </form>
+
+  {% if comparison_set.frames %}
+  <h2>Frame order</h2>
+  <table>
+    <thead><tr><th>Frame</th><th>Order</th></tr></thead>
+    <tbody>
+    {% for frame in comparison_set.frames %}
+      <tr><td>{{ frame.capture.capture_date }} — {{ frame.capture.shot_type.name }}</td><td>
+        <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}" data-reorder-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
+          {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
+          <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
+          {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
+          {% if not loop.last %}<button type="submit" name="direction" value="down">Down</button>{% endif %}
+        </form>
+      </td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
   <h2>Server preview</h2>
   <img id="server-preview" src="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Persisted Comparison Set preview" style="max-width:100%;height:auto">
 
   <hr>
   <h2>Add Frame</h2>
   <p class="muted">Choose one existing Capture, or upload one new image. A new image is first saved through the Capture Library workflow and then referenced here.</p>
-  <form method="post" action="{{ url_for('comparisons.add_frame_route', set_pk=comparison_set.id) }}" enctype="multipart/form-data" novalidate>
+  <form method="post" action="{{ url_for('comparisons.add_frame_route', set_pk=comparison_set.id) }}" enctype="multipart/form-data" novalidate data-add-frame-form>
     {{ frame_form.hidden_tag() }}
-    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
     <label for="capture_id">Existing Capture</label>
     <select id="capture_id" name="capture_id">
       <option value="">Choose an existing Capture</option>
@@ -122,6 +130,13 @@
     <label>{{ frame_form.create_proposal() }} {{ frame_form.create_proposal.label.text }}</label>
     {{ frame_form.submit() }}
   </form>
+  {% elif can_acquire %}
+    <p class="muted">Editing requires an active five-minute lease for this Set.</p>
+    <form method="post" action="{{ url_for('comparisons.lease_acquire', set_pk=comparison_set.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
+      <button type="submit">Acquire edit lease</button>
+    </form>
   {% else %}
     <dl>
       <dt>Canvas</dt><dd>{{ comparison_set.canvas_width_mm }} × {{ comparison_set.canvas_height_mm }} mm ({{ comparison_set.preset_key }})</dd>
@@ -141,13 +156,18 @@
 (() => {
   const editor = document.getElementById("canvas-editor");
   const csrf = editor.querySelector('input[name="csrf_token"]').value;
-  const version = () => Number(editor.querySelector('input[name="version"]').value);
+  const currentVersion = document.getElementById('current-version');
+  const version = () => Number(currentVersion.value);
+  const setVersion = (next) => {
+    currentVersion.value = String(next);
+    document.querySelectorAll('[data-version-token]').forEach((input) => { input.value = String(next); });
+  };
   const clamp = (value, low, high) => Math.min(high, Math.max(low, Number.isFinite(value) ? value : low));
   const state = () => ({
     title: editor.querySelector('[name="title"]').value,
     preset_key: editor.querySelector('[name="preset_key"]').value,
-    canvas_width_mm: Number(editor.querySelector('[name="canvas_width_mm"]').value),
-    canvas_height_mm: Number(editor.querySelector('[name="canvas_height_mm"]').value),
+    canvas_width_mm: editor.querySelector('[name="canvas_width_mm"]').value,
+    canvas_height_mm: editor.querySelector('[name="canvas_height_mm"]').value,
     frame_ratio: Number(editor.querySelector('[name="frame_ratio"]').value),
     columns: Number(editor.querySelector('[name="columns"]').value),
     show_patient_id: editor.querySelector('[name="show_patient_id"]').checked,
@@ -172,18 +192,22 @@
     event.preventDefault();
     const status = document.getElementById('save-status');
     status.textContent = 'Saving…';
-    const response = await fetch(editor.dataset.saveUrl, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf}, body: JSON.stringify({...state(), version: version()})});
+    const response = await fetch(editor.action, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf}, body: JSON.stringify({...state(), version: version()})});
     if (response.status === 409) { status.textContent = 'Set changed or is locked; reload to continue.'; editor.querySelector('button[type="submit"]').disabled = true; return; }
     if (!response.ok) { status.textContent = 'Could not save.'; return; }
     const result = await response.json();
-    editor.querySelector('[name="version"]').value = result.version;
+    setVersion(result.version);
     document.getElementById('server-preview').src = `${editor.dataset.previewUrl}?version=${result.version}`;
     status.textContent = `Saved version ${result.version}.`;
   };
   editor.addEventListener('submit', save);
   window.setInterval(async () => {
-    const response = await fetch(editor.dataset.heartbeatUrl, {method: 'POST', headers: {'X-CSRFToken': csrf}});
-    if (response.status === 409) { editor.querySelector('button[type="submit"]').disabled = true; document.getElementById('save-status').textContent = 'Edit lease expired.'; }
+    const response = await fetch(editor.dataset.heartbeatUrl, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf}, body: JSON.stringify({version: version()})});
+    if (response.status === 409) { editor.querySelector('button[type="submit"]').disabled = true; document.getElementById('save-status').textContent = 'Edit lease expired.'; return; }
+    if (response.ok) {
+      const result = await response.json();
+      setVersion(result.version);
+    }
   }, 60 * 1000);
 })();
 </script>

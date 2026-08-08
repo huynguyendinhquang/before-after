@@ -14,15 +14,19 @@ from PIL import Image
 from sqlalchemy import create_engine, select, text
 
 from app import create_app
-from app.board import CanvasRenderSpec, FrameRenderSpec, cover_crop_normalized, layout_frames, render_canvas
+from app.board import CanvasRenderSpec, FrameRenderSpec, cover_crop_normalized, layout_frames
 from app.comparisons import (
+    ComparisonError,
     EditLeaseError,
+    PreviewLimitError,
     StaleVersionError,
     acquire_edit_lease,
     add_frame,
     create_comparison_set,
     render_persisted_set,
+    render_spec_for_set,
     save_comparison_set,
+    _canvas_values,
 )
 from app.captures import create_capture
 from app.db import db, normalize_database_url
@@ -144,6 +148,23 @@ def fixture_capture(application, user_id: int, patient_id: int, day: str) -> int
         return capture.id
 
 
+def add_set_frame(actor: User, comparison_set: ComparisonSet, capture_id: int):
+    current = db.session.get(ComparisonSet, comparison_set.id)
+    assert current is not None
+    if current.lock_holder_id != actor.id:
+        current = acquire_edit_lease(
+            actor=actor,
+            comparison_set=current,
+            expected_version=current.version,
+        )
+    return add_frame(
+        actor=actor,
+        comparison_set=current,
+        capture_id=capture_id,
+        expected_version=current.version,
+    )
+
+
 def login(client, username: str) -> str:
     page = client.get("/login")
     token = CSRF_RE.search(page.get_data(as_text=True)).group(1)
@@ -194,6 +215,80 @@ def test_four_corner_crop_extremes_and_hidden_frames_are_deterministic() -> None
     assert geometry[-1].x_mm == pytest.approx(200 / 3)
 
 
+def test_custom_canvas_dimensions_use_decimal_validation() -> None:
+    key, width, height = _canvas_values(
+        preset_key="custom-mm",
+        width_mm="123.45",
+        height_mm="67.00",
+    )
+    assert key == "custom"
+    assert str(width) == "123.45"
+    assert str(height) == "67.00"
+    for value in ("0", "-1", "1.001", "1000000.00"):
+        with pytest.raises(ComparisonError):
+            _canvas_values(preset_key="custom", width_mm=value, height_mm="10")
+
+
+def test_custom_canvas_form_round_trip_and_invalid_values_are_controlled(app) -> None:
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    client = app.test_client()
+    token = login(client, "editor")
+    base = {
+        "preset_key": "custom",
+        "canvas_width_mm": "123.45",
+        "canvas_height_mm": "67.00",
+        "frame_ratio": "1",
+        "columns": "2",
+        "date_label_default": "y",
+        "csrf_token": token,
+    }
+    response = client.post(
+        f"/patients/{patient_id}/comparison-sets/new",
+        data={**base, "name": "Custom form"},
+    )
+    assert response.status_code == 302
+    with app.app_context():
+        saved = db.session.scalar(
+            select(ComparisonSet).where(ComparisonSet.name == "Custom form")
+        )
+        assert saved is not None
+        assert str(saved.canvas_width_mm) == "123.45"
+        assert str(saved.canvas_height_mm) == "67.00"
+
+    for index, value in enumerate(("0", "1.001", "1000000.00")):
+        response = client.post(
+            f"/patients/{patient_id}/comparison-sets/new",
+            data={**base, "name": f"Invalid {index}", "canvas_width_mm": value},
+        )
+        assert response.status_code == 400
+
+
+def test_add_frame_without_version_is_conflict(app) -> None:
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, "2024-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Add")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        set_id = comparison_set.id
+
+    client = app.test_client()
+    token = login(client, "editor")
+    response = client.post(
+        f"/comparison-sets/{set_id}/frames",
+        data={"capture_id": str(capture_id), "csrf_token": token},
+    )
+    assert response.status_code == 409
+
+
 def test_set_state_preview_and_original_checksum_survive_reload(app, tmp_path: Path):
     editor_id = add_user(app, "editor")
     patient_id = fixture_patient(app, editor_id)
@@ -207,7 +302,7 @@ def test_set_state_preview_and_original_checksum_survive_reload(app, tmp_path: P
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="History")
         for capture_id in capture_ids:
-            add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+            add_set_frame(actor, comparison_set, capture_id)
         comparison_set = db.session.get(ComparisonSet, comparison_set.id)
         assert comparison_set is not None
         original_sha = [capture.sha256 for capture in db.session.scalars(select(Capture).order_by(Capture.id))]
@@ -240,6 +335,7 @@ def test_set_state_preview_and_original_checksum_survive_reload(app, tmp_path: P
         assert reloaded.frames[1].zoom == 5
         assert [capture.sha256 for capture in db.session.scalars(select(Capture).order_by(Capture.id))] == original_sha
         expected_preview = render_persisted_set(reloaded, expected_version=version)
+        assert render_spec_for_set(reloaded, expected_version=version).version == version
         media_root = Path(app.config["MEDIA_ROOT"])
         original_keys = list(db.session.scalars(select(Capture.storage_key)))
 
@@ -265,10 +361,10 @@ def test_two_editors_cannot_save_and_stale_version_is_rejected(app):
         patient = db.session.get(Patient, patient_id)
         assert first is not None and second is not None and patient is not None
         comparison_set = create_comparison_set(actor=first, patient=patient, name="Locked")
-        add_frame(actor=first, comparison_set=comparison_set, capture_id=capture_id)
+        add_set_frame(first, comparison_set, capture_id)
         current = db.session.get(ComparisonSet, comparison_set.id)
         assert current is not None
-        acquire_edit_lease(actor=first, comparison_set=current)
+        acquire_edit_lease(actor=first, comparison_set=current, expected_version=current.version)
         current = db.session.get(ComparisonSet, current.id)
         assert current is not None
         with pytest.raises(EditLeaseError):
@@ -300,7 +396,11 @@ def test_expired_edit_lease_can_be_acquired(app):
         comparison_set.lock_holder_id = first.id
         comparison_set.lock_expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         db.session.commit()
-        acquired = acquire_edit_lease(actor=second, comparison_set=comparison_set)
+        acquired = acquire_edit_lease(
+            actor=second,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
         assert acquired.lock_holder_id == second.id
         assert acquired.lock_expires_at > datetime.now(timezone.utc)
 
@@ -322,6 +422,12 @@ def test_http_save_requires_the_active_lease_and_expected_version(app):
     first_token = login(first_client, "first")
     second_token = login(second_client, "second")
     assert first_client.get(f"/comparison-sets/{set_id}").status_code == 200
+    acquired = first_client.post(
+        f"/comparison-sets/{set_id}/lease/acquire",
+        data={"version": version},
+        headers={"X-CSRFToken": first_token},
+    )
+    assert acquired.status_code == 302
     blocked = second_client.post(
         f"/comparison-sets/{set_id}/save",
         json={"version": version, "title": "blocked"},
@@ -342,18 +448,114 @@ def test_http_save_requires_the_active_lease_and_expected_version(app):
     assert stale.status_code == 409
 
 
+def test_get_does_not_claim_lease_and_heartbeat_requires_version(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Lease")
+        set_id = comparison_set.id
+        version = comparison_set.version
+
+    client = app.test_client()
+    token = login(client, "editor")
+    assert client.get(f"/comparison-sets/{set_id}").status_code == 200
+    with app.app_context():
+        current = db.session.get(ComparisonSet, set_id)
+        assert current is not None and current.lock_holder_id is None
+
+    acquired = client.post(
+        f"/comparison-sets/{set_id}/lease/acquire",
+        json={"version": version},
+        headers={"X-CSRFToken": token},
+    )
+    assert acquired.status_code == 200
+    missing = client.post(
+        f"/comparison-sets/{set_id}/lease/heartbeat",
+        json={},
+        headers={"X-CSRFToken": token},
+    )
+    assert missing.status_code == 409
+    stale = client.post(
+        f"/comparison-sets/{set_id}/lease/heartbeat",
+        json={"version": version - 1},
+        headers={"X-CSRFToken": token},
+    )
+    assert stale.status_code == 409
+    renewed = client.post(
+        f"/comparison-sets/{set_id}/lease/heartbeat",
+        json={"version": version},
+        headers={"X-CSRFToken": token},
+    )
+    assert renewed.status_code == 200
+    assert renewed.json["version"] == version
+
+
+def test_preview_limits_are_checked_before_media_open(app, monkeypatch):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, "2024-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Bounded")
+        add_set_frame(actor, comparison_set, capture_id)
+        current = db.session.get(ComparisonSet, comparison_set.id)
+        assert current is not None
+        app.config["COMPARISON_PREVIEW_MAX_BYTES"] = 1
+        with monkeypatch.context() as patch:
+            opened = []
+            original_open = ManagedStorage.open_read
+
+            def tracked_open(storage, key):
+                opened.append(key)
+                return original_open(storage, key)
+
+            patch.setattr(ManagedStorage, "open_read", tracked_open)
+            with pytest.raises(PreviewLimitError):
+                render_persisted_set(current)
+            assert opened == []
+
+
 def test_renderer_applies_exif_before_geometry_without_mutating_source() -> None:
-    source = Image.new("RGB", (4, 2), "red")
+    source = Image.new("RGB", (4, 2))
+    pixels = source.load()
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+    for x, color in enumerate(colors):
+        pixels[x, 0] = color
+        pixels[x, 1] = color
     exif = source.getexif()
     exif[274] = 6
     before = source.tobytes()
-    spec = CanvasRenderSpec(20, 20, 1, 1, [FrameRenderSpec(1, image=source, zoom=1)])
-    rendered = render_canvas(spec, dpi=20)
+    oriented = cover_crop_normalized(source, 2, 4)
     try:
-        assert rendered.size == (15, 15)
+        assert oriented.size == (2, 4)
+        assert [oriented.getpixel((0, y)) for y in range(4)] == colors
         assert source.tobytes() == before
     finally:
-        rendered.close()
+        oriented.close()
+        source.close()
+
+
+def test_zoom_resize_is_bounded_to_the_destination(monkeypatch) -> None:
+    source = Image.new("RGB", (4000, 4000), "red")
+    calls = []
+    original_resize = Image.Image.resize
+
+    def tracked_resize(image, size, *args, **kwargs):
+        calls.append(size)
+        return original_resize(image, size, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "resize", tracked_resize)
+    result = cover_crop_normalized(source, 100, 100, zoom=5)
+    try:
+        assert result.size == (100, 100)
+        assert calls == [(100, 100)]
+    finally:
+        result.close()
         source.close()
 
 

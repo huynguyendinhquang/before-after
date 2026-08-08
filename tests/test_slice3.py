@@ -18,6 +18,7 @@ from app.comparisons import (
     ComparisonError,
     SamePatientError,
     StaleVersionError,
+    acquire_edit_lease,
     add_frame,
     create_comparison_set,
     reorder_frames,
@@ -166,6 +167,23 @@ def stored_capture(application, user_id: int, patient_id: int, payload: bytes, c
         return capture.id
 
 
+def add_frame_with_lease(actor: User, comparison_set: ComparisonSet, **values: object):
+    current = db.session.get(ComparisonSet, comparison_set.id)
+    assert current is not None
+    if current.lock_holder_id != actor.id:
+        current = acquire_edit_lease(
+            actor=actor,
+            comparison_set=current,
+            expected_version=current.version,
+        )
+    return add_frame(
+        actor=actor,
+        comparison_set=current,
+        expected_version=current.version,
+        **values,
+    )
+
+
 def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tmp_path, migrated_test_database):
     editor_id = add_user(app, "editor", "editor")
     add_user(app, "viewer", "viewer")
@@ -181,13 +199,26 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="History")
         set_id = comparison_set.id
+        set_version = comparison_set.version
 
     token = csrf_token(client, f"/comparison-sets/{set_id}")
+    acquired = client.post(
+        f"/comparison-sets/{set_id}/lease/acquire",
+        data={"version": str(set_version), "csrf_token": token},
+    )
+    assert acquired.status_code == 302
+
+    token = csrf_token(client, f"/comparison-sets/{set_id}")
+    with app.app_context():
+        set_version = db.session.get(ComparisonSet, set_id).version
     response = client.post(
         f"/comparison-sets/{set_id}/frames",
-        data={"capture_id": str(existing_id), "csrf_token": token},
+        data={"capture_id": str(existing_id), "version": str(set_version), "csrf_token": token},
     )
     assert response.status_code == 302
+
+    with app.app_context():
+        set_version = db.session.get(ComparisonSet, set_id).version
 
     new_payload = jpeg("red")
     response = client.post(
@@ -197,6 +228,7 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
             "capture_date": "2024-01-01",
             "capture_date_confirmed": "y",
             "shot_type_name": "Anterior",
+            "version": str(set_version),
             "csrf_token": token,
         },
         content_type="multipart/form-data",
@@ -247,6 +279,16 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
     restarted = create_app(app_config(tmp_path, migrated_test_database))
     restarted_client = restarted.test_client()
     login(restarted_client, "editor")
+    with restarted.app_context():
+        reopened = db.session.get(ComparisonSet, set_id)
+        assert reopened is not None
+        reopened_version = reopened.version
+    restart_token = csrf_token(restarted_client, f"/comparison-sets/{set_id}")
+    acquired = restarted_client.post(
+        f"/comparison-sets/{set_id}/lease/acquire",
+        data={"version": str(reopened_version), "csrf_token": restart_token},
+    )
+    assert acquired.status_code == 302
     detail = restarted_client.get(f"/comparison-sets/{set_id}")
     assert detail.status_code == 200
     assert detail.headers["Cache-Control"] == "no-store"
@@ -282,7 +324,7 @@ def test_cross_patient_frame_and_duplicate_active_name_are_rejected(app):
         assert actor is not None and first_patient is not None and second_patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=first_patient, name="Summary")
         with pytest.raises(SamePatientError):
-            add_frame(actor=actor, comparison_set=comparison_set, capture_id=other_capture_id)
+            add_frame_with_lease(actor, comparison_set, capture_id=other_capture_id)
         with pytest.raises(ComparisonError, match="already exists"):
             create_comparison_set(actor=actor, patient=first_patient, name=" summary ")
         assert db.session.scalar(select(func.count(Frame.id))) == 0
@@ -303,6 +345,11 @@ def test_inline_capture_and_frame_share_one_commit_and_failed_media_is_discarded
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Atomic")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
         commit_count: list[int] = []
         original_commit = db.session.commit
 
@@ -311,9 +358,9 @@ def test_inline_capture_and_frame_share_one_commit_and_failed_media_is_discarded
             original_commit()
 
         monkeypatch.setattr(db.session, "commit", count_commit)
-        add_frame(
-            actor=actor,
-            comparison_set=comparison_set,
+        add_frame_with_lease(
+            actor,
+            comparison_set,
             upload=jpeg("red"),
             capture_date="2024-01-01",
             capture_date_confirmed=True,
@@ -334,9 +381,9 @@ def test_inline_capture_and_frame_share_one_commit_and_failed_media_is_discarded
 
         monkeypatch.setattr(db.session, "commit", fail_commit)
         with pytest.raises(RuntimeError, match="outer commit failed"):
-            add_frame(
-                actor=actor,
-                comparison_set=comparison_set,
+            add_frame_with_lease(
+                actor,
+                comparison_set,
                 upload=jpeg("green"),
                 capture_date="2024-02-01",
                 capture_date_confirmed=True,
@@ -362,6 +409,11 @@ def test_inline_commit_raise_after_commit_returns_success(app, monkeypatch: pyte
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Commit")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
         original_commit = db.session.commit
 
         def commit_then_raise() -> None:
@@ -369,9 +421,9 @@ def test_inline_commit_raise_after_commit_returns_success(app, monkeypatch: pyte
             raise RuntimeError("commit completed")
 
         monkeypatch.setattr(db.session, "commit", commit_then_raise)
-        frame = add_frame(
-            actor=actor,
-            comparison_set=comparison_set,
+        frame = add_frame_with_lease(
+            actor,
+            comparison_set,
             upload=jpeg("red"),
             capture_date="2024-01-01",
             capture_date_confirmed=True,
@@ -403,9 +455,9 @@ def test_inline_finalize_failure_returns_committed_success_and_preserves_marker(
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Finalize")
-        frame = add_frame(
-            actor=actor,
-            comparison_set=comparison_set,
+        frame = add_frame_with_lease(
+            actor,
+            comparison_set,
             upload=jpeg("red"),
             capture_date="2024-01-01",
             capture_date_confirmed=True,
@@ -438,11 +490,16 @@ def test_inline_inconclusive_commit_preserves_pending_media(app, monkeypatch: py
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Unknown")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
         monkeypatch.setattr(db.session, "commit", fail_commit)
         with pytest.raises(CaptureReconciliationError, match="preserved"):
-            add_frame(
-                actor=actor,
-                comparison_set=comparison_set,
+            add_frame_with_lease(
+                actor,
+                comparison_set,
                 upload=jpeg("red"),
                 capture_date="2024-01-01",
                 capture_date_confirmed=True,
@@ -468,7 +525,7 @@ def test_reorder_rolls_back_direct_call_validation_and_stale_failures(app):
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Locks")
-        frame = add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+        frame = add_frame_with_lease(actor, comparison_set, capture_id=capture_id)
         version = db.session.get(ComparisonSet, comparison_set.id).version
 
         with pytest.raises(StaleVersionError):
@@ -510,9 +567,9 @@ def test_json_reorder_requires_positive_integer_frame_ids(app):
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="JSON")
-        frame = add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+        frame = add_frame_with_lease(actor, comparison_set, capture_id=capture_id)
         set_id = comparison_set.id
-        version = comparison_set.version
+        version = db.session.get(ComparisonSet, set_id).version
         frame_id = frame.id
 
     token = csrf_token(client, f"/comparison-sets/{set_id}")
@@ -548,7 +605,7 @@ def test_manual_frame_order_is_preserved_and_stale_versions_are_rejected(app):
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Manual")
         set_id = comparison_set.id
         for capture_id in capture_ids:
-            add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+            add_frame_with_lease(actor, comparison_set, capture_id=capture_id)
         frames = list(
             db.session.scalars(
                 select(Frame).where(Frame.comparison_set_id == set_id).order_by(Frame.position)
@@ -576,7 +633,7 @@ def test_manual_frame_order_is_preserved_and_stale_versions_are_rejected(app):
         actor = db.session.get(User, editor_id)
         comparison_set = db.session.get(ComparisonSet, set_id)
         assert actor is not None and comparison_set is not None
-        add_frame(actor=actor, comparison_set=comparison_set, capture_id=appended_capture_id)
+        add_frame_with_lease(actor, comparison_set, capture_id=appended_capture_id)
         final_frames = list(
             db.session.scalars(
                 select(Frame).where(Frame.comparison_set_id == set_id).order_by(Frame.position)
@@ -601,11 +658,18 @@ def test_capture_reload_and_canvas_precision_validation(app):
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         comparison_set = create_comparison_set(actor=actor, patient=patient, name="Validation")
-        supplied = db.session.get(Capture, other_capture_id)
-        assert supplied is not None
-        supplied.patient_id = patient_id
+        leased = acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
         with pytest.raises(SamePatientError):
-            add_frame(actor=actor, comparison_set=comparison_set, capture=supplied)
+            add_frame(
+                actor=actor,
+                comparison_set=comparison_set,
+                capture_id=other_capture_id,
+                expected_version=leased.version,
+            )
         db.session.rollback()
 
         with pytest.raises(ComparisonError, match="2 decimal places"):

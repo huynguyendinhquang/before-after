@@ -26,6 +26,7 @@ from wtforms.validators import Length, Optional
 from app.audit import append_audit
 from app.auth import editor_required
 from app.board import (
+    CANVAS_PRESETS,
     CanvasRenderSpec,
     FrameRenderSpec,
     canvas_dimensions,
@@ -43,10 +44,16 @@ from app.captures import (
 )
 from app.db import db
 from app.models import Capture, ComparisonSet, Frame, Patient, User
+from app.image_policy import ImagePolicyError, read_bounded
 from app.storage import ImageInspection, ManagedStorage, StorageError
 
 
 comparisons_bp = Blueprint("comparisons", __name__)
+
+
+@comparisons_bp.app_context_processor
+def comparison_template_context() -> dict[str, object]:
+    return {"canvas_presets": CANVAS_PRESETS}
 
 
 class ComparisonError(ValueError):
@@ -65,8 +72,14 @@ class EditLeaseError(ComparisonError):
     """Raised when another Editor owns the Set's edit lease."""
 
 
+class PreviewLimitError(ComparisonError):
+    """Raised when a preview exceeds its configured resource budget."""
+
+
 EDIT_LEASE_SECONDS = 5 * 60
 DEFAULT_RENDER_DPI = 150
+DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES = 100
+DEFAULT_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
 
 
 class ComparisonSetForm(FlaskForm):
@@ -160,7 +173,7 @@ def _locked_comparison_set(comparison_set: ComparisonSet) -> ComparisonSet | Non
 
 def _server_now() -> datetime:
     """Read the database clock; leases must not depend on browser clocks."""
-    value = db.session.scalar(select(func.now()))
+    value = db.session.scalar(select(func.clock_timestamp()))
     if not isinstance(value, datetime):
         return datetime.now(timezone.utc)
     if value.tzinfo is None:
@@ -170,13 +183,13 @@ def _server_now() -> datetime:
 
 def _version(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ComparisonError("Set version is required")
+        raise StaleVersionError("Set version is required")
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ComparisonError("Set version is required") from exc
+        raise StaleVersionError("Set version is required") from exc
     if parsed <= 0:
-        raise ComparisonError("Set version is required")
+        raise StaleVersionError("Set version is required")
     return parsed
 
 
@@ -211,14 +224,22 @@ def _claim_lease_locked(
     raise EditLeaseError("This Comparison Set is being edited by another user")
 
 
-def acquire_edit_lease(*, actor: User, comparison_set: ComparisonSet) -> ComparisonSet:
+def acquire_edit_lease(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet,
+    expected_version: object,
+) -> ComparisonSet:
     """Acquire or renew the five-minute Set lease using database server time."""
     _require_editor(actor)
+    expected = _version(expected_version)
     comparison_set = _active_set(comparison_set)
     try:
         locked = _locked_comparison_set(comparison_set)
         if locked is None or locked.archived_at is not None:
             raise ComparisonError("Comparison Set is unavailable")
+        if locked.version != expected:
+            raise StaleVersionError("Set has changed; reload before acquiring the lease")
         now = _server_now()
         _claim_lease_locked(locked, actor, now, acquire_if_free=True)
         db.session.commit()
@@ -228,14 +249,22 @@ def acquire_edit_lease(*, actor: User, comparison_set: ComparisonSet) -> Compari
         raise
 
 
-def heartbeat_edit_lease(*, actor: User, comparison_set: ComparisonSet) -> ComparisonSet:
+def heartbeat_edit_lease(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet,
+    expected_version: object,
+) -> ComparisonSet:
     """Extend only the caller's still-active lease; never steal an expired one."""
     _require_editor(actor)
+    expected = _version(expected_version)
     comparison_set = _active_set(comparison_set)
     try:
         locked = _locked_comparison_set(comparison_set)
         if locked is None or locked.archived_at is not None:
             raise ComparisonError("Comparison Set is unavailable")
+        if locked.version != expected:
+            raise StaleVersionError("Set has changed; reload before renewing the lease")
         now = _server_now()
         if not _lease_is_active(locked, actor.id, now):
             raise EditLeaseError("The edit lease has expired or belongs to another user")
@@ -247,14 +276,25 @@ def heartbeat_edit_lease(*, actor: User, comparison_set: ComparisonSet) -> Compa
         raise
 
 
-def release_edit_lease(*, actor: User, comparison_set: ComparisonSet) -> None:
+def release_edit_lease(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet,
+    expected_version: object,
+) -> None:
     _require_editor(actor)
+    expected = _version(expected_version)
     comparison_set = _active_set(comparison_set)
     try:
         locked = _locked_comparison_set(comparison_set)
-        if locked is not None and locked.lock_holder_id == actor.id:
-            locked.lock_holder_id = None
-            locked.lock_expires_at = None
+        if locked is None or locked.archived_at is not None:
+            raise ComparisonError("Comparison Set is unavailable")
+        if locked.version != expected:
+            raise StaleVersionError("Set has changed; reload before releasing the lease")
+        if not _lease_is_active(locked, actor.id, _server_now()):
+            raise EditLeaseError("The edit lease has expired or belongs to another user")
+        locked.lock_holder_id = None
+        locked.lock_expires_at = None
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -266,7 +306,6 @@ def _write_guard(
     actor: User,
     comparison_set: ComparisonSet,
     expected_version: object,
-    acquire_if_free: bool = True,
 ) -> tuple[ComparisonSet, int]:
     """Lock a Set row, verify its lease/version, and return it for mutation."""
     expected = _version(expected_version)
@@ -274,10 +313,9 @@ def _write_guard(
     locked = _locked_comparison_set(comparison_set)
     if locked is None or locked.archived_at is not None:
         raise ComparisonError("Comparison Set is unavailable")
-    now = _server_now()
-    _claim_lease_locked(locked, actor, now, acquire_if_free=acquire_if_free)
     if locked.version != expected:
         raise StaleVersionError("Set has changed; reload before saving")
+    _claim_lease_locked(locked, actor, _server_now(), acquire_if_free=False)
     return locked, expected
 
 
@@ -319,13 +357,17 @@ def _canvas_values(
 ) -> tuple[str, Decimal, Decimal]:
     try:
         key = normalize_canvas_preset(preset_key)
-        width, height = canvas_dimensions(key, width_mm, height_mm)
     except (TypeError, ValueError) as exc:
         raise ComparisonError(str(exc)) from exc
     if key == "custom":
-        persisted_width = _millimetres(width, "Canvas width")
-        persisted_height = _millimetres(height, "Canvas height")
+        # Form values arrive as strings.  Parse them exactly before asking the
+        # board module to resolve a preset so zero, excess precision, and DB
+        # bounds are rejected in one controlled path.
+        persisted_width = _millimetres(width_mm, "Canvas width")
+        persisted_height = _millimetres(height_mm, "Canvas height")
+        canvas_dimensions(key, persisted_width, persisted_height)
     else:
+        width, height = canvas_dimensions(key, width_mm, height_mm)
         # Validate caller-supplied dimensions even though a named preset owns
         # the final values.  This preserves the persisted two-decimal boundary.
         if width_mm is not None:
@@ -606,13 +648,17 @@ def add_frame(
     storage: ManagedStorage | None = None,
     inspection: ImageInspection | None = None,
     position: int | None = None,
-    expected_version: object | None = None,
+    expected_version: object,
 ) -> Frame:
     """Add an existing Capture or prepare a new Capture in one transaction."""
     _require_editor(actor)
-    comparison_set = _active_set(comparison_set)
     pending: PendingCapture | None = None
     try:
+        comparison_set, _ = _write_guard(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=expected_version,
+        )
         selected = _capture_for_frame(capture, capture_id)
         if selected is None:
             if upload is None:
@@ -633,21 +679,6 @@ def add_frame(
             )
             selected = pending.capture
 
-        if expected_version is None:
-            comparison_set = _locked_comparison_set(comparison_set)
-            if comparison_set is not None:
-                _claim_lease_locked(
-                    comparison_set,
-                    actor,
-                    _server_now(),
-                    acquire_if_free=True,
-                )
-        else:
-            comparison_set, _ = _write_guard(
-                actor=actor,
-                comparison_set=comparison_set,
-                expected_version=expected_version,
-            )
         if comparison_set is None or comparison_set.archived_at is not None:
             raise ComparisonError("Comparison Set is unavailable")
         if comparison_set.patient is None or comparison_set.patient.archived_at is not None:
@@ -770,57 +801,38 @@ def reorder_frames(
     """Persist a complete manual order when the Set version is unchanged."""
     _require_editor(actor)
     try:
-        ordered_ids = _frame_ids(ordered_frame_ids)
-        locked_set, expected_version = _write_guard(
+        locked_set, expected = _write_guard(
             actor=actor,
             comparison_set=comparison_set,
             expected_version=expected_version,
         )
         if locked_set.patient is None or locked_set.patient.archived_at is not None:
             raise ComparisonError("Patient is unavailable")
-
-        frames = list(
-            db.session.scalars(
-                select(Frame)
-                .where(Frame.comparison_set_id == locked_set.id)
-                .order_by(Frame.position, Frame.id)
-            )
-        )
-        expected = {frame.id for frame in frames}
-        if len(ordered_ids) != len(expected) or set(ordered_ids) != expected:
-            raise ComparisonError("Frame order must include every Frame exactly once")
-
-        by_id = {frame.id: frame for frame in frames}
-        offset = max((frame.position for frame in frames), default=-1) + len(frames) + 1
-        for index, frame in enumerate(frames):
-            frame.position = offset + index
-        db.session.flush()
-        for index, frame_id in enumerate(ordered_ids):
-            by_id[frame_id].position = index
+        ordered = _apply_order_locked(locked_set, ordered_frame_ids)
         result = db.session.execute(
             update(ComparisonSet)
             .where(
                 ComparisonSet.id == locked_set.id,
-                ComparisonSet.version == expected_version,
+                ComparisonSet.version == expected,
             )
-            .values(version=expected_version + 1, updated_by_id=actor.id)
+            .values(version=expected + 1, updated_by_id=actor.id)
         )
         if result.rowcount != 1:
             raise StaleVersionError("Set has changed; reload before reordering")
-        locked_set.version = expected_version + 1
+        locked_set.version = expected + 1
         locked_set.updated_by_id = actor.id
         append_audit(
             actor=actor,
             action="comparison_set.reorder",
             entity_type="comparison_set",
             entity_id=locked_set.id,
-            details={"frame_ids": ordered_ids},
+            details={"frame_ids": [frame.id for frame in ordered]},
         )
         db.session.commit()
     except Exception:
         db.session.rollback()
         raise
-    return [by_id[frame_id] for frame_id in ordered_ids]
+    return ordered
 
 
 _UNSET = object()
@@ -914,7 +926,10 @@ def _apply_frame_values(frame: Frame, values: dict[str, object]) -> None:
             setattr(frame, field, number)
 
 
-def _apply_order_locked(locked_set: ComparisonSet, ordered_frame_ids: Sequence[int]) -> None:
+def _apply_order_locked(
+    locked_set: ComparisonSet,
+    ordered_frame_ids: Sequence[int],
+) -> list[Frame]:
     ordered_ids = _frame_ids(ordered_frame_ids)
     frames = list(
         db.session.scalars(
@@ -933,6 +948,7 @@ def _apply_order_locked(locked_set: ComparisonSet, ordered_frame_ids: Sequence[i
     db.session.flush()
     for index, frame_id in enumerate(ordered_ids):
         by_id[frame_id].position = index
+    return [by_id[frame_id] for frame_id in ordered_ids]
 
 
 def save_comparison_set(
@@ -1033,51 +1049,133 @@ def update_frame(
         raise
 
 
+def _preview_limit(name: str, default: int) -> int:
+    value = current_app.config.get(name, default)
+    if isinstance(value, bool):
+        raise ComparisonError(f"{name} must be a positive integer")
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ComparisonError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ComparisonError(f"{name} must be a positive integer")
+    return value
+
+
+def _materialize_render_spec(
+    comparison_set: ComparisonSet,
+    *,
+    expected_version: object | None = None,
+) -> tuple[CanvasRenderSpec, int]:
+    """Read one locked Set snapshot and its visible media into a render spec."""
+    active = _active_set(comparison_set)
+    set_id = active.id
+    expected = _version(expected_version) if expected_version is not None else None
+    max_frames = _preview_limit(
+        "COMPARISON_PREVIEW_MAX_VISIBLE_FRAMES",
+        DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES,
+    )
+    max_bytes = _preview_limit("COMPARISON_PREVIEW_MAX_BYTES", DEFAULT_PREVIEW_MAX_BYTES)
+    storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
+    session = db.session.session_factory()
+    try:
+        with session.begin():
+            locked = session.scalar(
+                select(ComparisonSet)
+                .where(ComparisonSet.id == set_id)
+                .with_for_update(of=ComparisonSet)
+            )
+            if locked is None or locked.archived_at is not None:
+                raise ComparisonError("Comparison Set is unavailable")
+            version = int(locked.version)
+            if expected is not None and version != expected:
+                raise StaleVersionError("Set has changed; reload before previewing")
+            patient = locked.patient
+            if patient is None or patient.archived_at is not None:
+                raise ComparisonError("Patient is unavailable")
+
+            # Hidden Frames never need media access.  Check both bounds before
+            # opening any image so a large Set cannot exhaust process memory.
+            visible_frames = list(
+                session.scalars(
+                    select(Frame)
+                    .where(
+                        Frame.comparison_set_id == locked.id,
+                        Frame.visible.is_(True),
+                    )
+                    .order_by(Frame.position, Frame.id)
+                )
+            )
+            if len(visible_frames) > max_frames:
+                raise PreviewLimitError("Preview contains too many visible Frames")
+            total_bytes = 0
+            for frame in visible_frames:
+                try:
+                    total_bytes += int(frame.capture.byte_count)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ComparisonError("Capture media metadata is invalid") from exc
+            if total_bytes > max_bytes:
+                raise PreviewLimitError("Preview media exceeds its byte limit")
+
+            frames: list[FrameRenderSpec] = []
+            for frame in visible_frames:
+                try:
+                    with storage.open_read(frame.capture.storage_key) as source:
+                        image_bytes = read_bounded(source, max_bytes=int(frame.capture.byte_count))
+                except (ImagePolicyError, OSError, StorageError) as exc:
+                    raise ComparisonError("Capture media is unavailable") from exc
+                show_date = (
+                    frame.date_visible_override
+                    if frame.date_visible_override is not None
+                    else locked.date_label_default
+                )
+                frames.append(
+                    FrameRenderSpec(
+                        id=frame.id,
+                        image=image_bytes,
+                        visible=True,
+                        label=frame.label or "",
+                        date_label=frame.capture.capture_date.isoformat() if show_date else None,
+                        zoom=frame.zoom,
+                        pan_x=frame.pan_x,
+                        pan_y=frame.pan_y,
+                    )
+                )
+
+            # The Set row lock blocks all editor mutations.  Recheck anyway so
+            # an unexpected writer cannot make a mixed snapshot look current.
+            current_version = session.scalar(
+                select(ComparisonSet.version).where(ComparisonSet.id == locked.id)
+            )
+            if current_version != version:
+                raise StaleVersionError("Set changed while preparing preview")
+            spec = CanvasRenderSpec(
+                width_mm=float(locked.canvas_width_mm),
+                height_mm=float(locked.canvas_height_mm),
+                frame_ratio=float(locked.frame_ratio),
+                columns=int(locked.columns),
+                frames=frames,
+                title=locked.name,
+                patient_id=patient.patient_id,
+                patient_name=patient.name,
+                birth_year=patient.birth_year,
+                show_patient_id=bool(locked.show_patient_id),
+                show_patient_name=bool(locked.show_patient_name),
+                show_birth_year=bool(locked.show_birth_year),
+                version=version,
+            )
+        return spec, version
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def render_spec_for_set(comparison_set: ComparisonSet, *, expected_version: object | None = None) -> CanvasRenderSpec:
     """Build render data from one persisted Set version without exposing media paths."""
-    comparison_set = _active_set(comparison_set)
-    if expected_version is not None and comparison_set.version != _version(expected_version):
-        raise StaleVersionError("Set has changed; reload before previewing")
-    storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
-    frames: list[FrameRenderSpec] = []
-    for frame in comparison_set.frames:
-        try:
-            with storage.open_read(frame.capture.storage_key) as source:
-                image_bytes = source.read()
-        except (OSError, StorageError) as exc:
-            raise ComparisonError("Capture media is unavailable") from exc
-        show_date = (
-            frame.date_visible_override
-            if frame.date_visible_override is not None
-            else comparison_set.date_label_default
-        )
-        frames.append(
-            FrameRenderSpec(
-                id=frame.id,
-                image=image_bytes,
-                visible=bool(frame.visible),
-                label=frame.label or "",
-                date_label=frame.capture.capture_date.isoformat() if show_date else None,
-                zoom=frame.zoom,
-                pan_x=frame.pan_x,
-                pan_y=frame.pan_y,
-            )
-        )
-    patient = comparison_set.patient
-    return CanvasRenderSpec(
-        width_mm=float(comparison_set.canvas_width_mm),
-        height_mm=float(comparison_set.canvas_height_mm),
-        frame_ratio=float(comparison_set.frame_ratio),
-        columns=int(comparison_set.columns),
-        frames=frames,
-        title=comparison_set.name,
-        patient_id=patient.patient_id,
-        patient_name=patient.name,
-        birth_year=patient.birth_year,
-        show_patient_id=bool(comparison_set.show_patient_id),
-        show_patient_name=bool(comparison_set.show_patient_name),
-        show_birth_year=bool(comparison_set.show_birth_year),
-    )
+    spec, _ = _materialize_render_spec(comparison_set, expected_version=expected_version)
+    return spec
 
 
 def render_persisted_set(
@@ -1086,10 +1184,25 @@ def render_persisted_set(
     expected_version: object | None = None,
     dpi: float = DEFAULT_RENDER_DPI,
 ) -> bytes:
-    spec = render_spec_for_set(comparison_set, expected_version=expected_version)
+    spec, _ = _materialize_render_spec(comparison_set, expected_version=expected_version)
     image = render_canvas(spec, dpi=dpi)
     try:
         return encode(image, "png")
+    finally:
+        image.close()
+
+
+def render_persisted_set_versioned(
+    comparison_set: ComparisonSet,
+    *,
+    expected_version: object | None = None,
+    dpi: float = DEFAULT_RENDER_DPI,
+) -> tuple[bytes, int]:
+    """Render a materialized snapshot and return its exact persisted version."""
+    spec, version = _materialize_render_spec(comparison_set, expected_version=expected_version)
+    image = render_canvas(spec, dpi=dpi)
+    try:
+        return encode(image, "png"), version
     finally:
         image.close()
 
@@ -1164,17 +1277,11 @@ def new(patient_pk: int):
 @login_required
 def detail(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
-    can_edit = False
-    if current_user.is_editor:
-        try:
-            acquire_edit_lease(actor=current_user, comparison_set=comparison_set)
-        except EditLeaseError:
-            pass
-        else:
-            can_edit = True
-        comparison_set = _route_set(set_pk, patient_pk)
-    if comparison_set.lock_holder_id == current_user.id:
-        can_edit = True
+    can_edit = current_user.is_editor and _lease_is_active(
+        comparison_set,
+        current_user.id,
+        _server_now(),
+    )
     return render_template(
         "comparisons/detail.html",
         comparison_set=comparison_set,
@@ -1182,6 +1289,7 @@ def detail(set_pk: int, patient_pk: int | None = None):
         captures=list_captures(comparison_set.patient),
         frame_form=FrameForm(),
         can_edit=can_edit,
+        can_acquire=current_user.is_editor and not can_edit,
     )
 
 
@@ -1206,16 +1314,16 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
         if form.capture_id.data:
             if form.image.data and filename:
                 raise ComparisonError("choose an existing Capture or upload a new image")
-            add_frame(
+            frame = add_frame(
                 actor=current_user,
                 comparison_set=comparison_set,
                 capture_id=form.capture_id.data,
-                expected_version=expected_version if expected_version is not None else None,
+                expected_version=expected_version,
             )
         else:
             if not form.image.data or not filename:
                 raise ComparisonError("choose an existing Capture or upload a new image")
-            add_frame(
+            frame = add_frame(
                 actor=current_user,
                 comparison_set=comparison_set,
                 upload=form.image.data,
@@ -1224,7 +1332,7 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
                 shot_type_name=form.shot_type_name.data,
                 create_proposal=form.create_proposal.data,
                 original_filename=filename,
-                expected_version=expected_version if expected_version is not None else None,
+                expected_version=expected_version,
             )
     except CaptureReconciliationError as exc:
         form.capture_id.errors.append(str(exc))
@@ -1265,7 +1373,14 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
             frame_form=form,
         ), 400
     flash("Frame added.", "success")
-    return redirect(url_for("comparisons.detail", set_pk=comparison_set.id))
+    new_version = db.session.scalar(
+        select(ComparisonSet.version).where(ComparisonSet.id == comparison_set.id)
+    )
+    if request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify(frame_id=frame.id, version=new_version)
+    response = redirect(url_for("comparisons.detail", set_pk=comparison_set.id))
+    response.headers["X-Comparison-Set-Version"] = str(new_version)
+    return response
 
 
 def _request_payload() -> dict[str, object]:
@@ -1274,7 +1389,25 @@ def _request_payload() -> dict[str, object]:
         if not isinstance(payload, dict):
             raise ComparisonError("JSON payload must be an object")
         return payload
-    return {key: value for key, value in request.form.items()}
+    boolean_fields = {
+        "show_patient_id",
+        "show_patient_name",
+        "show_birth_year",
+        "date_label_default",
+    }
+    payload: dict[str, object] = {}
+    for key in request.form:
+        values = request.form.getlist(key)
+        if key in boolean_fields:
+            payload[key] = any(value.strip().casefold() in {"1", "true", "on", "yes"} for value in values)
+        else:
+            payload[key] = values[-1]
+    if "columns" in payload and isinstance(payload["columns"], str):
+        try:
+            payload["columns"] = int(payload["columns"])
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return payload
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/save")
@@ -1321,7 +1454,12 @@ def save(set_pk: int, patient_pk: int | None = None):
         return jsonify(error=str(exc)), 409
     except ComparisonError as exc:
         return jsonify(error=str(exc)), 400
-    return jsonify(version=saved.version)
+    if request.is_json:
+        return jsonify(version=saved.version)
+    flash("Comparison Set saved.", "success")
+    response = redirect(url_for("comparisons.detail", set_pk=saved.id))
+    response.headers["X-Comparison-Set-Version"] = str(saved.version)
+    return response
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/frames/<int:frame_id>")
@@ -1348,16 +1486,28 @@ def update_frame_route(set_pk: int, frame_id: int, patient_pk: int | None = None
     return jsonify(frame_id=frame.id, version=frame.comparison_set.version)
 
 
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/lease/acquire")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/lease/acquire")
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/lease")
 @comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/lease")
 @editor_required
-def lease(set_pk: int, patient_pk: int | None = None):
+def lease_acquire(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
     try:
-        acquired = acquire_edit_lease(actor=current_user, comparison_set=comparison_set)
-    except EditLeaseError as exc:
+        payload = _request_payload()
+        acquired = acquire_edit_lease(
+            actor=current_user,
+            comparison_set=comparison_set,
+            expected_version=payload.get("version", payload.get("expected_version")),
+        )
+    except (StaleVersionError, EditLeaseError) as exc:
         return jsonify(error=str(exc)), 409
-    return jsonify(version=acquired.version, expires_at=acquired.lock_expires_at.isoformat())
+    except ComparisonError as exc:
+        return jsonify(error=str(exc)), 400
+    if request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify(version=acquired.version, expires_at=acquired.lock_expires_at.isoformat())
+    flash("Edit lease acquired.", "success")
+    return redirect(url_for("comparisons.detail", set_pk=acquired.id))
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/lease/heartbeat")
@@ -1367,9 +1517,16 @@ def lease(set_pk: int, patient_pk: int | None = None):
 def lease_heartbeat(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
     try:
-        renewed = heartbeat_edit_lease(actor=current_user, comparison_set=comparison_set)
-    except EditLeaseError as exc:
+        payload = _request_payload()
+        renewed = heartbeat_edit_lease(
+            actor=current_user,
+            comparison_set=comparison_set,
+            expected_version=payload.get("version", payload.get("expected_version")),
+        )
+    except (StaleVersionError, EditLeaseError) as exc:
         return jsonify(error=str(exc)), 409
+    except ComparisonError as exc:
+        return jsonify(error=str(exc)), 400
     return jsonify(version=renewed.version, expires_at=renewed.lock_expires_at.isoformat())
 
 
@@ -1378,8 +1535,19 @@ def lease_heartbeat(set_pk: int, patient_pk: int | None = None):
 @editor_required
 def lease_release(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
-    release_edit_lease(actor=current_user, comparison_set=comparison_set)
-    return jsonify(released=True)
+    try:
+        payload = _request_payload()
+        expected = _version(payload.get("version", payload.get("expected_version")))
+        release_edit_lease(
+            actor=current_user,
+            comparison_set=comparison_set,
+            expected_version=expected,
+        )
+    except (StaleVersionError, EditLeaseError) as exc:
+        return jsonify(error=str(exc)), 409
+    except ComparisonError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(released=True, version=expected)
 
 
 @comparisons_bp.get("/comparison-sets/<int:set_pk>/preview")
@@ -1391,25 +1559,27 @@ def preview(set_pk: int, patient_pk: int | None = None):
     raw_version = request.args.get("version")
     try:
         expected = _version(raw_version) if raw_version is not None else None
-        payload = render_persisted_set(
+        payload, version = render_persisted_set_versioned(
             comparison_set,
             expected_version=expected,
             dpi=float(current_app.config.get("BOARD_RENDER_DPI", DEFAULT_RENDER_DPI)),
         )
     except StaleVersionError as exc:
         return jsonify(error=str(exc)), 409
+    except PreviewLimitError as exc:
+        return jsonify(error=str(exc)), 413
     except (ComparisonError, StorageError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
     response = send_file(
         io.BytesIO(payload),
         mimetype="image/png",
-        download_name=f"comparison-set-{comparison_set.id}-v{comparison_set.version}.png",
+        download_name=f"comparison-set-{comparison_set.id}-v{version}.png",
         max_age=0,
         conditional=False,
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Comparison-Set-Version"] = str(comparison_set.version)
+    response.headers["X-Comparison-Set-Version"] = str(version)
     return response
 
 
@@ -1476,4 +1646,6 @@ def reorder(set_pk: int, patient_pk: int | None = None):
     if request.is_json:
         return {"frame_ids": [frame.id for frame in ordered], "version": int(expected_version) + 1}
     flash("Frame order saved.", "success")
-    return redirect(url_for("comparisons.detail", set_pk=comparison_set.id))
+    response = redirect(url_for("comparisons.detail", set_pk=comparison_set.id))
+    response.headers["X-Comparison-Set-Version"] = str(int(expected_version) + 1)
+    return response
