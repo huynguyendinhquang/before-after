@@ -94,7 +94,8 @@ def read_bounded(source: BinaryIO, max_bytes: int | None = None) -> bytes:
         if not isinstance(chunk, (bytes, bytearray, memoryview)):
             raise ImagePolicyError("image stream must return bytes")
         try:
-            chunk_size = len(chunk)
+            chunk_view = memoryview(chunk)
+            chunk_size = chunk_view.nbytes
         except (TypeError, ValueError) as exc:
             raise ImagePolicyError("image stream returned invalid bytes") from exc
         if chunk_size > size:
@@ -104,7 +105,7 @@ def read_bounded(source: BinaryIO, max_bytes: int | None = None) -> bytes:
         if chunk_size == 0:
             break
         try:
-            chunk_bytes = bytes(chunk)
+            chunk_bytes = chunk_view.tobytes()
         except (TypeError, ValueError) as exc:
             raise ImagePolicyError("image stream returned invalid bytes") from exc
         chunks.append(chunk_bytes)

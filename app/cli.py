@@ -17,7 +17,10 @@ DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
 
 def _collect_from_dir(folder: Path, slot_ids: list[str]) -> dict[str, Path]:
     """Map slot ids to images found in folder (by name prefix or sorted order)."""
-    files = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS)
+    try:
+        files = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise ImagePolicyError(f"could not read input directory {folder}: {exc.strerror}") from exc
     by_stem = {p.stem.lower(): p for p in files}
     images: dict[str, Path] = {}
     unused = list(files)
