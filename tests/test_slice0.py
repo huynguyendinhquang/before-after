@@ -28,6 +28,15 @@ def _write_image(path: Path, image_format: str, size: tuple[int, int] = (4, 2), 
     return path.read_bytes()
 
 
+def _corrupted_tiff_payload() -> bytes:
+    payload_stream = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(payload_stream, format="TIFF")
+    payload = bytearray(payload_stream.getvalue())
+    for offset, bit in ((452, 7), (806, 4), (604, 0), (72, 3)):
+        payload[offset] ^= 1 << bit
+    return bytes(payload)
+
+
 def test_current_renderer_exports_non_empty_png_and_pdf(tmp_path: Path) -> None:
     source = tmp_path / "generated-fixture.jpg"
     _write_image(source, "JPEG", size=(8, 4))
@@ -295,6 +304,57 @@ def test_cli_invalid_image_exits_with_concise_error(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Traceback" not in result.stderr
+    assert "image" in result.stderr.lower()
+
+
+def test_corrupted_tiff_is_rejected_by_open_image() -> None:
+    with pytest.raises(image_policy.ImagePolicyError):
+        image_policy.open_image(_corrupted_tiff_payload())
+
+
+def test_web_rejects_corrupted_tiff_upload() -> None:
+    from app.web import app
+
+    response = app.test_client().post(
+        "/render",
+        data={
+            "title": "Generated fixture",
+            "template": "viengut_case",
+            "format": "png",
+            "slot_portrait": (io.BytesIO(_corrupted_tiff_payload()), "fixture.tif"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+def test_cli_corrupted_tiff_exits_with_concise_error(tmp_path: Path) -> None:
+    corrupted = tmp_path / "corrupted.tif"
+    corrupted.write_bytes(_corrupted_tiff_payload())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--slot",
+            f"portrait={corrupted}",
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
     assert "image" in result.stderr.lower()
 
 
