@@ -6,15 +6,19 @@ import os
 import stat
 from pathlib import Path
 
+import click
 from flask import Flask, redirect, request, url_for
 from flask_login import current_user
 from flask_wtf.csrf import CSRFError, CSRFProtect
+from sqlalchemy import select
 
 from app.auth import auth_bp, editor_required, login_manager, register_cli
 from app.captures import captures_bp
 from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
+from app.models import Capture
 from app.patients import patients_bp
+from app.storage import DEFAULT_ORPHAN_GRACE_SECONDS, ManagedStorage, StorageError
 
 __version__ = "0.1.0"
 
@@ -140,6 +144,24 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(captures_bp)
     _register_prototype_routes(app)
     register_cli(app)
+
+    @app.cli.command("reconcile-media")
+    @click.option(
+        "--grace-seconds",
+        type=click.FloatRange(min=0),
+        default=DEFAULT_ORPHAN_GRACE_SECONDS,
+        show_default=True,
+    )
+    def reconcile_media(grace_seconds: float) -> None:
+        """Remove stale media that no committed Capture references."""
+        storage = ManagedStorage(app.config["MEDIA_ROOT"])
+        try:
+            with storage.reconciliation_lock():
+                referenced = set(db.session.scalars(select(Capture.storage_key)))
+                removed = storage.reconcile(referenced, grace_seconds=grace_seconds)
+        except StorageError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"Removed {len(removed)} orphan media files.")
 
     @app.errorhandler(CSRFError)
     def csrf_failure(_error):
