@@ -19,6 +19,9 @@
   <hr>
   <h2>Capture Library</h2>
   <p><a class="button" href="{{ url_for('captures.library', patient_pk=patient.id) }}">Open Capture Library</a></p>
+  <h2>Comparison Sets</h2>
+  <p><a class="button" href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Open Comparison Sets</a></p>
+  {% if current_user.is_editor %}<p><a class="button" href="{{ url_for('comparisons.new', patient_pk=patient.id) }}">New Comparison Set</a></p>{% endif %}
   {% if current_user.is_editor %}
     <p><a class="button" href="{{ url_for('captures.new', patient_pk=patient.id) }}">Add Capture</a></p>
   {% endif %}

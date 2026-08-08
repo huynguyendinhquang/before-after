@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}{{ comparison_set.name }} — {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+    <h1>{{ comparison_set.name }}</h1>
+    <span class="muted">{{ 'Read-only' if not current_user.is_editor else 'Editor' }}</span>
+  </div>
+  <p class="muted">Patient {{ patient.patient_id }} · {{ patient.name }} · {{ patient.birth_year }}</p>
+  <dl>
+    <dt>Canvas</dt><dd>{{ comparison_set.canvas_width_mm }} × {{ comparison_set.canvas_height_mm }} mm ({{ comparison_set.preset_key }})</dd>
+    <dt>Frame ratio / columns</dt><dd>{{ comparison_set.frame_ratio }} / {{ comparison_set.columns }}</dd>
+    <dt>Capture Date labels</dt><dd>{{ 'shown by default' if comparison_set.date_label_default else 'hidden by default' }}</dd>
+  </dl>
+
+  <h2>Frames</h2>
+  {% if comparison_set.frames %}
+    <table>
+      <thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Label</th><th>Visible</th><th>Order</th></tr></thead>
+      <tbody>
+      {% for frame in comparison_set.frames %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="140"></td>
+          <td>{{ frame.capture.capture_date }}</td>
+          <td>{{ frame.capture.shot_type.name }}</td>
+          <td>{{ frame.label or '—' }}</td>
+          <td>{{ 'yes' if frame.visible else 'no' }}{% if frame.date_visible_override is not none %}; date {{ 'shown' if frame.date_visible_override else 'hidden' }}{% endif %}</td>
+          <td>
+            {% if current_user.is_editor %}
+              <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}">
+                {{ frame_form.csrf_token }}
+                {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
+                <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
+                {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
+                {% if not loop.last %}<button type="submit" name="direction" value="down">Down</button>{% endif %}
+              </form>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No Frames in this Set yet.</p>
+  {% endif %}
+
+  {% if current_user.is_editor %}
+    <hr>
+    <h2>Add Frame</h2>
+    <p class="muted">Choose one existing Capture, or upload one new image. A new image is first saved through the Capture Library workflow and then referenced here.</p>
+    <form method="post" action="{{ url_for('comparisons.add_frame_route', set_pk=comparison_set.id) }}" enctype="multipart/form-data" novalidate>
+      {{ frame_form.hidden_tag() }}
+      <label for="capture_id">Existing Capture</label>
+      <select id="capture_id" name="capture_id">
+        <option value="">Choose an existing Capture</option>
+        {% for capture in captures %}
+          <option value="{{ capture.id }}">#{{ capture.id }} — {{ capture.capture_date }} — {{ capture.shot_type.name }}</option>
+        {% endfor %}
+      </select>
+      {% for error in frame_form.capture_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
+      <p class="muted">Or upload a new Capture:</p>
+      <label for="image">{{ frame_form.image.label }}</label>
+      {{ frame_form.image(id="image", accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*") }}
+      {% for error in frame_form.image.errors %}<div class="error">{{ error }}</div>{% endfor %}
+      <label for="capture_date">{{ frame_form.capture_date.label }}</label>
+      {{ frame_form.capture_date(id="capture_date", type="date") }}
+      <label>{{ frame_form.capture_date_confirmed() }} {{ frame_form.capture_date_confirmed.label.text }}</label>
+      {% for error in frame_form.capture_date.errors %}<div class="error">{{ error }}</div>{% endfor %}
+      <label for="shot_type_name">{{ frame_form.shot_type_name.label }}</label>
+      {{ frame_form.shot_type_name(id="shot_type_name", autocomplete="off") }}
+      <label>{{ frame_form.create_proposal() }} {{ frame_form.create_proposal.label.text }}</label>
+      {{ frame_form.submit() }}
+    </form>
+  {% endif %}
+  <p><a href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Back to Comparison Sets</a> · <a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
+</section>
+{% endblock %}

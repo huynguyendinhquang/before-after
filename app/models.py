@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flask_login import UserMixin
-from sqlalchemy.orm import validates
+from sqlalchemy.orm import synonym, validates
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.db import db
@@ -109,6 +109,11 @@ class Patient(db.Model):
     created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
     updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
     archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
+    comparison_sets = db.relationship(
+        "ComparisonSet",
+        back_populates="patient",
+        order_by="ComparisonSet.name",
+    )
 
 
 class ShotType(db.Model):
@@ -225,6 +230,137 @@ class Capture(db.Model):
     archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
     created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
     updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
+
+
+class ComparisonSet(db.Model):
+    __tablename__ = "comparison_sets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(
+        db.Integer,
+        db.ForeignKey("patients.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    name = db.Column(db.String(200), nullable=False)
+    canvas_width_mm = db.Column(db.Numeric(8, 2), nullable=False, default=297, server_default="297")
+    canvas_height_mm = db.Column(db.Numeric(8, 2), nullable=False, default=210, server_default="210")
+    preset_key = db.Column(
+        db.String(32), nullable=False, default="a4-landscape", server_default="a4-landscape"
+    )
+    frame_ratio = db.Column(db.Float, nullable=False, default=1.0, server_default="1")
+    columns = db.Column(db.Integer, nullable=False, default=3, server_default="3")
+    show_patient_id = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+    show_patient_name = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+    show_birth_year = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+    date_label_default = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
+    version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
+    lock_holder_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    lock_expires_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    archived_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    archived_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    updated_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.func.now(),
+        onupdate=db.func.now(),
+    )
+
+    __table_args__ = (
+        db.CheckConstraint("length(trim(name)) > 0", name="ck_comparison_sets_name_not_blank"),
+        db.CheckConstraint("canvas_width_mm > 0 AND canvas_height_mm > 0", name="ck_comparison_sets_canvas_dimensions"),
+        db.CheckConstraint("frame_ratio > 0", name="ck_comparison_sets_frame_ratio"),
+        db.CheckConstraint("columns > 0", name="ck_comparison_sets_columns"),
+        db.CheckConstraint("version > 0", name="ck_comparison_sets_version"),
+        db.Index(
+            "uq_comparison_sets_patient_name_active",
+            "patient_id",
+            db.func.lower(name),
+            unique=True,
+            postgresql_where=archived_at.is_(None),
+        ),
+    )
+
+    title = synonym("name")
+    canvas_preset_key = synonym("preset_key")
+    canvas_preset = synonym("preset_key")
+    frame_aspect_ratio = synonym("frame_ratio")
+    include_patient_id = synonym("show_patient_id")
+    include_patient_name = synonym("show_patient_name")
+    include_birth_year = synonym("show_birth_year")
+    show_capture_date = synonym("date_label_default")
+    edit_lock_holder_id = synonym("lock_holder_id")
+    edit_lock_expires_at = synonym("lock_expires_at")
+
+    patient = db.relationship("Patient", foreign_keys=[patient_id], back_populates="comparison_sets", lazy="joined")
+    frames = db.relationship(
+        "Frame",
+        back_populates="comparison_set",
+        order_by="Frame.position",
+        cascade="all, delete-orphan",
+    )
+    lock_holder = db.relationship("User", foreign_keys=[lock_holder_id], lazy="joined")
+    archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
+    created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
+    updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
+
+
+class Frame(db.Model):
+    __tablename__ = "frames"
+
+    id = db.Column(db.Integer, primary_key=True)
+    comparison_set_id = db.Column(
+        db.Integer,
+        db.ForeignKey("comparison_sets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    capture_id = db.Column(
+        db.Integer,
+        db.ForeignKey("captures.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    position = db.Column(db.Integer, nullable=False)
+    visible = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
+    label = db.Column(db.String(500), nullable=True)
+    date_visible_override = db.Column(db.Boolean, nullable=True)
+    zoom = db.Column(db.Float, nullable=False, default=1.0, server_default="1")
+    pan_x = db.Column(db.Float, nullable=False, default=0.0, server_default="0")
+    pan_y = db.Column(db.Float, nullable=False, default=0.0, server_default="0")
+
+    __table_args__ = (
+        db.CheckConstraint("position >= 0", name="ck_frames_position"),
+        db.CheckConstraint("zoom >= 1 AND zoom <= 5", name="ck_frames_zoom"),
+        db.CheckConstraint("pan_x >= -1 AND pan_x <= 1", name="ck_frames_pan_x"),
+        db.CheckConstraint("pan_y >= -1 AND pan_y <= 1", name="ck_frames_pan_y"),
+        db.UniqueConstraint("comparison_set_id", "position", name="uq_frames_set_position"),
+    )
+
+    set_id = synonym("comparison_set_id")
+    capture_date_visible = synonym("date_visible_override")
+    date_label_visible = synonym("date_visible_override")
+    date_override = synonym("date_visible_override")
+
+    comparison_set = db.relationship("ComparisonSet", back_populates="frames", lazy="joined")
+    capture = db.relationship("Capture", foreign_keys=[capture_id], lazy="joined")
+
 
 class AuditEvent(db.Model):
     __tablename__ = "audit_events"
