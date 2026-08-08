@@ -148,8 +148,9 @@ def main(argv: list[str] | None = None) -> int:
         case = CaseData(title=title, images=images, labels=labels)
         board = render(tmpl, case, dpi=args.dpi)
         out = export(board, args.output)
-    except ImagePolicyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (OSError, ValueError, OverflowError) as exc:
+        detail = exc.strerror if isinstance(exc, OSError) else str(exc)
+        print(f"error: {detail or exc.__class__.__name__}", file=sys.stderr)
         return 2
 
     print(out)

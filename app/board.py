@@ -8,12 +8,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 from app.image_policy import open_image
 
 MM = 300 / 25.4  # px per mm at 300 DPI
 MAX_TITLE_CHARS = 500
+MAX_RENDER_DPI = 600
+MAX_CANVAS_PIXELS = 100_000_000
+MAX_BORDER_PX = 100
+MAX_FONT_PT = 200
 
 
 def _is_finite_number(value: object) -> bool:
@@ -23,6 +27,20 @@ def _is_finite_number(value: object) -> bool:
         return math.isfinite(value)
     except OverflowError:
         return False
+
+
+def _is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_color(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        ImageColor.getrgb(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 @dataclass
@@ -58,10 +76,62 @@ class BoardTemplate:
             raise ValueError("template JSON requires width_mm and height_mm")
         if not _is_finite_number(data["width_mm"]) or not _is_finite_number(data["height_mm"]):
             raise ValueError("template width_mm and height_mm must be finite numbers")
-        if data["width_mm"] <= 0 or data["height_mm"] <= 0:
+        width_mm = data["width_mm"]
+        height_mm = data["height_mm"]
+        if width_mm <= 0 or height_mm <= 0:
             raise ValueError("template width_mm and height_mm must be positive")
-        if not isinstance(data.get("title", {}), dict):
+
+        name = data.get("name", Path(path).stem)
+        if not isinstance(name, str):
+            raise ValueError("template name must be a string")
+
+        background = data.get("background", "#ffffff")
+        if not _is_color(background):
+            raise ValueError("template background must be a valid color")
+        border_color = data.get("border_color", "#222222")
+        if not _is_color(border_color):
+            raise ValueError("template border_color must be a valid color")
+
+        border_px = data.get("border_px", 2)
+        if not _is_integer(border_px) or not 0 <= border_px <= MAX_BORDER_PX:
+            raise ValueError(f"template border_px must be an integer from 0 to {MAX_BORDER_PX}")
+        label_pt = data.get("label_pt", 11)
+        if not _is_integer(label_pt) or not 1 <= label_pt <= MAX_FONT_PT:
+            raise ValueError(f"template label_pt must be an integer from 1 to {MAX_FONT_PT}")
+        gap_label_mm = data.get("gap_label_mm", 1.5)
+        if not _is_finite_number(gap_label_mm) or gap_label_mm < 0:
+            raise ValueError("template gap_label_mm must be a finite non-negative number")
+
+        title = data.get("title", {})
+        if not isinstance(title, dict):
             raise ValueError("template title must be an object")
+        title_allowed = {"x_mm", "y_mm", "pt", "color", "default"}
+        unexpected_title = title.keys() - title_allowed
+        if unexpected_title:
+            raise ValueError(
+                "template title has unexpected fields: "
+                + ", ".join(sorted(unexpected_title))
+            )
+        title_x = title.get("x_mm", 5)
+        title_y = title.get("y_mm", 4)
+        if (
+            not _is_finite_number(title_x)
+            or title_x < 0
+            or title_x > width_mm
+            or not _is_finite_number(title_y)
+            or title_y < 0
+            or title_y > height_mm
+        ):
+            raise ValueError("template title x_mm and y_mm must be within the canvas")
+        title_pt = title.get("pt", 16)
+        if not _is_finite_number(title_pt) or not 0 < title_pt <= MAX_FONT_PT:
+            raise ValueError(f"template title pt must be between 1 and {MAX_FONT_PT}")
+        title_color = title.get("color", "#111111")
+        if not _is_color(title_color):
+            raise ValueError("template title color must be a valid color")
+        title_default = title.get("default", "")
+        if not isinstance(title_default, str) or len(title_default) > MAX_TITLE_CHARS:
+            raise ValueError(f"template title default exceeds {MAX_TITLE_CHARS} characters")
 
         raw_slots = data.get("slots", [])
         if not isinstance(raw_slots, list) or any(not isinstance(slot, dict) for slot in raw_slots):
@@ -99,6 +169,13 @@ class BoardTemplate:
                 or slot["h"] <= 0
             ):
                 raise ValueError(f"template slot {index} w/h must be finite positive numbers")
+            if (
+                slot["x"] < 0
+                or slot["y"] < 0
+                or slot["x"] + slot["w"] > width_mm
+                or slot["y"] + slot["h"] > height_mm
+            ):
+                raise ValueError(f"template slot {index} must lie within the canvas")
             if not isinstance(slot.get("label", ""), str):
                 raise ValueError(f"template slot {index} label must be a string")
             if not isinstance(slot.get("fit", "cover"), str) or slot.get("fit", "cover") not in {
@@ -109,16 +186,16 @@ class BoardTemplate:
             slots.append(Slot(**slot))
 
         return cls(
-            name=data.get("name", Path(path).stem),
-            width_mm=data["width_mm"],
-            height_mm=data["height_mm"],
-            background=data.get("background", "#ffffff"),
-            title=data.get("title", {}),
+            name=name,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            background=background,
+            title=title,
             slots=slots,
-            border_px=data.get("border_px", 2),
-            border_color=data.get("border_color", "#222222"),
-            gap_label_mm=data.get("gap_label_mm", 1.5),
-            label_pt=data.get("label_pt", 11),
+            border_px=border_px,
+            border_color=border_color,
+            gap_label_mm=gap_label_mm,
+            label_pt=label_pt,
         )
 
 
@@ -182,9 +259,35 @@ class CaseData:
 
 
 def render(template: BoardTemplate, case: CaseData, dpi: float = 300) -> Image.Image:
+    if not _is_finite_number(dpi) or dpi < 1 or dpi > MAX_RENDER_DPI:
+        raise ValueError(f"dpi must be finite and between 1 and {MAX_RENDER_DPI}")
+
     px = dpi / 25.4
-    W = int(template.width_mm * px)
-    H = int(template.height_mm * px)
+    try:
+        W = int(template.width_mm * px)
+        H = int(template.height_mm * px)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("canvas dimensions are invalid") from exc
+    if W <= 0 or H <= 0:
+        raise ValueError("canvas must have nonzero pixels")
+    if W * H > MAX_CANVAS_PIXELS:
+        raise ValueError(f"canvas exceeds {MAX_CANVAS_PIXELS} pixels")
+
+    frames: list[tuple[int, int, int, int]] = []
+    for slot in template.slots:
+        try:
+            x = int(slot.x * px)
+            y = int(slot.y * px)
+            w = int(slot.w * px)
+            h = int(slot.h * px)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"frame {slot.id} geometry is invalid") from exc
+        if w <= 0 or h <= 0:
+            raise ValueError(f"frame {slot.id} must have nonzero pixels")
+        if x < 0 or y < 0 or x + w > W or y + h > H:
+            raise ValueError(f"frame {slot.id} must lie within the canvas")
+        frames.append((x, y, w, h))
+
     board = Image.new("RGB", (W, H), template.background)
     draw = ImageDraw.Draw(board)
 
@@ -202,12 +305,7 @@ def render(template: BoardTemplate, case: CaseData, dpi: float = 300) -> Image.I
     label_font = _font(int(template.label_pt * dpi / 72))
     gap = int(template.gap_label_mm * px)
 
-    for slot in template.slots:
-        x = int(slot.x * px)
-        y = int(slot.y * px)
-        w = int(slot.w * px)
-        h = int(slot.h * px)
-
+    for slot, (x, y, w, h) in zip(template.slots, frames):
         path = case.images.get(slot.id)
         if path:
             src = open_image(path)

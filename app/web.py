@@ -187,6 +187,8 @@ def do_render():
         return jsonify(error="invalid template"), 400
 
     fmt = (request.form.get("format") or "png").lower()
+    if fmt not in {"png", "pdf"}:
+        return jsonify(error="invalid format"), 400
     raw_labels = request.form.get("labels")
     raw_labels = "{}" if raw_labels is None else raw_labels
     try:
