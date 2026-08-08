@@ -934,7 +934,9 @@ def _valid_template() -> dict[str, object]:
     }
 
 
-def _run_template_cli(tmp_path: Path, template_data: object) -> subprocess.CompletedProcess[str]:
+def _run_template_cli(
+    tmp_path: Path, template_data: object, dpi: object = 20
+) -> subprocess.CompletedProcess[str]:
     template_path = tmp_path / "template.json"
     template_path.write_text(json.dumps(template_data), encoding="utf-8")
     return subprocess.run(
@@ -946,8 +948,7 @@ def _run_template_cli(tmp_path: Path, template_data: object) -> subprocess.Compl
             "Generated fixture",
             "--template",
             str(template_path),
-            "--dpi",
-            "20",
+            f"--dpi={dpi}",
             "-o",
             str(tmp_path / "board.png"),
         ],
@@ -1042,3 +1043,192 @@ def test_cli_rejects_template_non_object_title(tmp_path: Path, title: object) ->
     template["title"] = title
 
     _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("background", 7),
+        ("background", []),
+        ("background", "not-a-color"),
+        ("border_color", 7),
+        ("border_color", []),
+        ("border_color", "not-a-color"),
+        ("border_px", "2"),
+        ("border_px", True),
+        ("border_px", -1),
+        ("border_px", 101),
+        ("gap_label_mm", "1"),
+        ("gap_label_mm", True),
+        ("gap_label_mm", -1),
+        ("gap_label_mm", float("nan")),
+        ("label_pt", "11"),
+        ("label_pt", True),
+        ("label_pt", 0),
+        ("label_pt", 201),
+        ("name", 7),
+        ("name", []),
+    ],
+)
+def test_cli_rejects_invalid_optional_template_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    template = _valid_template()
+    template[field] = value
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("x_mm", "left"),
+        ("x_mm", True),
+        ("x_mm", -1),
+        ("x_mm", float("inf")),
+        ("y_mm", "top"),
+        ("y_mm", False),
+        ("y_mm", -1),
+        ("y_mm", float("nan")),
+        ("pt", "18"),
+        ("pt", True),
+        ("pt", 0),
+        ("pt", 201),
+        ("color", 7),
+        ("color", "not-a-color"),
+        ("default", 7),
+        ("default", "x" * 501),
+    ],
+)
+def test_cli_rejects_invalid_template_title_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    template = _valid_template()
+    template["title"] = {field: value}
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+def test_cli_rejects_unconsumed_template_title_fields(tmp_path: Path) -> None:
+    template = _valid_template()
+    template["title"] = {"unexpected": "value"}
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize("dpi", ["nan", "inf", "-inf", "0", "-1", "601"])
+def test_cli_rejects_invalid_dpi(tmp_path: Path, dpi: str) -> None:
+    template = {"width_mm": 1, "height_mm": 1, "slots": []}
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template, dpi=dpi))
+
+
+@pytest.mark.parametrize(
+    ("template", "message"),
+    [
+        (
+            BoardTemplate(
+                name="zero-canvas",
+                width_mm=0.001,
+                height_mm=10,
+                slots=[],
+            ),
+            "canvas",
+        ),
+        (
+            BoardTemplate(
+                name="zero-frame",
+                width_mm=10,
+                height_mm=10,
+                slots=[Slot(id="tiny", x=1, y=1, w=0.001, h=1)],
+            ),
+            "frame",
+        ),
+    ],
+)
+def test_render_rejects_zero_pixel_geometry_before_allocation(
+    monkeypatch: pytest.MonkeyPatch, template: BoardTemplate, message: str
+) -> None:
+    from app import board as board_module
+
+    def unexpected_allocation(*args: object, **kwargs: object) -> None:
+        pytest.fail("render allocated a zero-pixel image")
+
+    monkeypatch.setattr(board_module.Image, "new", unexpected_allocation)
+    with pytest.raises(ValueError, match=message):
+        render(template, CaseData(title="", images={}), dpi=72)
+
+
+def test_render_rejects_excessive_canvas_pixel_budget_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import board as board_module
+
+    def unexpected_allocation(*args: object, **kwargs: object) -> None:
+        pytest.fail("render allocated an over-budget image")
+
+    monkeypatch.setattr(board_module.Image, "new", unexpected_allocation)
+    template = BoardTemplate(name="large", width_mm=1000, height_mm=1000, slots=[])
+    with pytest.raises(ValueError, match="pixel"):
+        render(template, CaseData(title="", images={}), dpi=600)
+
+
+@pytest.mark.parametrize(
+    "slot_update",
+    [
+        {"x": -1},
+        {"x": 296, "w": 2},
+        {"y": 209, "h": 2},
+    ],
+)
+def test_cli_rejects_slot_outside_canvas(tmp_path: Path, slot_update: dict[str, object]) -> None:
+    template = _valid_template()
+    template["slots"][0].update(slot_update)  # type: ignore[index]
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize("parent_kind", ["file", "device"])
+def test_cli_rejects_output_parent_errors(tmp_path: Path, parent_kind: str) -> None:
+    if parent_kind == "file":
+        parent = tmp_path / "not-a-directory"
+        parent.write_text("not a directory", encoding="utf-8")
+    else:
+        parent = Path("/dev/null")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--dpi",
+            "20",
+            "-o",
+            str(parent / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    _assert_template_cli_rejects(result)
+
+
+def test_web_rejects_unknown_render_format() -> None:
+    from app.web import app
+
+    response = app.test_client().post(
+        "/render",
+        data={
+            "title": "Generated fixture",
+            "template": "viengut_case",
+            "format": "svg",
+            "labels": "{}",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
