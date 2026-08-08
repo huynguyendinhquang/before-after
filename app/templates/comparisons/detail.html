@@ -153,7 +153,7 @@
   <h2>Export</h2>
   <form method="post" action="{{ url_for('comparisons.export_route', set_pk=comparison_set.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
     <label for="export-format">Format</label>
     <select id="export-format" name="format">
       <option value="png">PNG</option>

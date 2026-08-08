@@ -69,6 +69,9 @@ class StoredDerivative:
     pending_key: str
 
 
+StoredObject = StoredMedia | StoredDerivative
+
+
 class ManagedStorage:
     """Own media paths and make every write atomic and independently cleanable."""
 
@@ -331,7 +334,21 @@ class ManagedStorage:
         except OSError:
             pass
 
-    def finalize(self, stored: StoredMedia) -> None:
+    @staticmethod
+    def _stored_keys(stored: StoredObject) -> tuple[str, ...]:
+        if isinstance(stored, StoredMedia):
+            return tuple(
+                key for key in (stored.original_key, stored.preview_key) if key
+            )
+        if isinstance(stored, StoredDerivative):
+            return (stored.storage_key,)
+        raise StorageError("stored media object is invalid")
+
+    def preserve(self, stored: StoredObject) -> None:
+        """Release a pending marker lock while preserving its marker and media."""
+        self._release_pending(stored.pending_key)
+
+    def finalize(self, stored: StoredObject) -> None:
         """Release a committed store's marker without touching its media."""
         with self.reconciliation_lock():
             try:
@@ -339,31 +356,11 @@ class ManagedStorage:
             finally:
                 self._release_pending(stored.pending_key)
 
-    def discard(self, stored: StoredMedia) -> None:
+    def discard(self, stored: StoredObject) -> None:
         """Release a failed store and best-effort remove its media and marker."""
         with self.reconciliation_lock():
             try:
-                for key in (stored.original_key, stored.preview_key, stored.pending_key):
-                    try:
-                        self.cleanup(key)
-                    except StorageError:
-                        pass
-            finally:
-                self._release_pending(stored.pending_key)
-
-    def finalize_derivative(self, stored: StoredDerivative) -> None:
-        """Release a committed derivative marker without touching its bytes."""
-        with self.reconciliation_lock():
-            try:
-                self.cleanup(stored.pending_key)
-            finally:
-                self._release_pending(stored.pending_key)
-
-    def discard_derivative(self, stored: StoredDerivative) -> None:
-        """Release a failed derivative and best-effort remove its bytes/marker."""
-        with self.reconciliation_lock():
-            try:
-                for key in (stored.storage_key, stored.pending_key):
+                for key in (*self._stored_keys(stored), stored.pending_key):
                     try:
                         self.cleanup(key)
                     except StorageError:
@@ -387,18 +384,14 @@ class ManagedStorage:
         stem = uuid.uuid4().hex
         storage_key = f"derivatives/{stem}.{extension}"
         pending_key = f"quarantine/{_PENDING_PREFIX}{stem}"
+        stored = StoredDerivative(storage_key=storage_key, pending_key=pending_key)
         with self.reconciliation_lock():
             try:
                 self._create_pending_marker(pending_key, storage_key, "")
                 self._atomic_write(storage_key, raw)
-                return StoredDerivative(storage_key=storage_key, pending_key=pending_key)
+                return stored
             except Exception:
-                for key in (storage_key, pending_key):
-                    try:
-                        self.cleanup(key)
-                    except StorageError:
-                        pass
-                self._release_pending(pending_key)
+                self.discard(stored)
                 raise
 
     def _atomic_write(self, key: str, payload: bytes) -> None:

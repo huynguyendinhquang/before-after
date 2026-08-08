@@ -1236,7 +1236,12 @@ def _render_spec_bytes(
     """Render and encode one immutable Set snapshot for preview or export."""
     image = render_canvas(spec, dpi=dpi)
     try:
-        return encode(image, output_format)
+        return encode(
+            image,
+            output_format,
+            dpi=dpi,
+            physical_size_mm=(spec.width_mm, spec.height_mm),
+        )
     finally:
         image.close()
 
@@ -1286,12 +1291,12 @@ def _settle_export_attempt(
         return
     if committed.storage_key == stored.storage_key:
         try:
-            managed.finalize_derivative(stored)
+            managed.finalize(stored)
         except StorageError:
             # The row is durable; reconciliation can remove this marker later.
             pass
     else:
-        managed.discard_derivative(stored)
+        managed.discard(stored)
 
 
 def create_export(
@@ -1347,19 +1352,19 @@ def create_export(
         try:
             committed = _reconcile_export(stored.storage_key)
         except Exception as reconciliation_exc:
-            managed._release_pending(stored.pending_key)
+            managed.preserve(stored)
             raise ExportReconciliationError(
                 "Export save status could not be confirmed; pending derivative was preserved for reconciliation"
             ) from reconciliation_exc
         if committed is not None:
             _settle_export_attempt(managed, stored, committed)
             return committed
-        managed.discard_derivative(stored)
+        managed.discard(stored)
         raise
 
     if stored is not None:
         try:
-            managed.finalize_derivative(stored)
+            managed.finalize(stored)
         except StorageError:
             # A committed export remains recoverable through reconciliation.
             pass
@@ -1751,15 +1756,53 @@ def preview(set_pk: int, patient_pk: int | None = None):
     return response
 
 
-def _export_response(exported: Export):
+def _export_payload(exported: Export) -> bytes:
+    storage: ManagedStorage | None = None
     try:
-        handle = ManagedStorage(current_app.config["MEDIA_ROOT"]).open_read(exported.storage_key)
-    except StorageError:
+        byte_count = exported.byte_count
+        digest = exported.sha256
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count <= 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise StorageError("export metadata is invalid")
+        storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
+        with storage.open_read(exported.storage_key) as handle:
+            payload = read_bounded(handle, max_bytes=byte_count)
+        if len(payload) != byte_count or hashlib.sha256(payload).hexdigest() != digest:
+            raise StorageError("export integrity check failed")
+        return payload
+    except (ImagePolicyError, OSError, StorageError, TypeError, ValueError, OverflowError):
+        if storage is not None:
+            try:
+                storage.quarantine(exported.storage_key)
+            except StorageError:
+                pass
+        abort(410)
+
+
+def _export_response(exported: Export):
+    # Exports inherit the same active Patient/Set visibility contract as the
+    # owning Set routes; archived owners are never downloadable.
+    if open_comparison_set(exported.comparison_set_id) is None:
         abort(404)
-    suffix = exported.format.lower()
+    payload = _export_payload(exported)
+    try:
+        format_name = exported.format
+        if not isinstance(format_name, str):
+            raise ValueError
+        suffix = format_name.lower()
+        if suffix not in {"png", "pdf"}:
+            raise ValueError
+    except (TypeError, ValueError):
+        abort(500)
     mimetype = "image/png" if suffix == "png" else "application/pdf"
     response = send_file(
-        handle,
+        io.BytesIO(payload),
         mimetype=mimetype,
         download_name=f"comparison-set-{exported.comparison_set_id}-v{exported.rendered_version}.{suffix}",
         max_age=0,
@@ -1805,7 +1848,7 @@ def export_route(
 
 
 @comparisons_bp.get("/exports/<int:export_pk>")
-@editor_required
+@login_required
 def export_download(export_pk: int):
     exported = db.session.get(Export, export_pk)
     if exported is None:

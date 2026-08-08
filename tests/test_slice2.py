@@ -279,8 +279,8 @@ def test_reconcile_expires_malformed_marker_and_temp_without_touching_references
     storage = ManagedStorage(tmp_path / "media")
     orphan = storage.store(oriented_jpeg())
     referenced = storage.store(oriented_jpeg())
-    storage._release_pending(orphan.pending_key)
-    storage._release_pending(referenced.pending_key)
+    storage.preserve(orphan)
+    storage.preserve(referenced)
 
     old = time.time() - 301
     orphan_marker = storage.root / orphan.pending_key
@@ -323,7 +323,7 @@ def test_reconcile_rejects_marker_stem_mismatch_without_deleting_recent_media(
 ) -> None:
     storage = ManagedStorage(tmp_path / "media")
     stored = storage.store(oriented_jpeg())
-    storage._release_pending(stored.pending_key)
+    storage.preserve(stored)
     marker = storage.root / stored.pending_key
     stem = marker.name.removeprefix(".pending-")
     mismatched = "f" * len(stem)

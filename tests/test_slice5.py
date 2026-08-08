@@ -283,6 +283,80 @@ def test_png_pdf_are_audited_wysiwyg_and_keep_originals_unchanged(app):
         assert [capture.sha256 for capture in db.session.scalars(select(Capture).order_by(Capture.id))] == original_sha
 
 
+def test_export_form_uses_the_canonical_live_version_token(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    set_id, _version, _frame_ids, _original_sha = set_with_frames(app, editor_id, patient_id)
+
+    client = app.test_client()
+    login(client, "editor")
+    html = client.get(f"/comparison-sets/{set_id}").get_data(as_text=True)
+    assert re.search(
+        r'<input[^>]+name="version"[^>]+data-version-token',
+        html,
+    )
+    assert "querySelectorAll('[data-version-token]')" in html
+
+
+def test_export_download_requires_active_owner_but_keeps_viewer_read_access(app):
+    editor_id = add_user(app, "editor")
+    add_user(app, "viewer", "viewer")
+    patient_id = fixture_patient(app, editor_id)
+    set_id, version, _frame_ids, _original_sha = set_with_frames(app, editor_id, patient_id)
+
+    editor = app.test_client()
+    login(editor, "editor")
+    token = csrf_token(editor, f"/comparison-sets/{set_id}")
+    created = editor.post(
+        f"/comparison-sets/{set_id}/export",
+        data={"format": "png", "version": str(version), "csrf_token": token},
+    )
+    assert created.status_code == 200
+    export_id = int(created.headers["X-Export-ID"])
+
+    viewer = app.test_client()
+    login(viewer, "viewer")
+    assert viewer.get(f"/exports/{export_id}").status_code == 200
+
+    with app.app_context():
+        comparison_set = db.session.get(ComparisonSet, set_id)
+        assert comparison_set is not None
+        comparison_set.archived_at = datetime.now(timezone.utc)
+        db.session.commit()
+    archived = viewer.get(f"/exports/{export_id}")
+    assert archived.status_code == 404
+
+
+def test_export_download_rejects_and_quarantines_corrupt_bytes(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    set_id, version, _frame_ids, _original_sha = set_with_frames(app, editor_id, patient_id)
+
+    editor = app.test_client()
+    login(editor, "editor")
+    token = csrf_token(editor, f"/comparison-sets/{set_id}")
+    created = editor.post(
+        f"/comparison-sets/{set_id}/export",
+        data={"format": "png", "version": str(version), "csrf_token": token},
+    )
+    assert created.status_code == 200
+    export_id = int(created.headers["X-Export-ID"])
+    with app.app_context():
+        exported = db.session.get(Export, export_id)
+        assert exported is not None
+        storage_key = exported.storage_key
+        byte_count = exported.byte_count
+
+    corrupt_path = Path(app.config["MEDIA_ROOT"]) / storage_key
+    corrupt_path.write_bytes(b"x" * byte_count)
+    response = editor.get(f"/exports/{export_id}")
+    assert response.status_code == 410
+    assert storage_key not in response.get_data(as_text=True)
+    assert str(app.config["MEDIA_ROOT"]) not in response.get_data(as_text=True)
+    assert not corrupt_path.exists()
+    assert len(list((Path(app.config["MEDIA_ROOT"]) / "quarantine").glob("*.png"))) == 1
+
+
 def test_viewer_and_stale_version_cannot_export(app):
     editor_id = add_user(app, "editor")
     add_user(app, "viewer", "viewer")

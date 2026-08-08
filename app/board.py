@@ -405,6 +405,7 @@ def render_canvas(spec: CanvasRenderSpec | object, dpi: float = 300) -> Image.Im
         raise ValueError(f"canvas exceeds {MAX_CANVAS_PIXELS} pixels")
 
     board = Image.new("RGB", (width, height), spec.background)
+    board.info["canvas_size_mm"] = (spec.width_mm, spec.height_mm)
     draw = ImageDraw.Draw(board)
     geometries = layout_frames(spec)
     visible = [frame for frame in spec.frames if frame.visible]
@@ -488,18 +489,47 @@ def render_canvas(spec: CanvasRenderSpec | object, dpi: float = 300) -> Image.Im
     return board
 
 
-def encode(image: Image.Image, format: str = "PNG") -> bytes:
+def encode(
+    image: Image.Image,
+    format: str = "PNG",
+    *,
+    dpi: float = 300,
+    physical_size_mm: tuple[float, float] | None = None,
+) -> bytes:
     """Encode a rendered Canvas without writing it to a filesystem path."""
     if not isinstance(format, str):
         raise ValueError("output format is invalid")
     normalized = format.strip().lower().lstrip(".")
     if normalized not in {"png", "pdf", "jpg", "jpeg", "webp"}:
         raise ValueError("output format must be PNG, PDF, JPEG, or WebP")
+    if not _is_finite_number(dpi) or not 1 <= dpi <= MAX_RENDER_DPI:
+        raise ValueError(f"dpi must be finite and between 1 and {MAX_RENDER_DPI}")
+    if physical_size_mm is None:
+        physical_size_mm = image.info.get("canvas_size_mm")
     output = io.BytesIO()
     if normalized == "pdf":
         rgb = image if image.mode == "RGB" else image.convert("RGB")
         try:
-            rgb.save(output, format="PDF", resolution=300.0)
+            if physical_size_mm is None:
+                rgb.save(output, format="PDF", resolution=float(dpi))
+            else:
+                if (
+                    not isinstance(physical_size_mm, tuple)
+                    or len(physical_size_mm) != 2
+                    or not all(_is_finite_number(value) and value > 0 for value in physical_size_mm)
+                ):
+                    raise ValueError("physical Canvas dimensions must be positive finite numbers")
+                width_mm, height_mm = physical_size_mm
+                if image.width <= 0 or image.height <= 0:
+                    raise ValueError("image dimensions must be positive")
+                # Pillow derives PDF MediaBox from pixels / DPI.  Use the
+                # effective DPI for the rounded raster so the persisted Canvas
+                # dimensions, rather than the raster approximation, are exact.
+                effective_dpi = (
+                    image.width * 25.4 / float(width_mm),
+                    image.height * 25.4 / float(height_mm),
+                )
+                rgb.save(output, format="PDF", dpi=effective_dpi)
         finally:
             if rgb is not image:
                 rgb.close()
