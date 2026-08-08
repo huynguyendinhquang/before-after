@@ -5,9 +5,9 @@ Small open-source replacement for CorelDRAW **PowerCLIP** case boards.
 Typical use (Viengut-style medical sheet):
 
 - title: `Name - Year - ID - City`
-- fixed frames (slots) for clinical photos + X-rays
-- each image is clipped into its frame (`cover` crop or `contain` letterbox)
-- optional date captions under slots
+- structured Frames for clinical photos + X-rays
+- each image is clipped into its Frame with a persisted cover crop
+- optional Capture Date and Frame labels
 - export **PNG** / **PDF**
 
 ## Quick start
@@ -35,10 +35,10 @@ flask --app app:create_app run
 ```
 
 Production keeps `SESSION_COOKIE_SECURE` enabled and must run behind HTTPS
-(the HTTPS deployment is part of Slice 8). The temporary `/prototype` route is
-available only to Admins/Editors, is CSRF-protected, and audits generated
-output; it is not a standalone `app.web` server or an unaudited Viewer export.
-The standalone renderer CLI below remains available for Slice 0 comparisons.
+(the HTTPS deployment is part of Slice 8). Comparison Set preview and PNG/PDF
+export are versioned server-side; export is restricted to Admins/Editors,
+CSRF-protected, audited, and served with `Cache-Control: no-store`. Viewer
+accounts can read Sets and previews but cannot export.
 
 ### PostgreSQL acceptance gate
 
@@ -52,45 +52,23 @@ export TEST_DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_aft
 ./scripts/test-postgres.sh
 ```
 
-### CLI
+## Comparison Set preview and export
 
-```bash
-python -m app.cli \
-  --title "Nguyễn Thế Sơn - 1990 - VG2606000151 - Hải Phòng" \
-  --input-dir ./examples/sample_case \
-  --label xray_1=24/06/2026 \
-  --label xray_2=31/07/2026 \
-  -o output/case.png
-```
+Open a persisted Comparison Set in the web UI. The server preview and the
+Editor/Admin export form use the same versioned Canvas render specification;
+choose PNG or PDF and submit the current Set version. Export derivatives are
+stored outside the static web root and linked to an audited `Export` record.
 
-Or assign slots explicitly:
+## Structured Canvas layout
 
-```bash
-python -m app.cli \
-  --title "Patient - 1990 - ID - City" \
-  --slot portrait=./p.jpg \
-  --slot clinical_1=./c1.jpg \
-  --slot xray_1=./x1.jpg \
-  --label xray_1=24/06/2026 \
-  -o output/case.pdf
-```
-
-## Template = layout
-
-Edit `app/templates/viengut_case.json`:
-
-| field | meaning |
-|-------|---------|
-| `width_mm` / `height_mm` | page size (default A4 landscape) |
-| `slots[].id` | slot name (`portrait`, `clinical_1`, …) |
-| `slots[].x/y/w/h` | frame position/size in **mm** |
-| `slots[].fit` | `cover` (fill+crop) or `contain` (letterbox, good for X-ray) |
-
-Add more templates as extra JSON files in `app/templates/`.
+Canvas presets include 16:9, 16:10, A4 landscape, A4 portrait, and custom mm.
+The Set stores a shared Frame ratio, column count, order, visibility, labels,
+and normalized crop state. Hidden Frames are retained in the Set but excluded
+from preview/export.
 
 ## Layout matching your Corel board
 
-Default template mirrors the common foot-case sheet:
+A three-column structured grid mirrors the common foot-case sheet:
 
 ```
 +------------+--------+--------+--------+
@@ -104,15 +82,15 @@ Default template mirrors the common foot-case sheet:
 
 | CorelDRAW | this app |
 |-----------|----------|
-| Rectangle + PowerCLIP | slot frame + `cover`/`contain` |
-| Manual arrange | JSON template (repeatable) |
-| Export bitmap/PDF | Pillow PNG/PDF |
+| Rectangle + PowerCLIP | structured Frame + normalized cover crop |
+| Manual arrange | persisted Canvas/grid/order state |
+| Export bitmap/PDF | audited Pillow PNG/PDF derivative |
 
 ### Build path (suggested evolution)
 
-1. **Now** — template JSON + CLI + local web UI  
-2. **Next** — pan/zoom offset per slot (true PowerCLIP reframe)  
-3. **Later** — multi-page cases, before/after pair templates, HIS filename parse  
+1. **Now** — persisted Comparison Sets + local web UI + audited export
+2. **Next** — lifecycle and administration workflows
+3. **Later** — multi-page cases, HIS integration, guided capture
 
 ## Requirements
 

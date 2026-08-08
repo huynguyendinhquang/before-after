@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import unicodedata
@@ -43,9 +44,9 @@ from app.captures import (
     prepare_capture,
 )
 from app.db import db
-from app.models import Capture, ComparisonSet, Frame, Patient, User
+from app.models import Capture, ComparisonSet, Export, Frame, Patient, User
 from app.image_policy import DEFAULT_MAX_PIXELS, ImagePolicyError, read_bounded
-from app.storage import ImageInspection, ManagedStorage, StorageError
+from app.storage import ImageInspection, ManagedStorage, StorageError, StoredDerivative
 
 
 comparisons_bp = Blueprint("comparisons", __name__)
@@ -74,6 +75,10 @@ class EditLeaseError(ComparisonError):
 
 class PreviewLimitError(ComparisonError):
     """Raised when a preview exceeds its configured resource budget."""
+
+
+class ExportReconciliationError(ComparisonError):
+    """Raised when the database outcome of an export cannot be confirmed."""
 
 
 EDIT_LEASE_SECONDS = 5 * 60
@@ -1215,10 +1220,28 @@ def render_persisted_set(
     expected_version: object | None = None,
     dpi: float = DEFAULT_RENDER_DPI,
 ) -> bytes:
-    spec, _ = _materialize_render_spec(comparison_set, expected_version=expected_version)
+    return render_persisted_set_versioned(
+        comparison_set,
+        expected_version=expected_version,
+        dpi=dpi,
+    )[0]
+
+
+def _render_spec_bytes(
+    spec: CanvasRenderSpec,
+    output_format: str = "png",
+    *,
+    dpi: float = DEFAULT_RENDER_DPI,
+) -> bytes:
+    """Render and encode one immutable Set snapshot for preview or export."""
     image = render_canvas(spec, dpi=dpi)
     try:
-        return encode(image, "png")
+        return encode(
+            image,
+            output_format,
+            dpi=dpi,
+            physical_size_mm=(spec.width_mm, spec.height_mm),
+        )
     finally:
         image.close()
 
@@ -1231,11 +1254,125 @@ def render_persisted_set_versioned(
 ) -> tuple[bytes, int]:
     """Render a materialized snapshot and return its exact persisted version."""
     spec, version = _materialize_render_spec(comparison_set, expected_version=expected_version)
-    image = render_canvas(spec, dpi=dpi)
+    return _render_spec_bytes(spec, "png", dpi=dpi), version
+
+
+def _export_format(value: object) -> str:
+    if not isinstance(value, str):
+        raise ComparisonError("Export format must be PNG or PDF")
+    normalized = value.strip().lower().lstrip(".")
+    if normalized not in {"png", "pdf"}:
+        raise ComparisonError("Export format must be PNG or PDF")
+    return normalized.upper()
+
+
+def _reconcile_export(storage_key: str) -> Export | None:
+    """Read committed export state in a new session after an unclear commit."""
+    db.session.rollback()
+    session = db.session.session_factory()
     try:
-        return encode(image, "png"), version
+        exported = session.scalar(select(Export).where(Export.storage_key == storage_key))
+        if exported is not None:
+            session.expunge(exported)
+        return exported
+    except Exception:
+        session.rollback()
+        raise
     finally:
-        image.close()
+        session.close()
+
+
+def _settle_export_attempt(
+    managed: ManagedStorage,
+    stored: StoredDerivative | None,
+    committed: Export,
+) -> None:
+    if stored is None:
+        return
+    if committed.storage_key == stored.storage_key:
+        try:
+            managed.finalize(stored)
+        except StorageError:
+            # The row is durable; reconciliation can remove this marker later.
+            pass
+    else:
+        managed.discard(stored)
+
+
+def create_export(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet,
+    output_format: object,
+    expected_version: object,
+    storage: ManagedStorage | None = None,
+    dpi: float = DEFAULT_RENDER_DPI,
+) -> Export:
+    """Render one requested Set version, persist its derivative, and audit it."""
+    _require_editor(actor)
+    format_name = _export_format(output_format)
+    expected = _version(expected_version)
+    spec, version = _materialize_render_spec(
+        comparison_set,
+        expected_version=expected,
+    )
+    payload = _render_spec_bytes(spec, format_name, dpi=dpi)
+    managed = storage or ManagedStorage(current_app.config["MEDIA_ROOT"])
+    stored: StoredDerivative | None = None
+    try:
+        stored = managed.store_derivative(payload, format_name)
+        exported = Export(
+            comparison_set_id=comparison_set.id,
+            format=format_name,
+            storage_key=stored.storage_key,
+            byte_count=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            rendered_version=version,
+            created_by_id=actor.id,
+        )
+        db.session.add(exported)
+        db.session.flush()
+        append_audit(
+            actor=actor,
+            action="export.create",
+            entity_type="export",
+            entity_id=exported.id,
+            details={
+                "format": format_name,
+                "byte_count": len(payload),
+                "sha256": exported.sha256,
+                "rendered_version": version,
+            },
+        )
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        if stored is None:
+            raise
+        try:
+            committed = _reconcile_export(stored.storage_key)
+        except Exception as reconciliation_exc:
+            managed.preserve(stored)
+            raise ExportReconciliationError(
+                "Export save status could not be confirmed; pending derivative was preserved for reconciliation"
+            ) from reconciliation_exc
+        if committed is not None:
+            _settle_export_attempt(managed, stored, committed)
+            return committed
+        managed.discard(stored)
+        raise
+
+    if stored is not None:
+        try:
+            managed.finalize(stored)
+        except StorageError:
+            # A committed export remains recoverable through reconciliation.
+            pass
+    return exported
+
+
+# Descriptive alias for callers that name the operation rather than the row.
+export_comparison_set = create_export
 
 
 def _route_patient(patient_pk: int) -> Patient:
@@ -1617,6 +1754,106 @@ def preview(set_pk: int, patient_pk: int | None = None):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Comparison-Set-Version"] = str(version)
     return response
+
+
+def _export_payload(exported: Export) -> bytes:
+    storage: ManagedStorage | None = None
+    try:
+        byte_count = exported.byte_count
+        digest = exported.sha256
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count <= 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise StorageError("export metadata is invalid")
+        storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
+        with storage.open_read(exported.storage_key) as handle:
+            payload = read_bounded(handle, max_bytes=byte_count)
+        if len(payload) != byte_count or hashlib.sha256(payload).hexdigest() != digest:
+            raise StorageError("export integrity check failed")
+        return payload
+    except (ImagePolicyError, OSError, StorageError, TypeError, ValueError, OverflowError):
+        if storage is not None:
+            try:
+                storage.quarantine(exported.storage_key)
+            except StorageError:
+                pass
+        abort(410)
+
+
+def _export_response(exported: Export):
+    # Exports inherit the same active Patient/Set visibility contract as the
+    # owning Set routes; archived owners are never downloadable.
+    if open_comparison_set(exported.comparison_set_id) is None:
+        abort(404)
+    payload = _export_payload(exported)
+    try:
+        format_name = exported.format
+        if not isinstance(format_name, str):
+            raise ValueError
+        suffix = format_name.lower()
+        if suffix not in {"png", "pdf"}:
+            raise ValueError
+    except (TypeError, ValueError):
+        abort(500)
+    mimetype = "image/png" if suffix == "png" else "application/pdf"
+    response = send_file(
+        io.BytesIO(payload),
+        mimetype=mimetype,
+        download_name=f"comparison-set-{exported.comparison_set_id}-v{exported.rendered_version}.{suffix}",
+        max_age=0,
+        conditional=False,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Comparison-Set-Version"] = str(exported.rendered_version)
+    response.headers["X-Export-ID"] = str(exported.id)
+    response.headers["X-Export-SHA256"] = exported.sha256
+    return response
+
+
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/export")
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/export/<output_format>")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/export")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/export/<output_format>")
+@editor_required
+def export_route(
+    set_pk: int,
+    output_format: str | None = None,
+    patient_pk: int | None = None,
+):
+    comparison_set = _route_set(set_pk, patient_pk)
+    try:
+        payload = _request_payload()
+        exported = create_export(
+            actor=current_user,
+            comparison_set=comparison_set,
+            output_format=output_format or payload.get("format"),
+            expected_version=payload.get("version", payload.get("expected_version")),
+            dpi=float(current_app.config.get("BOARD_RENDER_DPI", DEFAULT_RENDER_DPI)),
+        )
+    except StaleVersionError as exc:
+        return jsonify(error=str(exc)), 409
+    except ExportReconciliationError as exc:
+        return jsonify(error=str(exc)), 503
+    except PreviewLimitError as exc:
+        return jsonify(error=str(exc)), 413
+    except (ComparisonError, StorageError, ValueError, IntegrityError) as exc:
+        return jsonify(error=str(exc)), 400
+    return _export_response(exported)
+
+
+@comparisons_bp.get("/exports/<int:export_pk>")
+@login_required
+def export_download(export_pk: int):
+    exported = db.session.get(Export, export_pk)
+    if exported is None:
+        abort(404)
+    return _export_response(exported)
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/reorder")

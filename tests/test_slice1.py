@@ -246,39 +246,12 @@ def test_patient_creation_requires_consent_and_audit_rolls_back_with_mutation(ap
         assert db.session.scalar(select(func.count(AuditEvent.id))) == 0
 
 
-def test_prototype_is_preserved_under_transition_prefix(app) -> None:
+def test_legacy_renderer_routes_are_removed_after_export_cutover(app) -> None:
     add_user(app, "editor", "editor")
-    add_user(app, "viewer", "viewer")
     client = app.test_client()
     login(client, "/login", "editor")
-    response = client.get("/prototype")
-    assert response.status_code == 200
-    assert "Before / After Case Board" in response.get_data(as_text=True)
-    assert client.get("/prototype/api/template/viengut_case").status_code == 200
-
-    render_response = client.post(
-        "/prototype/render",
-        data={
-            "title": "Migration preview",
-            "template": "viengut_case",
-            "format": "png",
-            "labels": "{}",
-            "csrf_token": csrf_token(client, "/patients"),
-        },
-    )
-    assert render_response.status_code == 200
-    with app.app_context():
-        event = db.session.scalar(
-            select(AuditEvent).where(AuditEvent.action == "prototype.export")
-        )
-        assert event is not None
-        assert event.actor_id is not None
-        assert event.details["format"] == "png"
-
-    client.post("/logout", data={"csrf_token": csrf_token(client, "/patients")})
-    login(client, "/login", "viewer")
-    assert client.get("/prototype").status_code == 403
-    assert client.post("/prototype/render").status_code == 403
+    assert client.get("/prototype").status_code == 404
+    assert client.post("/render").status_code == 404
 
 
 def test_create_admin_records_bootstrap_audit_and_rolls_back_with_audit_failure(

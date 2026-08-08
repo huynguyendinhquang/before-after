@@ -78,7 +78,7 @@ class PendingCapture:
 
     def preserve(self) -> None:
         if self.stored is not None:
-            self.managed._release_pending(self.stored.pending_key)
+            self.managed.preserve(self.stored)
 
     def settle(self, committed: Capture) -> None:
         _settle_committed_attempt(self.managed, self.stored, committed)
@@ -331,7 +331,7 @@ def prepare_capture(
                 committed = _reconcile_capture(patient_id, inspection.sha256)
             except Exception as exc:
                 if stored is not None:
-                    managed._release_pending(stored.pending_key)
+                    managed.preserve(stored)
                 raise CaptureReconciliationError(
                     "Capture save status could not be confirmed; pending media was preserved for reconciliation"
                 ) from exc

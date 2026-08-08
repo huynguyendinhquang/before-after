@@ -12,12 +12,12 @@ from flask_login import current_user
 from flask_wtf.csrf import CSRFError, CSRFProtect
 from sqlalchemy import select
 
-from app.auth import auth_bp, editor_required, login_manager, register_cli
+from app.auth import auth_bp, login_manager, register_cli
 from app.captures import captures_bp
 from app.comparisons import comparisons_bp
 from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
-from app.models import Capture
+from app.models import Capture, Export
 from app.patients import patients_bp
 from app.storage import DEFAULT_ORPHAN_GRACE_SECONDS, ManagedStorage, StorageError
 
@@ -74,42 +74,6 @@ def _validate_configuration(app: Flask) -> None:
         app.config["DEBUG"] = False
 
 
-def _register_prototype_routes(app: Flask) -> None:
-    """Keep Slice 0's renderer available without exposing it at the new root."""
-    from app import web as legacy
-
-    @app.get("/prototype")
-    @editor_required
-    def prototype_index():
-        return legacy.index()
-
-    @app.get("/prototype/api/template/<name>")
-    @editor_required
-    def prototype_template(name: str):
-        return legacy.api_template(name)
-
-    @app.post("/prototype/render")
-    @editor_required
-    def prototype_render():
-        response = legacy.do_render()
-        if response.status_code == 200:
-            from app.audit import append_audit
-
-            try:
-                append_audit(
-                    actor=current_user,
-                    action="prototype.export",
-                    entity_type="prototype",
-                    entity_id="legacy",
-                    details={"format": (request.form.get("format") or "png").lower()},
-                )
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
-                raise
-        return response
-
-
 def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=True)
     app.config.from_mapping(
@@ -144,7 +108,6 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(patients_bp)
     app.register_blueprint(captures_bp)
     app.register_blueprint(comparisons_bp)
-    _register_prototype_routes(app)
     register_cli(app)
 
     @app.cli.command("reconcile-media")
@@ -155,11 +118,12 @@ def create_app(config: dict | None = None) -> Flask:
         show_default=True,
     )
     def reconcile_media(grace_seconds: float) -> None:
-        """Remove stale media that no committed Capture references."""
+        """Remove stale media that no committed Capture or Export references."""
         storage = ManagedStorage(app.config["MEDIA_ROOT"])
         try:
             with storage.reconciliation_lock():
                 referenced = set(db.session.scalars(select(Capture.storage_key)))
+                referenced.update(db.session.scalars(select(Export.storage_key)))
                 removed = storage.reconcile(referenced, grace_seconds=grace_seconds)
         except StorageError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -180,7 +144,7 @@ def create_app(config: dict | None = None) -> Flask:
     @app.after_request
     def no_store_authenticated_patient_pages(response):
         if current_user.is_authenticated and request.path.startswith(
-            ("/patients", "/captures", "/shot-types", "/comparison-sets", "/prototype")
+            ("/patients", "/captures", "/shot-types", "/comparison-sets", "/exports")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response

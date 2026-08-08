@@ -346,6 +346,46 @@ class Frame(db.Model):
     capture = db.relationship("Capture", foreign_keys=[capture_id], lazy="joined")
 
 
+class Export(db.Model):
+    __tablename__ = "exports"
+
+    id = db.Column(db.Integer, primary_key=True)
+    comparison_set_id = db.Column(
+        db.Integer,
+        db.ForeignKey("comparison_sets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    format = db.Column(db.String(8), nullable=False)
+    storage_key = db.Column(db.String(512), nullable=False)
+    byte_count = db.Column(db.BigInteger, nullable=False)
+    sha256 = db.Column(db.String(64), nullable=False)
+    rendered_version = db.Column(db.Integer, nullable=False)
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
+
+    __table_args__ = (
+        db.CheckConstraint("format IN ('PNG', 'PDF')", name="ck_exports_format"),
+        db.CheckConstraint("length(trim(storage_key)) > 0", name="ck_exports_storage_key_not_blank"),
+        db.CheckConstraint("byte_count > 0", name="ck_exports_byte_count"),
+        db.CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_exports_sha256"),
+        db.CheckConstraint("rendered_version > 0", name="ck_exports_rendered_version"),
+        db.UniqueConstraint("storage_key", name="uq_exports_storage_key"),
+        db.Index("ix_exports_comparison_set_version", "comparison_set_id", "rendered_version"),
+    )
+
+    comparison_set = db.relationship("ComparisonSet", foreign_keys=[comparison_set_id], lazy="joined")
+    created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
+
+    @property
+    def rendered_set_version(self) -> int:
+        """Descriptive alias for callers that name the persisted Set version."""
+        return self.rendered_version
+
+
 class AuditEvent(db.Model):
     __tablename__ = "audit_events"
 
