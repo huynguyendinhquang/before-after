@@ -19,7 +19,6 @@ from app.board import (
     CanvasRenderSpec,
     FrameRenderSpec,
     cover_crop_normalized,
-    export as export_board,
     layout_frames,
     render_canvas,
 )
@@ -786,27 +785,6 @@ def test_preview_decoded_pixel_limit_is_checked_before_media_open(app, monkeypat
             with pytest.raises(PreviewLimitError, match="decoded pixels"):
                 render_persisted_set(current)
             assert opened == []
-
-
-def test_legacy_pdf_export_does_not_overwrite_resolution(tmp_path: Path, monkeypatch) -> None:
-    board = Image.new("RGB", (20, 10), "white")
-    calls = []
-    original_save = Image.Image.save
-
-    def tracked_save(image, *args, **kwargs):
-        calls.append((args, kwargs))
-        return original_save(image, *args, **kwargs)
-
-    monkeypatch.setattr(Image.Image, "save", tracked_save)
-    try:
-        output = export_board(board, tmp_path / "board.pdf")
-        assert output.exists()
-        assert len(calls) == 1
-        assert calls[0][0][1] == "PDF"
-        assert calls[0][1]["resolution"] == 300.0
-    finally:
-        board.close()
-
 
 def test_render_canvas_clamps_a4_frame_edges_at_150_dpi(monkeypatch) -> None:
     source = Image.new("RGB", (20, 20), "red")

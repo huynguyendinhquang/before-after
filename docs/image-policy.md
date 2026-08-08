@@ -1,6 +1,6 @@
 # Image policy
 
-The prototype accepts BMP, JPEG, PNG, TIFF, and WebP image content. Animated
+The application accepts BMP, JPEG, PNG, TIFF, and WebP image content. Animated
 and unknown formats are rejected. Pillow EXIF orientation is applied before
 render geometry, and opened files are detached and closed before rendering.
 
@@ -25,8 +25,8 @@ enabled; warning-range decompression bombs are also rejected as
 `ImagePolicyError`, and these limits do not disable or widen it. Only PNG/JPEG
 terminal-marker checks reject trailing bytes: PNG inputs must end with terminal
 IEND, and JPEG inputs with terminal EOI; other formats remain best effort. Keep
-the production media root on the managed backup volume; the current prototype
-uses only temporary upload files and does not persist media.
+the production media root on the managed backup volume; originals and
+approved derivatives are stored there outside the static web root.
 
 Seekable caller-owned streams are measured from their actual contents and
 their original cursor is restored after success or failure. Unknown-length or

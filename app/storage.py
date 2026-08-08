@@ -25,7 +25,7 @@ from app.image_policy import FORMAT_EXTENSIONS, ImagePolicyError, open_image
 
 PREVIEW_MAX_DIMENSION = 1600
 DEFAULT_ORPHAN_GRACE_SECONDS = 300
-_ALLOWED_ROOTS = frozenset({"originals", "previews", "quarantine"})
+_ALLOWED_ROOTS = frozenset({"originals", "previews", "derivatives", "quarantine"})
 _HEX_KEY = re.compile(r"^[0-9a-f]{32}$")
 _PENDING_PREFIX = ".pending-"
 _PENDING_MARKER_NAME = re.compile(r"^\.pending-([0-9a-f]{32})$")
@@ -61,6 +61,12 @@ class StoredMedia:
     original_key: str
     preview_key: str
     pending_key: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredDerivative:
+    storage_key: str
+    pending_key: str
 
 
 class ManagedStorage:
@@ -345,6 +351,56 @@ class ManagedStorage:
             finally:
                 self._release_pending(stored.pending_key)
 
+    def finalize_derivative(self, stored: StoredDerivative) -> None:
+        """Release a committed derivative marker without touching its bytes."""
+        with self.reconciliation_lock():
+            try:
+                self.cleanup(stored.pending_key)
+            finally:
+                self._release_pending(stored.pending_key)
+
+    def discard_derivative(self, stored: StoredDerivative) -> None:
+        """Release a failed derivative and best-effort remove its bytes/marker."""
+        with self.reconciliation_lock():
+            try:
+                for key in (stored.storage_key, stored.pending_key):
+                    try:
+                        self.cleanup(key)
+                    except StorageError:
+                        pass
+            finally:
+                self._release_pending(stored.pending_key)
+
+    def store_derivative(self, payload: bytes, format: str) -> StoredDerivative:
+        """Atomically store a PNG/PDF derivative with a crash-reconcilable marker."""
+        try:
+            raw = bytes(payload)
+        except (TypeError, ValueError) as exc:
+            raise StorageError("derivative payload must contain bytes") from exc
+        if not raw:
+            raise StorageError("derivative payload is empty")
+        if not isinstance(format, str):
+            raise StorageError("derivative format is invalid")
+        extension = format.strip().lower().lstrip(".")
+        if extension not in {"png", "pdf"}:
+            raise StorageError("derivative format is invalid")
+        stem = uuid.uuid4().hex
+        storage_key = f"derivatives/{stem}.{extension}"
+        pending_key = f"quarantine/{_PENDING_PREFIX}{stem}"
+        with self.reconciliation_lock():
+            try:
+                self._create_pending_marker(pending_key, storage_key, "")
+                self._atomic_write(storage_key, raw)
+                return StoredDerivative(storage_key=storage_key, pending_key=pending_key)
+            except Exception:
+                for key in (storage_key, pending_key):
+                    try:
+                        self.cleanup(key)
+                    except StorageError:
+                        pass
+                self._release_pending(pending_key)
+                raise
+
     def _atomic_write(self, key: str, payload: bytes) -> None:
         parts = self._key_parts(key)
         parent_fd: int | None = None
@@ -551,24 +607,30 @@ class ManagedStorage:
                 raise StorageError("pending marker is incomplete")
             original_key, preview_key = lines[:2]
             original_parts = self._key_parts(original_key)
-            if len(original_parts) != 2 or original_parts[0] != "originals":
-                raise StorageError("pending marker original key is invalid")
+            if len(original_parts) != 2:
+                raise StorageError("pending marker media key is invalid")
             original_name = original_parts[-1]
             original_stem = Path(original_name).stem
             extension = Path(original_name).suffix.lower().lstrip(".")
             if original_stem != marker_stem or not _HEX_KEY.fullmatch(original_stem):
                 raise StorageError("pending marker stem does not match its key")
-            if extension not in FORMAT_EXTENSIONS.values():
-                raise StorageError("pending marker original extension is invalid")
-            if ManagedStorage.preview_key(original_key) != preview_key:
-                raise StorageError("pending marker does not match its media")
-            preview_parts = self._key_parts(preview_key)
-            if (
-                len(preview_parts) != 2
-                or preview_parts[0] != "previews"
-                or preview_parts[-1] != f"{marker_stem}.jpg"
-            ):
-                raise StorageError("pending marker preview key is invalid")
+            if original_parts[0] == "originals":
+                if extension not in FORMAT_EXTENSIONS.values():
+                    raise StorageError("pending marker original extension is invalid")
+                if ManagedStorage.preview_key(original_key) != preview_key:
+                    raise StorageError("pending marker does not match its media")
+                preview_parts = self._key_parts(preview_key)
+                if (
+                    len(preview_parts) != 2
+                    or preview_parts[0] != "previews"
+                    or preview_parts[-1] != f"{marker_stem}.jpg"
+                ):
+                    raise StorageError("pending marker preview key is invalid")
+            elif original_parts[0] == "derivatives":
+                if preview_key or extension not in {"png", "pdf"}:
+                    raise StorageError("pending marker derivative key is invalid")
+            else:
+                raise StorageError("pending marker media root is invalid")
         except (UnicodeError, ValueError) as exc:
             raise StorageError("pending marker is invalid") from exc
         return original_key, preview_key
@@ -618,6 +680,8 @@ class ManagedStorage:
             return timestamp - modified >= grace
 
         def remove(key: str) -> bool:
+            if key in removed:
+                return False
             try:
                 self.cleanup(key)
             except StorageError:
@@ -627,11 +691,21 @@ class ManagedStorage:
 
         originals = self._regular_entries("originals")
         previews = self._regular_entries("previews")
+        derivatives = self._regular_entries("derivatives")
         quarantine = self._regular_entries("quarantine")
+        media_entries = {
+            "originals": originals,
+            "previews": previews,
+            "derivatives": derivatives,
+        }
         protected_stems: set[str] = set()
         removed: list[str] = []
 
-        for directory, entries in (("originals", originals), ("previews", previews)):
+        for directory, entries in (
+            ("originals", originals),
+            ("previews", previews),
+            ("derivatives", derivatives),
+        ):
             for name, modified in entries.items():
                 if not _TEMP_NAME.fullmatch(name):
                     continue
@@ -682,14 +756,14 @@ class ManagedStorage:
                 if not marker_stale:
                     protected_stems.add(marker_match.group(1))
                     continue
-                original_name = Path(original_key).name
-                preview_name = Path(preview_key).name
-                if original_key not in referenced and original_name in originals:
-                    if is_stale(originals[original_name]):
-                        remove(original_key)
-                if preview_key not in referenced and preview_name in previews:
-                    if is_stale(previews[preview_name]):
-                        remove(preview_key)
+                for media_key in (original_key, preview_key):
+                    if not media_key or media_key in referenced:
+                        continue
+                    media_parts = self._key_parts(media_key)
+                    entries = media_entries[media_parts[0]]
+                    media_name = media_parts[-1]
+                    if media_name in entries and is_stale(entries[media_name]):
+                        remove(media_key)
                 remove(marker_key)
             finally:
                 try:
@@ -697,27 +771,17 @@ class ManagedStorage:
                 finally:
                     os.close(marker_fd)
 
-        original_by_stem = {
-            Path(name).stem: name
-            for name in originals
-            if _HEX_KEY.fullmatch(Path(name).stem)
-        }
-        preview_by_stem = {
-            Path(name).stem: name
-            for name in previews
-            if _HEX_KEY.fullmatch(Path(name).stem)
-        }
-        stems = set(original_by_stem) | set(preview_by_stem)
-        for stem in sorted(stems - protected_stems):
-            original_name = original_by_stem.get(stem)
-            preview_name = preview_by_stem.get(stem)
-            original_key = f"originals/{original_name}" if original_name else None
-            preview_key = f"previews/{preview_name}" if preview_name else None
-            for key, modified in (
-                (original_key, originals[original_name]) if original_name else (None, 0),
-                (preview_key, previews[preview_name]) if preview_name else (None, 0),
-            ):
-                if key is None or is_referenced(key) or not is_stale(modified):
+        media_by_stem: dict[str, list[tuple[str, float]]] = {}
+        for directory, entries in media_entries.items():
+            for name, modified in entries.items():
+                stem = Path(name).stem
+                if _HEX_KEY.fullmatch(stem):
+                    media_by_stem.setdefault(stem, []).append(
+                        (f"{directory}/{name}", modified)
+                    )
+        for stem in sorted(set(media_by_stem) - protected_stems):
+            for key, modified in media_by_stem[stem]:
+                if is_referenced(key) or not is_stale(modified):
                     continue
                 remove(key)
         return removed

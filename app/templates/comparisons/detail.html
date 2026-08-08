@@ -149,6 +149,19 @@
       </tbody></table>
     {% else %}<p class="muted">No Frames in this Set yet.</p>{% endif %}
   {% endif %}
+  {% if current_user.is_editor %}
+  <h2>Export</h2>
+  <form method="post" action="{{ url_for('comparisons.export_route', set_pk=comparison_set.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <label for="export-format">Format</label>
+    <select id="export-format" name="format">
+      <option value="png">PNG</option>
+      <option value="pdf">PDF</option>
+    </select>
+    <button type="submit">Export</button>
+  </form>
+  {% endif %}
   <p><a href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Back to Comparison Sets</a> · <a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
 </section>
 {% if can_edit %}
