@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}New Comparison Set — {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>New Comparison Set — {{ patient.patient_id }}</h1>
+  <form method="post" novalidate>
+    {{ form.hidden_tag() }}
+    <label for="name">{{ form.name.label }}</label>
+    {{ form.name(id="name", autofocus=true) }}
+    {% for error in form.name.errors %}<div class="error">{{ error }}</div>{% endfor %}
+
+    <h2>Canvas</h2>
+    <label for="preset_key">{{ form.preset_key.label }}</label>
+    {{ form.preset_key(id="preset_key", value=form.preset_key.data or "a4-landscape") }}
+    <label for="canvas_width_mm">{{ form.canvas_width_mm.label }}</label>
+    {{ form.canvas_width_mm(id="canvas_width_mm", value=form.canvas_width_mm.data or "297") }}
+    <label for="canvas_height_mm">{{ form.canvas_height_mm.label }}</label>
+    {{ form.canvas_height_mm(id="canvas_height_mm", value=form.canvas_height_mm.data or "210") }}
+    <label for="frame_ratio">{{ form.frame_ratio.label }}</label>
+    {{ form.frame_ratio(id="frame_ratio", value=form.frame_ratio.data if form.frame_ratio.data is not none else "1.0") }}
+    <label for="columns">{{ form.columns.label }}</label>
+    {{ form.columns(id="columns", value=form.columns.data if form.columns.data is not none else "3") }}
+
+    <h2>Output labels</h2>
+    <label>{{ form.show_patient_id() }} {{ form.show_patient_id.label.text }}</label>
+    <label>{{ form.show_patient_name() }} {{ form.show_patient_name.label.text }}</label>
+    <label>{{ form.show_birth_year() }} {{ form.show_birth_year.label.text }}</label>
+    <label>{{ form.date_label_default(checked=true) }} {{ form.date_label_default.label.text }}</label>
+    {{ form.submit() }}
+  </form>
+  <p><a href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Back to Comparison Sets</a></p>
+</section>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Comparison Sets — {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+    <h1>Comparison Sets — {{ patient.patient_id }}</h1>
+    {% if current_user.is_editor %}<a class="button" href="{{ url_for('comparisons.new', patient_pk=patient.id) }}">New Set</a>{% endif %}
+  </div>
+  {% if comparison_sets %}
+    <table>
+      <thead><tr><th>Name</th><th>Canvas</th><th>Frames</th><th>Updated</th></tr></thead>
+      <tbody>
+      {% for comparison_set in comparison_sets %}
+        <tr>
+          <td><a href="{{ url_for('comparisons.detail', set_pk=comparison_set.id) }}">{{ comparison_set.name }}</a></td>
+          <td>{{ comparison_set.canvas_width_mm }} × {{ comparison_set.canvas_height_mm }} mm</td>
+          <td>{{ comparison_set.frames|length }}</td>
+          <td>{{ comparison_set.updated_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No Comparison Sets created yet.</p>
+  {% endif %}
+  <p><a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
+</section>
+{% endblock %}
