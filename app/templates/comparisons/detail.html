@@ -30,6 +30,7 @@
             {% if current_user.is_editor %}
               <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}">
                 {{ frame_form.csrf_token }}
+                <input type="hidden" name="version" value="{{ comparison_set.version }}">
                 {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
                 <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
                 {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
@@ -60,14 +61,17 @@
       </select>
       {% for error in frame_form.capture_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
       <p class="muted">Or upload a new Capture:</p>
-      <label for="image">{{ frame_form.image.label }}</label>
-      {{ frame_form.image(id="image", accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*") }}
+      <div id="image-dropzone" role="group" aria-label="Upload a new Capture">
+        <label for="image">{{ frame_form.image.label.text }}</label>
+        {{ frame_form.image(id="image", accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*") }}
+        <span class="muted">Or drag and drop an image here.</span>
+      </div>
       {% for error in frame_form.image.errors %}<div class="error">{{ error }}</div>{% endfor %}
-      <label for="capture_date">{{ frame_form.capture_date.label }}</label>
+      <label for="capture_date">{{ frame_form.capture_date.label.text }}</label>
       {{ frame_form.capture_date(id="capture_date", type="date") }}
       <label>{{ frame_form.capture_date_confirmed() }} {{ frame_form.capture_date_confirmed.label.text }}</label>
       {% for error in frame_form.capture_date.errors %}<div class="error">{{ error }}</div>{% endfor %}
-      <label for="shot_type_name">{{ frame_form.shot_type_name.label }}</label>
+      <label for="shot_type_name">{{ frame_form.shot_type_name.label.text }}</label>
       {{ frame_form.shot_type_name(id="shot_type_name", autocomplete="off") }}
       <label>{{ frame_form.create_proposal() }} {{ frame_form.create_proposal.label.text }}</label>
       {{ frame_form.submit() }}
@@ -75,4 +79,19 @@
   {% endif %}
   <p><a href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Back to Comparison Sets</a> · <a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
 </section>
+<script>
+(() => {
+  const zone = document.getElementById("image-dropzone");
+  const input = document.getElementById("image");
+  if (!zone || !input) return;
+  zone.addEventListener("dragover", (event) => event.preventDefault());
+  zone.addEventListener("drop", (event) => {
+    event.preventDefault();
+    if (event.dataTransfer.files.length) {
+      input.files = event.dataTransfer.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  });
+})();
+</script>
 {% endblock %}

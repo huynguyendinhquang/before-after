@@ -13,7 +13,14 @@ from PIL import Image
 from sqlalchemy import create_engine, func, select, text
 
 from app import create_app
-from app.comparisons import ComparisonError, SamePatientError, add_frame, create_comparison_set
+from app.comparisons import (
+    ComparisonError,
+    SamePatientError,
+    StaleVersionError,
+    add_frame,
+    create_comparison_set,
+    reorder_frames,
+)
 from app.captures import create_capture
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, ComparisonSet, Frame, Patient, ShotType, User
@@ -211,6 +218,7 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
         capture_count = db.session.scalar(select(func.count(Capture.id)))
         assert capture_count == 2
         assert len(list((Path(app.config["MEDIA_ROOT"]) / "originals").iterdir())) == 2
+        set_version = comparison_set.version
 
     # Reorder through the same route a user uses, then verify it survives a
     # fresh application/session against the same PostgreSQL rows.
@@ -219,10 +227,20 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
         f"/comparison-sets/{set_id}/reorder",
         data={
             "frame_ids": [str(frame_ids[1]), str(frame_ids[0])],
+            "version": str(set_version),
             "csrf_token": token,
         },
     )
     assert response.status_code == 302
+    stale = client.post(
+        f"/comparison-sets/{set_id}/reorder",
+        data={
+            "frame_ids": [str(frame_ids[0]), str(frame_ids[1])],
+            "version": str(set_version),
+            "csrf_token": token,
+        },
+    )
+    assert stale.status_code == 409
 
     restarted = create_app(app_config(tmp_path, migrated_test_database))
     restarted_client = restarted.test_client()
@@ -230,6 +248,9 @@ def test_set_acceptance_reopens_inline_capture_and_persists_manual_order(app, tm
     detail = restarted_client.get(f"/comparison-sets/{set_id}")
     assert detail.status_code == 200
     assert detail.headers["Cache-Control"] == "no-store"
+    detail_body = detail.get_data(as_text=True)
+    assert "dataTransfer.files" in detail_body
+    assert "dragover" in detail_body
     with restarted.app_context():
         comparison_set = db.session.get(ComparisonSet, set_id)
         assert comparison_set is not None
@@ -264,3 +285,169 @@ def test_cross_patient_frame_and_duplicate_active_name_are_rejected(app):
             create_comparison_set(actor=actor, patient=first_patient, name=" summary ")
         assert db.session.scalar(select(func.count(Frame.id))) == 0
         assert db.session.scalar(select(func.count(AuditEvent.id)).where(AuditEvent.action == "frame.add")) == 0
+
+
+def test_inline_capture_and_frame_share_one_commit_and_failed_media_is_discarded(
+    app, monkeypatch: pytest.MonkeyPatch
+):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Atomic")
+        commit_count: list[int] = []
+        original_commit = db.session.commit
+
+        def count_commit() -> None:
+            commit_count.append(1)
+            original_commit()
+
+        monkeypatch.setattr(db.session, "commit", count_commit)
+        add_frame(
+            actor=actor,
+            comparison_set=comparison_set,
+            upload=jpeg("red"),
+            capture_date="2024-01-01",
+            capture_date_confirmed=True,
+            shot_type_name="Anterior",
+        )
+        assert commit_count == [1]
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
+        assert db.session.scalar(select(func.count(Frame.id))) == 1
+        assert db.session.scalar(
+            select(func.count(AuditEvent.id)).where(AuditEvent.action == "capture.create")
+        ) == 1
+        assert db.session.scalar(
+            select(func.count(AuditEvent.id)).where(AuditEvent.action == "frame.add")
+        ) == 1
+
+        def fail_commit() -> None:
+            raise RuntimeError("outer commit failed")
+
+        monkeypatch.setattr(db.session, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="outer commit failed"):
+            add_frame(
+                actor=actor,
+                comparison_set=comparison_set,
+                upload=jpeg("green"),
+                capture_date="2024-02-01",
+                capture_date_confirmed=True,
+                shot_type_name="Anterior",
+            )
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
+        assert db.session.scalar(select(func.count(Frame.id))) == 1
+
+    media_root = Path(app.config["MEDIA_ROOT"])
+    assert len(list((media_root / "originals").iterdir())) == 1
+    assert len(list((media_root / "previews").iterdir())) == 1
+
+
+def test_manual_frame_order_is_preserved_and_stale_versions_are_rejected(app):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+    capture_ids = [
+        stored_capture(app, editor_id, patient_id, jpeg(color), capture_date)
+        for color, capture_date in (
+            ("blue", "2024-01-01"),
+            ("green", "2024-02-01"),
+            ("red", "2024-03-01"),
+        )
+    ]
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Manual")
+        set_id = comparison_set.id
+        for capture_id in capture_ids:
+            add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+        frames = list(
+            db.session.scalars(
+                select(Frame).where(Frame.comparison_set_id == set_id).order_by(Frame.position)
+            )
+        )
+        frame_ids = [frame.id for frame in frames]
+        version = db.session.get(ComparisonSet, set_id).version
+        reorder_frames(
+            actor=actor,
+            comparison_set=comparison_set,
+            ordered_frame_ids=[frame_ids[2], frame_ids[0], frame_ids[1]],
+            expected_version=version,
+        )
+        with pytest.raises(StaleVersionError):
+            reorder_frames(
+                actor=actor,
+                comparison_set=comparison_set,
+                ordered_frame_ids=frame_ids,
+                expected_version=version,
+            )
+        db.session.rollback()
+
+    appended_capture_id = stored_capture(app, editor_id, patient_id, jpeg("yellow"), "2020-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        comparison_set = db.session.get(ComparisonSet, set_id)
+        assert actor is not None and comparison_set is not None
+        add_frame(actor=actor, comparison_set=comparison_set, capture_id=appended_capture_id)
+        final_frames = list(
+            db.session.scalars(
+                select(Frame).where(Frame.comparison_set_id == set_id).order_by(Frame.position)
+            )
+        )
+        assert [frame.id for frame in final_frames[:3]] == [frame_ids[2], frame_ids[0], frame_ids[1]]
+        assert final_frames[-1].capture_id == appended_capture_id
+        assert [frame.position for frame in final_frames] == [0, 1, 2, 3]
+
+
+def test_capture_reload_and_canvas_precision_validation(app):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    other_patient_id = create_patient(app, client, "SET-0002")
+    add_shot_type(app, editor_id)
+    other_capture_id = stored_capture(app, editor_id, other_patient_id, jpeg("blue"), "2024-01-01")
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Validation")
+        supplied = db.session.get(Capture, other_capture_id)
+        assert supplied is not None
+        supplied.patient_id = patient_id
+        with pytest.raises(SamePatientError):
+            add_frame(actor=actor, comparison_set=comparison_set, capture=supplied)
+        db.session.rollback()
+
+        with pytest.raises(ComparisonError, match="2 decimal places"):
+            create_comparison_set(
+                actor=actor,
+                patient=patient,
+                name="Too precise",
+                canvas_width_mm="297.001",
+            )
+        with pytest.raises(ComparisonError, match="positive"):
+            create_comparison_set(
+                actor=actor,
+                patient=patient,
+                name="Zero ratio",
+                frame_ratio=0,
+            )
+        with pytest.raises(ComparisonError, match="positive integer"):
+            create_comparison_set(
+                actor=actor,
+                patient=patient,
+                name="Zero columns",
+                columns=0,
+            )

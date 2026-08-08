@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 import unicodedata
 
 from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, send_file, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.exc import IntegrityError
 from wtforms import BooleanField, FileField, StringField, SubmitField
 from wtforms.validators import DataRequired, Length, ValidationError
@@ -24,13 +25,15 @@ from app.storage import ImageInspection, ManagedStorage, StorageError, StoredMed
 captures_bp = Blueprint("captures", __name__)
 
 
-def _strict_confirmation(_form, field) -> None:
+def _strict_confirmation(form, field) -> None:
+    if getattr(form, "capture_id", None) is not None and form.capture_id.data:
+        return
     if field.raw_data != ["y"]:
         raise ValidationError("Capture Date confirmation is required.")
 
 
-class CaptureForm(FlaskForm):
-    image = FileField("Image", validators=[DataRequired()])
+class CaptureUploadForm(FlaskForm):
+    image = FileField("Image")
     capture_date = StringField("Capture Date", validators=[Length(max=10)])
     capture_date_confirmed = BooleanField(
         "I confirm this Capture Date is correct (or I have overridden the EXIF suggestion).",
@@ -38,6 +41,10 @@ class CaptureForm(FlaskForm):
     )
     shot_type_name = StringField("Shot Type", validators=[Length(max=200)])
     create_proposal = BooleanField("Use this name as a Shot Type Proposal")
+
+
+class CaptureForm(CaptureUploadForm):
+    image = FileField("Image", validators=[DataRequired()])
     submit = SubmitField("Save Capture")
 
 
@@ -51,6 +58,30 @@ class ConsentRequired(CaptureError):
 
 class CaptureReconciliationError(CaptureError):
     """Raised when a failed commit cannot be verified safely."""
+
+
+@dataclass
+class PendingCapture:
+    """A prepared Capture whose media still follows the caller's transaction."""
+
+    capture: Capture
+    managed: ManagedStorage
+    stored: StoredMedia | None
+
+    def finalize(self) -> None:
+        if self.stored is not None:
+            self.managed.finalize(self.stored)
+
+    def discard(self) -> None:
+        if self.stored is not None:
+            self.managed.discard(self.stored)
+
+    def preserve(self) -> None:
+        if self.stored is not None:
+            self.managed._release_pending(self.stored.pending_key)
+
+    def settle(self, committed: Capture) -> None:
+        _settle_committed_attempt(self.managed, self.stored, committed)
 
 
 def _storage(storage: ManagedStorage | None = None) -> ManagedStorage:
@@ -166,6 +197,35 @@ def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
     )
 
 
+def _current_patient(patient: Patient) -> Patient:
+    if patient is None:
+        raise CaptureError("Patient is unavailable")
+    state = inspect(patient)
+    patient_id = state.identity[0] if state.identity else state.dict.get("id")
+    if isinstance(patient_id, bool) or not isinstance(patient_id, int):
+        raise CaptureError("Patient is unavailable")
+    with db.session.no_autoflush:
+        current = db.session.scalar(
+            select(Patient)
+            .where(Patient.id == patient_id)
+            .execution_options(autoflush=False)
+        )
+        if current is not None:
+            db.session.expunge(current)
+            current = db.session.scalar(
+                select(Patient)
+                .where(Patient.id == patient_id)
+                .execution_options(autoflush=False)
+            )
+    if current is None:
+        if state.dict.get("consent_confirmed_at", object()) is None:
+            raise ConsentRequired("Consent Confirmation is required before storing images")
+        raise CaptureError("Patient is unavailable")
+    if current.archived_at is not None:
+        raise CaptureError("Patient is unavailable")
+    return current
+
+
 def _reconcile_capture(patient_id: int, sha256: str) -> Capture | None:
     """Check commit state in a new session before deciding whether to clean media."""
     db.session.rollback()
@@ -205,7 +265,7 @@ def _settle_committed_attempt(
         managed.discard(stored)
 
 
-def create_capture(
+def prepare_capture(
     *,
     actor: User,
     patient: Patient,
@@ -219,12 +279,11 @@ def create_capture(
     original_filename: str | None = None,
     storage: ManagedStorage | None = None,
     inspection: ImageInspection | None = None,
-) -> Capture:
-    """Store one Capture and its audit event, or return an existing duplicate."""
+) -> PendingCapture:
+    """Prepare one Capture while leaving commit ownership with the caller."""
     if not actor.is_editor:
         raise PermissionError("only an Editor or Admin can create Captures")
-    if patient is None or patient.archived_at is not None:
-        raise CaptureError("Patient is unavailable")
+    patient = _current_patient(patient)
     if patient.consent_confirmed_at is None:
         raise ConsentRequired("Consent Confirmation is required before storing images")
     if capture_date_confirmed is not True:
@@ -238,7 +297,7 @@ def create_capture(
         inspection = managed.inspect(payload)
     duplicate = _existing_capture(patient_id, inspection.sha256)
     if duplicate is not None:
-        return duplicate
+        return PendingCapture(duplicate, managed, None)
 
     stored = None
     try:
@@ -271,12 +330,14 @@ def create_capture(
             try:
                 committed = _reconcile_capture(patient_id, inspection.sha256)
             except Exception as exc:
+                if stored is not None:
+                    managed._release_pending(stored.pending_key)
                 raise CaptureReconciliationError(
                     "Capture save status could not be confirmed; pending media was preserved for reconciliation"
                 ) from exc
             if committed is not None:
                 _settle_committed_attempt(managed, stored, committed)
-                return committed
+                return PendingCapture(committed, managed, None)
             raise
         append_audit(
             actor=actor,
@@ -284,31 +345,74 @@ def create_capture(
             entity_type="capture",
             entity_id=capture.id,
         )
-        try:
-            db.session.commit()
-        except Exception:
+    except CaptureReconciliationError:
+        raise
+    except Exception:
+        if stored is not None:
+            managed.discard(stored)
+        raise
+    return PendingCapture(capture, managed, stored)
+
+
+def create_capture(
+    *,
+    actor: User,
+    patient: Patient,
+    upload: object,
+    capture_date: date | str | None,
+    capture_date_confirmed: bool,
+    shot_type: ShotType | int | None = None,
+    shot_type_id: int | None = None,
+    shot_type_name: str | None = None,
+    create_proposal: bool = False,
+    original_filename: str | None = None,
+    storage: ManagedStorage | None = None,
+    inspection: ImageInspection | None = None,
+) -> Capture:
+    """Store one Capture and its audit event, or return an existing duplicate."""
+    pending: PendingCapture | None = None
+    try:
+        pending = prepare_capture(
+            actor=actor,
+            patient=patient,
+            upload=upload,
+            capture_date=capture_date,
+            capture_date_confirmed=capture_date_confirmed,
+            shot_type=shot_type,
+            shot_type_id=shot_type_id,
+            shot_type_name=shot_type_name,
+            create_proposal=create_proposal,
+            original_filename=original_filename,
+            storage=storage,
+            inspection=inspection,
+        )
+        if pending.stored is None:
+            return pending.capture
+        db.session.commit()
+    except CaptureReconciliationError:
+        db.session.rollback()
+        if pending is not None:
+            pending.preserve()
+        raise
+    except Exception:
+        if pending is None:
+            db.session.rollback()
+        else:
             try:
-                committed = _reconcile_capture(patient_id, inspection.sha256)
+                committed = _reconcile_capture(pending.capture.patient_id, pending.capture.sha256)
             except Exception as exc:
+                db.session.rollback()
+                pending.preserve()
                 raise CaptureReconciliationError(
                     "Capture save status could not be confirmed; pending media was preserved for reconciliation"
                 ) from exc
             if committed is not None:
-                _settle_committed_attempt(managed, stored, committed)
+                pending.settle(committed)
                 return committed
-            raise
-    except CaptureReconciliationError:
-        db.session.rollback()
-        if stored is not None:
-            managed._release_pending(stored.pending_key)
+            pending.discard()
         raise
-    except Exception:
-        db.session.rollback()
-        if stored is not None:
-            managed.discard(stored)
-        raise
-    managed.finalize(stored)
-    return capture
+    pending.finalize()
+    return pending.capture
 
 
 def search_shot_types(query: str = "", limit: int = 20) -> list[ShotType]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flask_login import UserMixin
-from sqlalchemy.orm import synonym, validates
+from sqlalchemy.orm import validates
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.db import db
@@ -299,17 +299,6 @@ class ComparisonSet(db.Model):
         ),
     )
 
-    title = synonym("name")
-    canvas_preset_key = synonym("preset_key")
-    canvas_preset = synonym("preset_key")
-    frame_aspect_ratio = synonym("frame_ratio")
-    include_patient_id = synonym("show_patient_id")
-    include_patient_name = synonym("show_patient_name")
-    include_birth_year = synonym("show_birth_year")
-    show_capture_date = synonym("date_label_default")
-    edit_lock_holder_id = synonym("lock_holder_id")
-    edit_lock_expires_at = synonym("lock_expires_at")
-
     patient = db.relationship("Patient", foreign_keys=[patient_id], back_populates="comparison_sets", lazy="joined")
     frames = db.relationship(
         "Frame",
@@ -352,11 +341,6 @@ class Frame(db.Model):
         db.CheckConstraint("pan_y >= -1 AND pan_y <= 1", name="ck_frames_pan_y"),
         db.UniqueConstraint("comparison_set_id", "position", name="uq_frames_set_position"),
     )
-
-    set_id = synonym("comparison_set_id")
-    capture_date_visible = synonym("date_visible_override")
-    date_label_visible = synonym("date_visible_override")
-    date_override = synonym("date_visible_override")
 
     comparison_set = db.relationship("ComparisonSet", back_populates="frames", lazy="joined")
     capture = db.relationship("Capture", foreign_keys=[capture_id], lazy="joined")

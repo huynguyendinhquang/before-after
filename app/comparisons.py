@@ -9,11 +9,10 @@ from decimal import Decimal, InvalidOperation
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from wtforms import (
     BooleanField,
-    FileField,
     FloatField,
     IntegerField,
     StringField,
@@ -23,7 +22,14 @@ from wtforms.validators import Length, Optional
 
 from app.audit import append_audit
 from app.auth import editor_required
-from app.captures import CaptureError, create_capture, list_captures
+from app.captures import (
+    CaptureError,
+    CaptureReconciliationError,
+    CaptureUploadForm,
+    PendingCapture,
+    list_captures,
+    prepare_capture,
+)
 from app.db import db
 from app.models import Capture, ComparisonSet, Frame, Patient, User
 from app.storage import ImageInspection, ManagedStorage, StorageError
@@ -40,13 +46,8 @@ class SamePatientError(ComparisonError):
     """Raised when a Frame would reference another Patient's Capture."""
 
 
-class InlineCaptureFrameError(ComparisonError):
-    """The Capture committed, but its following Frame mutation did not."""
-
-    def __init__(self, capture_id: int, cause: Exception) -> None:
-        self.capture_id = capture_id
-        super().__init__(f"Capture {capture_id} was saved but its Frame was not added")
-        self.__cause__ = cause
+class StaleVersionError(ComparisonError):
+    """Raised when a reorder was based on an older Set version."""
 
 
 class ComparisonSetForm(FlaskForm):
@@ -63,13 +64,8 @@ class ComparisonSetForm(FlaskForm):
     submit = SubmitField("Create Set")
 
 
-class FrameForm(FlaskForm):
+class FrameForm(CaptureUploadForm):
     capture_id = IntegerField("Existing Capture", validators=[Optional()])
-    image = FileField("New image")
-    capture_date = StringField("Capture Date", validators=[Length(max=10)])
-    capture_date_confirmed = BooleanField("I confirm this Capture Date is correct")
-    shot_type_name = StringField("Shot Type", validators=[Length(max=200)])
-    create_proposal = BooleanField("Use this name as a Shot Type Proposal")
     submit = SubmitField("Add Frame")
 
 
@@ -79,17 +75,75 @@ def _require_editor(actor: User) -> None:
 
 
 def _active_patient(patient: Patient | None) -> Patient:
-    if patient is None or patient.archived_at is not None:
+    if patient is None:
         raise ComparisonError("Patient is unavailable")
-    return patient
+    state = inspect(patient)
+    patient_id = state.identity[0] if state.identity else state.dict.get("id")
+    if isinstance(patient_id, bool) or not isinstance(patient_id, int):
+        raise ComparisonError("Patient is unavailable")
+    with db.session.no_autoflush:
+        current = db.session.scalar(
+            select(Patient)
+            .where(Patient.id == patient_id)
+            .execution_options(autoflush=False)
+        )
+        if current is not None:
+            db.session.expunge(current)
+            current = db.session.scalar(
+                select(Patient)
+                .where(Patient.id == patient_id)
+                .execution_options(autoflush=False)
+            )
+    if current is None or current.archived_at is not None:
+        raise ComparisonError("Patient is unavailable")
+    return current
 
 
 def _active_set(comparison_set: ComparisonSet | None) -> ComparisonSet:
-    if comparison_set is None or comparison_set.archived_at is not None:
+    if comparison_set is None:
         raise ComparisonError("Comparison Set is unavailable")
-    if comparison_set.patient is None or comparison_set.patient.archived_at is not None:
+    state = inspect(comparison_set)
+    set_id = state.identity[0] if state.identity else state.dict.get("id")
+    if isinstance(set_id, bool) or not isinstance(set_id, int):
+        raise ComparisonError("Comparison Set is unavailable")
+    with db.session.no_autoflush:
+        current = db.session.scalar(
+            select(ComparisonSet)
+            .where(ComparisonSet.id == set_id)
+            .execution_options(autoflush=False)
+        )
+        if current is not None:
+            db.session.expunge(current)
+            current = db.session.scalar(
+                select(ComparisonSet)
+                .where(ComparisonSet.id == set_id)
+                .execution_options(autoflush=False)
+            )
+    if current is None or current.archived_at is not None:
+        raise ComparisonError("Comparison Set is unavailable")
+    if current.patient is None or current.patient.archived_at is not None:
         raise ComparisonError("Patient is unavailable")
-    return comparison_set
+    return current
+
+
+def _locked_comparison_set(comparison_set: ComparisonSet) -> ComparisonSet | None:
+    state = inspect(comparison_set)
+    set_id = state.identity[0] if state.identity else state.dict.get("id")
+    with db.session.no_autoflush:
+        current = db.session.scalar(
+            select(ComparisonSet)
+            .where(ComparisonSet.id == set_id)
+            .execution_options(autoflush=False)
+            .with_for_update(of=ComparisonSet)
+        )
+        if current is not None:
+            db.session.expunge(current)
+            current = db.session.scalar(
+                select(ComparisonSet)
+                .where(ComparisonSet.id == set_id)
+                .execution_options(autoflush=False)
+            )
+    return current
 
 
 def _number(value: object, field: str) -> float:
@@ -115,7 +169,13 @@ def _millimetres(value: object, field: str) -> Decimal:
         raise ComparisonError(f"{field} must be a positive number") from exc
     if not number.is_finite() or number <= 0 or number > Decimal("999999.99"):
         raise ComparisonError(f"{field} must be a positive number")
-    return number.quantize(Decimal("0.01"))
+    try:
+        quantized = number.quantize(Decimal("0.01"))
+    except InvalidOperation as exc:
+        raise ComparisonError(f"{field} must have at most 2 decimal places") from exc
+    if quantized != number:
+        raise ComparisonError(f"{field} must have at most 2 decimal places")
+    return quantized
 
 
 def _name(value: str | None) -> str:
@@ -132,7 +192,6 @@ def create_comparison_set(
     actor: User,
     patient: Patient,
     name: str | None = None,
-    title: str | None = None,
     canvas_width_mm: object = 297,
     canvas_height_mm: object = 210,
     preset_key: str = "a4-landscape",
@@ -146,8 +205,6 @@ def create_comparison_set(
     """Create a named Set and its audit event in one transaction."""
     _require_editor(actor)
     patient = _active_patient(patient)
-    if name is None:
-        name = title
     set_name = _name(name)
     if not isinstance(preset_key, str) or not preset_key.strip() or len(preset_key.strip()) > 32:
         raise ComparisonError("Canvas preset is invalid")
@@ -223,13 +280,28 @@ def list_comparison_sets(patient: Patient) -> list[ComparisonSet]:
 
 
 def open_comparison_set(set_id: int, patient: Patient | None = None) -> ComparisonSet | None:
-    comparison_set = db.session.get(ComparisonSet, set_id)
+    with db.session.no_autoflush:
+        comparison_set = db.session.scalar(
+            select(ComparisonSet)
+            .where(ComparisonSet.id == set_id)
+            .execution_options(autoflush=False)
+        )
+        if comparison_set is not None:
+            db.session.expunge(comparison_set)
+            comparison_set = db.session.scalar(
+                select(ComparisonSet)
+                .where(ComparisonSet.id == set_id)
+                .execution_options(autoflush=False)
+            )
     if comparison_set is None or comparison_set.archived_at is not None:
         return None
     if comparison_set.patient is None or comparison_set.patient.archived_at is not None:
         return None
-    if patient is not None and comparison_set.patient_id != patient.id:
-        return None
+    if patient is not None:
+        state = inspect(patient)
+        patient_id = state.identity[0] if state.identity else state.dict.get("id")
+        if comparison_set.patient_id != patient_id:
+            return None
     return comparison_set
 
 
@@ -242,14 +314,64 @@ def _capture_for_frame(capture: Capture | int | None, capture_id: int | None) ->
     if isinstance(candidate, bool):
         raise ComparisonError("Capture is invalid")
     if isinstance(candidate, int):
-        result = db.session.get(Capture, candidate)
+        candidate_id = candidate
     elif isinstance(candidate, Capture):
-        result = candidate
+        state = inspect(candidate)
+        candidate_id = state.identity[0] if state.identity else state.dict.get("id")
     else:
         raise ComparisonError("Capture is invalid")
+    if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
+        raise ComparisonError("Capture is invalid")
+    with db.session.no_autoflush:
+        result = db.session.scalar(
+            select(Capture)
+            .where(Capture.id == candidate_id)
+            .execution_options(autoflush=False)
+        )
+        if result is not None:
+            db.session.expunge(result)
+            result = db.session.scalar(
+                select(Capture)
+                .where(Capture.id == candidate_id)
+                .execution_options(autoflush=False)
+            )
     if result is None:
         raise ComparisonError("Capture is unavailable")
     return result
+
+
+def _inline_commit_state(
+    pending: PendingCapture,
+    comparison_set_id: int,
+    frame_id: int,
+) -> tuple[Capture | None, bool]:
+    session = db.session.session_factory()
+    try:
+        capture_state = inspect(pending.capture)
+        capture_id = (
+            capture_state.identity[0]
+            if capture_state.identity
+            else capture_state.dict.get("id")
+        )
+        capture = session.scalar(select(Capture).where(Capture.id == capture_id))
+        frame_saved = session.scalar(
+            select(Frame.id).where(
+                Frame.id == frame_id,
+                Frame.comparison_set_id == comparison_set_id,
+            )
+        ) is not None
+        if capture is not None:
+            session.expunge(capture)
+        return capture, frame_saved
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _frame_capture_order_key(frame: Frame) -> tuple[object, int, int]:
+    return (frame.capture.capture_date, frame.capture_id, frame.id)
 
 
 def add_frame(
@@ -270,70 +392,76 @@ def add_frame(
     inspection: ImageInspection | None = None,
     position: int | None = None,
 ) -> Frame:
-    """Add an existing Capture or call the Slice 2 Capture command once."""
+    """Add an existing Capture or prepare a new Capture in one transaction."""
     _require_editor(actor)
     comparison_set = _active_set(comparison_set)
-    selected = _capture_for_frame(capture, capture_id)
-    inline_capture = selected is None
-    if inline_capture:
-        if upload is None:
-            raise ComparisonError("choose an existing Capture or upload an image")
-        # This deliberately delegates all validation, deduplication, storage,
-        # and Capture auditing to Slice 2 instead of maintaining a second path.
-        selected = create_capture(
-            actor=actor,
-            patient=comparison_set.patient,
-            upload=upload,
-            capture_date=capture_date,
-            capture_date_confirmed=capture_date_confirmed,
-            shot_type=shot_type,
-            shot_type_id=shot_type_id,
-            shot_type_name=shot_type_name,
-            create_proposal=create_proposal,
-            original_filename=original_filename,
-            storage=storage,
-            inspection=inspection,
-        )
-
-    if selected.patient_id != comparison_set.patient_id:
-        if inline_capture:
-            raise InlineCaptureFrameError(selected.id, SamePatientError("Capture belongs to another Patient"))
-        raise SamePatientError("Capture belongs to another Patient")
-    if selected.archived_at is not None:
-        raise ComparisonError("Capture is unavailable")
-
-    automatic_position = position is None
-    existing_frames: list[Frame] = []
-    if automatic_position:
-        existing_frames = list(
-            db.session.scalars(
-                select(Frame)
-                .where(Frame.comparison_set_id == comparison_set.id)
-                .order_by(Frame.position, Frame.id)
-            )
-        )
-        maximum = max((item.position for item in existing_frames), default=-1)
-        position = 0 if not existing_frames else maximum + len(existing_frames) + 2
-    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
-        raise ComparisonError("Frame position is invalid")
-
-    frame = Frame(
-        comparison_set_id=comparison_set.id,
-        capture_id=selected.id,
-        position=position,
-        visible=True,
-        label=None,
-        date_visible_override=None,
-        zoom=1.0,
-        pan_x=0.0,
-        pan_y=0.0,
-    )
+    pending: PendingCapture | None = None
     try:
+        selected = _capture_for_frame(capture, capture_id)
+        if selected is None:
+            if upload is None:
+                raise ComparisonError("choose an existing Capture or upload an image")
+            pending = prepare_capture(
+                actor=actor,
+                patient=comparison_set.patient,
+                upload=upload,
+                capture_date=capture_date,
+                capture_date_confirmed=capture_date_confirmed,
+                shot_type=shot_type,
+                shot_type_id=shot_type_id,
+                shot_type_name=shot_type_name,
+                create_proposal=create_proposal,
+                original_filename=original_filename,
+                storage=storage,
+                inspection=inspection,
+            )
+            selected = pending.capture
+
+        comparison_set = _locked_comparison_set(comparison_set)
+        if comparison_set is None or comparison_set.archived_at is not None:
+            raise ComparisonError("Comparison Set is unavailable")
+        if comparison_set.patient is None or comparison_set.patient.archived_at is not None:
+            raise ComparisonError("Patient is unavailable")
+        if selected.patient_id != comparison_set.patient_id:
+            raise SamePatientError("Capture belongs to another Patient")
+        if selected.archived_at is not None:
+            raise ComparisonError("Capture is unavailable")
+
+        automatic_position = position is None
+        existing_frames: list[Frame] = []
+        if automatic_position:
+            existing_frames = list(
+                db.session.scalars(
+                    select(Frame)
+                    .where(Frame.comparison_set_id == comparison_set.id)
+                    .order_by(Frame.position, Frame.id)
+                )
+            )
+            maximum = max((item.position for item in existing_frames), default=-1)
+            position = maximum + 1
+        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            raise ComparisonError("Frame position is invalid")
+
+        frame = Frame(
+            comparison_set_id=comparison_set.id,
+            capture_id=selected.id,
+            capture=selected,
+            position=position,
+            visible=True,
+            label=None,
+            date_visible_override=None,
+            zoom=1.0,
+            pan_x=0.0,
+            pan_y=0.0,
+        )
         db.session.add(frame)
         db.session.flush()
-        if automatic_position and existing_frames:
-            # Move through temporary positions so inserting an older Capture
-            # cannot collide with the existing unique (Set, position) key.
+        canonical = [frame.id for frame in existing_frames] == [
+            item.id
+            for item in sorted(existing_frames, key=_frame_capture_order_key)
+        ]
+        if automatic_position and existing_frames and canonical:
+            # Move through temporary positions before restoring Capture-Date order.
             offset = position + len(existing_frames) + 1
             for index, existing in enumerate(existing_frames):
                 existing.position = offset + index
@@ -341,15 +469,12 @@ def add_frame(
             db.session.flush()
             ordered = sorted(
                 [*existing_frames, frame],
-                key=lambda item: (
-                    selected.capture_date if item is frame else item.capture.capture_date,
-                    selected.id if item is frame else item.capture_id,
-                    item.id,
-                ),
+                key=_frame_capture_order_key,
             )
             for index, item in enumerate(ordered):
                 item.position = index
         comparison_set.updated_by_id = actor.id
+        comparison_set.version += 1
         append_audit(
             actor=actor,
             action="frame.add",
@@ -357,12 +482,35 @@ def add_frame(
             entity_id=frame.id,
             details={"comparison_set_id": comparison_set.id, "capture_id": selected.id},
         )
+    except Exception:
+        db.session.rollback()
+        if pending is not None:
+            pending.discard()
+        raise
+    try:
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
-        if inline_capture:
-            raise InlineCaptureFrameError(selected.id, exc) from exc
+        if pending is None:
+            raise
+        try:
+            committed, frame_saved = _inline_commit_state(pending, comparison_set.id, frame.id)
+        except Exception as reconciliation_exc:
+            pending.preserve()
+            raise CaptureReconciliationError(
+                "Capture and Frame save status could not be confirmed; pending media was preserved for reconciliation"
+            ) from reconciliation_exc
+        if committed is not None:
+            pending.settle(committed)
+            if frame_saved:
+                return frame
+            raise CaptureReconciliationError(
+                "Capture commit was confirmed but its Frame was not"
+            ) from exc
+        pending.discard()
         raise
+    if pending is not None:
+        pending.finalize()
     return frame
 
 
@@ -371,19 +519,35 @@ def reorder_frames(
     actor: User,
     comparison_set: ComparisonSet,
     ordered_frame_ids: Sequence[int],
+    expected_version: object,
 ) -> list[Frame]:
-    """Persist a complete manual order for the Set's Frames."""
+    """Persist a complete manual order when the Set version is unchanged."""
     _require_editor(actor)
+    try:
+        if isinstance(expected_version, bool) or not isinstance(expected_version, (int, str)):
+            raise ValueError
+        expected_version = int(expected_version)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ComparisonError("Set version is required") from exc
+    if expected_version <= 0:
+        raise ComparisonError("Set version is required")
     comparison_set = _active_set(comparison_set)
     try:
         ordered_ids = [int(value) for value in ordered_frame_ids]
     except (TypeError, ValueError) as exc:
         raise ComparisonError("Frame order is invalid") from exc
+    locked_set = _locked_comparison_set(comparison_set)
+    if locked_set is None or locked_set.archived_at is not None:
+        raise ComparisonError("Comparison Set is unavailable")
+    if locked_set.patient is None or locked_set.patient.archived_at is not None:
+        raise ComparisonError("Patient is unavailable")
+    if locked_set.version != expected_version:
+        raise StaleVersionError("Set has changed; reload before reordering")
 
     frames = list(
         db.session.scalars(
             select(Frame)
-            .where(Frame.comparison_set_id == comparison_set.id)
+            .where(Frame.comparison_set_id == locked_set.id)
             .order_by(Frame.position, Frame.id)
         )
     )
@@ -399,12 +563,23 @@ def reorder_frames(
         db.session.flush()
         for index, frame_id in enumerate(ordered_ids):
             by_id[frame_id].position = index
-        comparison_set.updated_by_id = actor.id
+        result = db.session.execute(
+            update(ComparisonSet)
+            .where(
+                ComparisonSet.id == locked_set.id,
+                ComparisonSet.version == expected_version,
+            )
+            .values(version=expected_version + 1, updated_by_id=actor.id)
+        )
+        if result.rowcount != 1:
+            raise StaleVersionError("Set has changed; reload before reordering")
+        locked_set.version = expected_version + 1
+        locked_set.updated_by_id = actor.id
         append_audit(
             actor=actor,
             action="comparison_set.reorder",
             entity_type="comparison_set",
-            entity_id=comparison_set.id,
+            entity_id=locked_set.id,
             details={"frame_ids": ordered_ids},
         )
         db.session.commit()
@@ -412,12 +587,6 @@ def reorder_frames(
         db.session.rollback()
         raise
     return [by_id[frame_id] for frame_id in ordered_ids]
-
-
-# Small aliases keep the feature vocabulary usable by callers without adding
-# another persistence path.
-create_set = create_comparison_set
-list_sets = list_comparison_sets
 
 
 def _route_patient(patient_pk: int) -> Patient:
@@ -457,11 +626,19 @@ def new(patient_pk: int):
                 actor=current_user,
                 patient=patient,
                 name=form.name.data,
-                canvas_width_mm=form.canvas_width_mm.data or 297,
-                canvas_height_mm=form.canvas_height_mm.data or 210,
+                canvas_width_mm=(
+                    form.canvas_width_mm.data
+                    if form.canvas_width_mm.data is not None
+                    else 297
+                ),
+                canvas_height_mm=(
+                    form.canvas_height_mm.data
+                    if form.canvas_height_mm.data is not None
+                    else 210
+                ),
                 preset_key=form.preset_key.data or "a4-landscape",
-                frame_ratio=form.frame_ratio.data or 1.0,
-                columns=form.columns.data or 3,
+                frame_ratio=form.frame_ratio.data if form.frame_ratio.data is not None else 1.0,
+                columns=form.columns.data if form.columns.data is not None else 3,
                 show_patient_id=form.show_patient_id.data,
                 show_patient_name=form.show_patient_name.data,
                 show_birth_year=form.show_birth_year.data,
@@ -529,9 +706,6 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
                 create_proposal=form.create_proposal.data,
                 original_filename=filename,
             )
-    except InlineCaptureFrameError as exc:
-        flash(f"Capture {exc.capture_id} was saved, but its Frame was not added.", "error")
-        return redirect(url_for("comparisons.detail", set_pk=comparison_set.id)), 409
     except (CaptureError, ComparisonError, StorageError, IntegrityError) as exc:
         form.capture_id.errors.append(str(exc))
         return render_template(
@@ -552,6 +726,11 @@ def reorder(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
     payload = request.get_json(silent=True) if request.is_json else None
     raw_ids = payload.get("frame_ids") if isinstance(payload, dict) else request.form.getlist("frame_ids")
+    expected_version = (
+        payload.get("version", payload.get("expected_version"))
+        if isinstance(payload, dict)
+        else request.form.get("version", request.form.get("expected_version"))
+    )
     if raw_ids is None:
         raw_ids = []
 
@@ -581,13 +760,19 @@ def reorder(set_pk: int, patient_pk: int | None = None):
             actor=current_user,
             comparison_set=comparison_set,
             ordered_frame_ids=raw_ids,
+            expected_version=expected_version,
         )
+    except StaleVersionError as exc:
+        if request.is_json:
+            return {"error": str(exc)}, 409
+        flash(str(exc), "error")
+        return redirect(url_for("comparisons.detail", set_pk=comparison_set.id)), 409
     except ComparisonError as exc:
         if request.is_json:
             return {"error": str(exc)}, 400
         flash(str(exc), "error")
         return redirect(url_for("comparisons.detail", set_pk=comparison_set.id)), 400
     if request.is_json:
-        return {"frame_ids": [frame.id for frame in ordered]}
+        return {"frame_ids": [frame.id for frame in ordered], "version": int(expected_version) + 1}
     flash("Frame order saved.", "success")
     return redirect(url_for("comparisons.detail", set_pk=comparison_set.id))
