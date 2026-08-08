@@ -11,12 +11,14 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from app.board import BoardTemplate, CaseData, export, render
+from app.image_policy import ImagePolicyError, configured_request_limit, open_image
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = ROOT / "app" / "templates"
 DEFAULT_TEMPLATE = TEMPLATE_DIR / "viengut_case.json"
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = configured_request_limit()
 
 PAGE = r"""
 <!doctype html>
@@ -172,27 +174,34 @@ def do_render():
     tmpl = _load_template(tmpl_name)
     images: dict[str, Path] = {}
 
-    with tempfile.TemporaryDirectory() as td:
-        tdir = Path(td)
-        for slot in tmpl.slots:
-            f = request.files.get(f"slot_{slot.id}")
-            if not f or not f.filename:
-                continue
-            dest = tdir / f"{slot.id}{Path(f.filename).suffix or '.jpg'}"
-            f.save(dest)
-            images[slot.id] = dest
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            for slot in tmpl.slots:
+                f = request.files.get(f"slot_{slot.id}")
+                if not f or not f.filename:
+                    continue
+                # Validate content and decoded dimensions before writing a
+                # request body into the temporary output directory.
+                with open_image(f.stream):
+                    pass
+                dest = tdir / f"{slot.id}{Path(f.filename).suffix or '.jpg'}"
+                f.save(dest)
+                images[slot.id] = dest
 
-        case = CaseData(title=title, images=images, labels=labels)
-        board = render(tmpl, case, dpi=200 if fmt == "png" else 300)
+            case = CaseData(title=title, images=images, labels=labels)
+            board = render(tmpl, case, dpi=200 if fmt == "png" else 300)
 
-        buf = io.BytesIO()
-        if fmt == "pdf":
-            board.convert("RGB").save(buf, "PDF", resolution=300.0)
+            buf = io.BytesIO()
+            if fmt == "pdf":
+                board.convert("RGB").save(buf, "PDF", resolution=300.0)
+                buf.seek(0)
+                return send_file(buf, mimetype="application/pdf", download_name="case-board.pdf")
+            board.save(buf, "PNG")
             buf.seek(0)
-            return send_file(buf, mimetype="application/pdf", download_name="case-board.pdf")
-        board.save(buf, "PNG")
-        buf.seek(0)
-        return send_file(buf, mimetype="image/png", download_name="case-board.png")
+            return send_file(buf, mimetype="image/png", download_name="case-board.png")
+    except ImagePolicyError:
+        return jsonify(error="invalid image upload"), 400
 
 
 def main():

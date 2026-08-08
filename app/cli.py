@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from app.board import BoardTemplate, CaseData, export, render
+from app.image_policy import ImagePolicyError
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
@@ -65,37 +66,42 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json-case", type=Path, help="Optional case JSON (title/images/labels)")
     args = p.parse_args(argv)
 
-    tmpl = BoardTemplate.load(args.template)
-    slot_ids = [s.id for s in tmpl.slots]
+    try:
+        tmpl = BoardTemplate.load(args.template)
+        slot_ids = [s.id for s in tmpl.slots]
 
-    title = args.title
-    images: dict[str, Path] = {}
-    labels: dict[str, str] = {}
+        title = args.title
+        images: dict[str, Path] = {}
+        labels: dict[str, str] = {}
 
-    if args.json_case:
-        data = json.loads(args.json_case.read_text(encoding="utf-8"))
-        title = data.get("title", title)
-        images.update({k: Path(v) for k, v in data.get("images", {}).items()})
-        labels.update(data.get("labels", {}))
+        if args.json_case:
+            data = json.loads(args.json_case.read_text(encoding="utf-8"))
+            title = data.get("title", title)
+            images.update({k: Path(v) for k, v in data.get("images", {}).items()})
+            labels.update(data.get("labels", {}))
 
-    if args.input_dir:
-        images.update(_collect_from_dir(args.input_dir, slot_ids))
+        if args.input_dir:
+            images.update(_collect_from_dir(args.input_dir, slot_ids))
 
-    for item in args.slot:
-        if "=" not in item:
-            p.error(f"--slot needs ID=PATH, got {item!r}")
-        sid, path = item.split("=", 1)
-        images[sid] = Path(path)
+        for item in args.slot:
+            if "=" not in item:
+                p.error(f"--slot needs ID=PATH, got {item!r}")
+            sid, path = item.split("=", 1)
+            images[sid] = Path(path)
 
-    for item in args.label:
-        if "=" not in item:
-            p.error(f"--label needs ID=TEXT, got {item!r}")
-        sid, text = item.split("=", 1)
-        labels[sid] = text
+        for item in args.label:
+            if "=" not in item:
+                p.error(f"--label needs ID=TEXT, got {item!r}")
+            sid, text = item.split("=", 1)
+            labels[sid] = text
 
-    case = CaseData(title=title, images=images, labels=labels)
-    board = render(tmpl, case, dpi=args.dpi)
-    out = export(board, args.output)
+        case = CaseData(title=title, images=images, labels=labels)
+        board = render(tmpl, case, dpi=args.dpi)
+        out = export(board, args.output)
+    except ImagePolicyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     print(out)
     return 0
 
