@@ -41,12 +41,14 @@ The MVP organizes existing image files. Guided camera capture and automatic imag
 
 ### Upload flows
 
-**`BA-CAP-006`**: Both entry points are supported:
+**`BA-CAP-006`**: Both entry points support file selection and drag-and-drop:
 
 1. Upload from the Capture Library.
 2. From a Comparison Set, add a Frame and either select an existing Capture or upload a new one. A new upload is stored once in the Capture Library and referenced by the Frame.
 
 **`BA-CAP-007`**: Single-image upload is the primary flow. Batch upload is secondary and requires an explicit review of Capture Date and Shot Type for every image before commit.
+
+**`BA-CAP-008`**: Upload accepts bounded, decodable BMP, JPEG, PNG, TIFF, and WebP image content. Validation rejects unreadable, oversized, animated, and obviously truncated files; it is not an authenticity guarantee for otherwise decodable image content.
 
 ## Comparison Sets
 

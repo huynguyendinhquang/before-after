@@ -4,6 +4,13 @@ The prototype accepts BMP, JPEG, PNG, TIFF, and WebP image content. Animated
 and unknown formats are rejected. Pillow EXIF orientation is applied before
 render geometry, and opened files are detached and closed before rendering.
 
+Validation is best effort, not an authenticity attestation. In particular, a
+JPEG whose compressed scan was modified but remains decodable cannot always be
+distinguished from an intentional JPEG by Pillow. The app rejects unreadable,
+oversized, animated, and obviously truncated input; it does not add a second
+native JPEG validator or a manual confirmation gate. Capture flows accept the
+same formats through file selection or drag-and-drop.
+
 Defaults are deliberately bounded:
 
 - `BEFORE_AFTER_IMAGE_MAX_BYTES=52428800` (50 MiB)
