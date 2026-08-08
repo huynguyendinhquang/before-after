@@ -145,7 +145,12 @@ class ShotType(db.Model):
             "canonical_target_id IS NULL OR canonical_target_id <> id",
             name="ck_shot_types_target_not_self",
         ),
-        db.UniqueConstraint("name", name="uq_shot_types_name"),
+        db.CheckConstraint(
+            "(state IN ('canonical', 'proposal') AND canonical_target_id IS NULL) "
+            "OR (state = 'merged' AND canonical_target_id IS NOT NULL)",
+            name="ck_shot_types_target_for_state",
+        ),
+        db.Index("uq_shot_types_name_ci", db.func.lower(name), unique=True),
     )
 
     created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")

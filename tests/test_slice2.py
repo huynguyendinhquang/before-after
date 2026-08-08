@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import re
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -12,12 +13,14 @@ from alembic.config import Config
 import pytest
 from PIL import Image
 from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from app import create_app
 from app import captures
 from app.captures import ConsentRequired, create_capture
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, Patient, ShotType, User
+from app import storage as storage_module
 from app.storage import ManagedStorage, StorageError
 
 
@@ -131,6 +134,95 @@ def oriented_jpeg() -> bytes:
     stream = io.BytesIO()
     image.save(stream, format="JPEG", exif=exif.tobytes())
     return stream.getvalue()
+
+
+def metadata_jpeg() -> bytes:
+    image = Image.new("RGB", (8, 4), "#447799")
+    exif = image.getexif()
+    exif[36867] = "2024:03:04 05:06:07"
+    stream = io.BytesIO()
+    image.save(
+        stream,
+        format="JPEG",
+        exif=exif.tobytes(),
+        comment=b"sensitive comment",
+        icc_profile=b"sensitive ICC profile",
+        xmp=b"sensitive XMP packet",
+    )
+    return stream.getvalue()
+
+
+def test_media_root_is_resolved_before_static_containment_and_permissions(tmp_path: Path) -> None:
+    base = {
+        "DATABASE_URL": "postgresql+psycopg://localhost/before_after",
+        "SECRET_KEY": "test-secret",
+        "TESTING": True,
+        "APP_ENV": "test",
+    }
+    probe = create_app({**base, "MEDIA_ROOT": str(tmp_path / "probe")})
+    static_root = Path(probe.static_folder).resolve()
+    static_root.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(RuntimeError, match="static web root"):
+        create_app({**base, "MEDIA_ROOT": str(static_root / "media")})
+
+    alias = tmp_path / "static-alias"
+    alias.symlink_to(static_root, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="static web root"):
+        create_app({**base, "MEDIA_ROOT": str(alias / "media")})
+
+    with pytest.raises(RuntimeError, match="lexical traversal"):
+        create_app({**base, "MEDIA_ROOT": str(tmp_path / "outside" / ".." / "media")})
+
+    public = tmp_path / "public-media"
+    public.mkdir(mode=0o755)
+    with pytest.raises(RuntimeError, match="private"):
+        create_app({**base, "MEDIA_ROOT": str(public)})
+
+
+def test_preview_removes_all_metadata_but_preserves_pixels_and_mode(tmp_path: Path) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    inspection = storage.inspect(metadata_jpeg())
+
+    with Image.open(io.BytesIO(inspection.preview_bytes)) as preview:
+        preview.load()
+        assert preview.mode == "RGB"
+        assert preview.size == (8, 4)
+        assert preview.getexif() == {}
+        assert not any(key in preview.info for key in ("comment", "xmp", "icc_profile"))
+
+    assert not any(
+        marker in inspection.preview_bytes
+        for marker in (b"sensitive comment", b"sensitive ICC profile", b"sensitive XMP packet")
+    )
+
+
+@pytest.mark.skipif(not storage_module._POSIX_DIRFD, reason="POSIX dirfd primitives unavailable")
+def test_managed_storage_rejects_parent_component_symlink(tmp_path: Path) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    originals = Path(storage.root) / "originals"
+    originals.rename(tmp_path / "originals-real")
+    originals.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StorageError):
+        storage.open_read("originals/missing.jpg")
+
+
+def test_atomic_store_reports_directory_fsync_failure_and_cleans(tmp_path: Path, monkeypatch) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    payload = oriented_jpeg()
+    inspection = storage.inspect(payload)
+
+    def fail_fsync(_fd: int) -> None:
+        raise StorageError("directory fsync failed")
+
+    monkeypatch.setattr(storage, "_fsync_directory", fail_fsync)
+    with pytest.raises(StorageError, match="fsync"):
+        storage.store(payload, inspection)
+    assert list((Path(storage.root) / "originals").iterdir()) == []
+    assert list((Path(storage.root) / "previews").iterdir()) == []
 
 
 def test_capture_workflow_confirms_override_preserves_original_and_survives_restart(
@@ -271,6 +363,80 @@ def test_failed_audit_transaction_cleans_media_and_capture_row(app, monkeypatch:
     media_root = Path(app.config["MEDIA_ROOT"])
     assert list((media_root / "originals").iterdir()) == []
     assert list((media_root / "previews").iterdir()) == []
+
+
+def test_commit_then_raise_reconciles_and_preserves_committed_media(
+    app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+
+    with app.app_context():
+        patient = db.session.get(Patient, patient_id)
+        actor = db.session.get(User, editor_id)
+        assert patient is not None and actor is not None
+        shot_type = ShotType(name="Commit acknowledgement", created_by_id=editor_id)
+        db.session.add(shot_type)
+        db.session.flush()
+        original_commit = db.session.commit
+
+        def commit_then_raise() -> None:
+            original_commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+        monkeypatch.setattr(db.session, "commit", commit_then_raise)
+        capture = create_capture(
+            actor=actor,
+            patient=patient,
+            upload=oriented_jpeg(),
+            capture_date="2025-02-03",
+            capture_date_confirmed=True,
+            shot_type=shot_type,
+            original_filename="commit-then-raise.jpg",
+        )
+        assert capture.id is not None
+        assert db.session.scalar(select(Capture).where(Capture.id == capture.id)) is not None
+
+    storage = ManagedStorage(app.config["MEDIA_ROOT"])
+    assert storage.resolve(capture.storage_key).is_file()
+    assert len(list((Path(app.config["MEDIA_ROOT"]) / "originals").iterdir())) == 1
+
+
+def test_filename_persists_without_control_or_bidi_characters() -> None:
+    filename = captures._filename(
+        None,
+        "../safe\n-name\u202e.gpj",
+    )
+    assert filename == "safe-name.gpj"
+    assert all(unicodedata.category(char) not in {"Cc", "Cf"} for char in filename)
+
+
+def test_shot_type_constraints_cover_case_and_state_target_invariants(app) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    with app.app_context():
+        canonical = ShotType(name="Anterior", state="canonical", created_by_id=editor_id)
+        db.session.add(canonical)
+        db.session.commit()
+
+        db.session.add(ShotType(name="anterior", state="canonical", created_by_id=editor_id))
+        with pytest.raises(IntegrityError):
+            db.session.flush()
+        db.session.rollback()
+
+        for state, target_id in (("merged", None), ("canonical", canonical.id)):
+            db.session.add(
+                ShotType(
+                    name=f"invalid-{state}-{target_id}",
+                    state=state,
+                    canonical_target_id=target_id,
+                    created_by_id=editor_id,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                db.session.flush()
+            db.session.rollback()
 
 
 def test_consent_confirmation_and_storage_path_safety_fail_before_storage(app, tmp_path: Path) -> None:

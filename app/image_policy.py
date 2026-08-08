@@ -12,8 +12,33 @@ from typing import BinaryIO
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-SUPPORTED_FORMATS = frozenset({"BMP", "JPEG", "PNG", "TIFF", "WEBP"})
-SUPPORTED_EXTENSIONS = frozenset({".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
+FORMAT_EXTENSIONS = {
+    "BMP": "bmp",
+    "JPEG": "jpg",
+    "PNG": "png",
+    "TIFF": "tif",
+    "WEBP": "webp",
+}
+FORMAT_MIMETYPES = {
+    "BMP": "image/bmp",
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "TIFF": "image/tiff",
+    "WEBP": "image/webp",
+}
+_FORMAT_INPUT_SUFFIXES = {
+    "BMP": ("bmp",),
+    "JPEG": ("jpg", "jpeg"),
+    "PNG": ("png",),
+    "TIFF": ("tif", "tiff"),
+    "WEBP": ("webp",),
+}
+SUPPORTED_FORMATS = frozenset(FORMAT_EXTENSIONS)
+SUPPORTED_EXTENSIONS = frozenset(
+    f".{suffix}"
+    for suffixes in _FORMAT_INPUT_SUFFIXES.values()
+    for suffix in suffixes
+)
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_PIXELS = 60_000_000
 MAX_BYTES_ENV = "BEFORE_AFTER_IMAGE_MAX_BYTES"
@@ -22,6 +47,10 @@ MAX_REQUEST_BYTES_ENV = "BEFORE_AFTER_IMAGE_MAX_REQUEST_BYTES"
 REQUEST_OVERHEAD_BYTES = 64 * 1024
 _PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 _JPEG_EOI = b"\xff\xd9"
+
+
+def mimetype_for_format(image_format: str) -> str:
+    return FORMAT_MIMETYPES.get(image_format.upper(), "application/octet-stream")
 
 
 class ImagePolicyError(ValueError):

@@ -34,6 +34,11 @@ def upgrade() -> None:
             "canonical_target_id IS NULL OR canonical_target_id <> id",
             name="ck_shot_types_target_not_self",
         ),
+        sa.CheckConstraint(
+            "(state IN ('canonical', 'proposal') AND canonical_target_id IS NULL) "
+            "OR (state = 'merged' AND canonical_target_id IS NOT NULL)",
+            name="ck_shot_types_target_for_state",
+        ),
         sa.ForeignKeyConstraint(
             ["created_by_id"], ["users.id"], name="fk_shot_types_created_by_id_users", ondelete="RESTRICT"
         ),
@@ -44,7 +49,12 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("name", name="uq_shot_types_name"),
+    )
+    op.create_index(
+        "uq_shot_types_name_ci",
+        "shot_types",
+        [sa.text("lower(name)")],
+        unique=True,
     )
     op.create_table(
         "captures",
@@ -103,4 +113,5 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_captures_patient_capture_date", table_name="captures")
     op.drop_table("captures")
+    op.drop_index("uq_shot_types_name_ci", table_name="shot_types")
     op.drop_table("shot_types")

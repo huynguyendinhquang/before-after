@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import unicodedata
 
 from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, send_file, url_for
 from flask_login import current_user, login_required
@@ -15,9 +16,9 @@ from wtforms.validators import DataRequired, Length, ValidationError
 from app.audit import append_audit
 from app.auth import editor_required
 from app.db import db
-from app.image_policy import read_bounded
+from app.image_policy import FORMAT_EXTENSIONS, mimetype_for_format, read_bounded
 from app.models import Capture, Patient, ShotType, User
-from app.storage import FORMAT_EXTENSIONS, ManagedStorage, StorageError, mimetype_for_format
+from app.storage import ImageInspection, ManagedStorage, StorageError
 
 
 captures_bp = Blueprint("captures", __name__)
@@ -83,7 +84,14 @@ def _filename(upload: object, original_filename: str | None) -> str:
         value = getattr(upload, "filename", None)
     if not isinstance(value, str):
         value = "upload"
-    value = value.replace("\\", "/").rsplit("/", 1)[-1].replace("\x00", "").strip()
+    value = value.replace("\\", "/").rsplit("/", 1)[-1]
+    value = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) not in {"Cc", "Cf"}
+        and unicodedata.bidirectional(char)
+        not in {"LRE", "LRO", "RLE", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+    ).strip()
     return (value or "upload")[:255]
 
 
@@ -105,11 +113,19 @@ def _shot_type(
 
     if selected_id is not None:
         selected = db.session.get(ShotType, selected_id)
-        if selected is None or selected.state == "merged":
-            if selected is None or selected.canonical_target_id is None:
+        if selected is None:
+            raise CaptureError("Shot Type is unavailable")
+        if selected.state == "merged":
+            if selected.canonical_target_id is None:
                 raise CaptureError("Shot Type is unavailable")
             selected = db.session.get(ShotType, selected.canonical_target_id)
-        if selected is None:
+            if (
+                selected is None
+                or selected.state != "canonical"
+                or selected.canonical_target_id is not None
+            ):
+                raise CaptureError("Shot Type is unavailable")
+        elif selected.state not in {"canonical", "proposal"} or selected.canonical_target_id is not None:
             raise CaptureError("Shot Type is unavailable")
         return selected
 
@@ -120,7 +136,7 @@ def _shot_type(
         raise CaptureError("Shot Type is too long")
     selected = db.session.scalar(
         select(ShotType)
-        .where(func.lower(ShotType.name) == name.casefold())
+        .where(func.lower(ShotType.name) == name.lower())
         .where(ShotType.state != "merged")
         .order_by(ShotType.state, ShotType.id)
     )
@@ -146,6 +162,27 @@ def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
     )
 
 
+def _reconcile_capture(patient_id: int, sha256: str) -> Capture | None:
+    """Check commit state in a new session before deciding whether to clean media."""
+    db.session.rollback()
+    db.session.close()
+    db.session.remove()
+    session = db.session.session_factory()
+    try:
+        capture = session.scalar(
+            select(Capture).where(Capture.patient_id == patient_id, Capture.sha256 == sha256)
+        )
+        if capture is not None:
+            session.expunge(capture)
+        session.commit()
+        return capture
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def create_capture(
     *,
     actor: User,
@@ -159,6 +196,7 @@ def create_capture(
     create_proposal: bool = False,
     original_filename: str | None = None,
     storage: ManagedStorage | None = None,
+    inspection: ImageInspection | None = None,
 ) -> Capture:
     """Store one Capture and its audit event, or return an existing duplicate."""
     if not actor.is_editor:
@@ -173,7 +211,8 @@ def create_capture(
     authoritative_date = _capture_date(capture_date)
     payload = _payload(upload)
     managed = _storage(storage)
-    inspection = managed.inspect(payload)
+    if inspection is None:
+        inspection = managed.inspect(payload)
     duplicate = _existing_capture(patient.id, inspection.sha256)
     if duplicate is not None:
         return duplicate
@@ -212,16 +251,10 @@ def create_capture(
         )
         db.session.commit()
         return capture
-    except IntegrityError:
-        db.session.rollback()
-        if stored is not None:
-            managed.cleanup(stored.original_key, stored.preview_key)
-        duplicate = _existing_capture(patient.id, inspection.sha256)
-        if duplicate is not None:
-            return duplicate
-        raise
     except Exception:
-        db.session.rollback()
+        committed = _reconcile_capture(patient.id, inspection.sha256)
+        if committed is not None:
+            return committed
         if stored is not None:
             managed.cleanup(stored.original_key, stored.preview_key)
         raise
@@ -298,12 +331,14 @@ def new(patient_pk: int):
     form = CaptureForm()
     suggested_date = None
     staged_payload: bytes | None = None
+    inspection: ImageInspection | None = None
     original_filename = None
     if request.method == "POST" and form.image.data:
         original_filename = form.image.data.filename
         try:
             staged_payload = _payload(form.image.data)
-            suggested_date = _storage().inspect(staged_payload).suggested_capture_date
+            inspection = _storage().inspect(staged_payload)
+            suggested_date = inspection.suggested_capture_date
         except (CaptureError, StorageError) as exc:
             form.image.errors.append(str(exc))
 
@@ -318,6 +353,7 @@ def new(patient_pk: int):
                 capture_date_confirmed=form.capture_date_confirmed.data,
                 shot_type_name=form.shot_type_name.data,
                 create_proposal=form.create_proposal.data,
+                inspection=inspection,
             )
         except (CaptureError, StorageError, ValueError) as exc:
             form.capture_date.errors.append(str(exc))

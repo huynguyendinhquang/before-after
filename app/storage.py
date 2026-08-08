@@ -7,7 +7,6 @@ import io
 import os
 import re
 import stat
-import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import date
@@ -15,26 +14,21 @@ from pathlib import Path, PurePosixPath
 
 from PIL import ExifTags, Image
 
-from app.image_policy import ImagePolicyError, open_image
+from app.image_policy import FORMAT_EXTENSIONS, ImagePolicyError, open_image
 
 
-FORMAT_EXTENSIONS = {
-    "BMP": "bmp",
-    "JPEG": "jpg",
-    "PNG": "png",
-    "TIFF": "tif",
-    "WEBP": "webp",
-}
-FORMAT_MIMETYPES = {
-    "BMP": "image/bmp",
-    "JPEG": "image/jpeg",
-    "PNG": "image/png",
-    "TIFF": "image/tiff",
-    "WEBP": "image/webp",
-}
 PREVIEW_MAX_DIMENSION = 1600
 _ALLOWED_ROOTS = frozenset({"originals", "previews", "quarantine"})
 _HEX_KEY = re.compile(r"^[0-9a-f]{32}$")
+_POSIX_DIRFD = (
+    os.name == "posix"
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+    and os.open in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and os.link in os.supports_dir_fd
+)
 
 
 class StorageError(ValueError):
@@ -62,94 +56,160 @@ class ManagedStorage:
     """Own media paths and make every write atomic and independently cleanable."""
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
-        self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        if not self.root.is_dir():
-            raise StorageError("MEDIA_ROOT must be a directory")
-        for name in _ALLOWED_ROOTS:
-            directory = self.root / name
+        if not _POSIX_DIRFD:
+            raise StorageError("managed storage requires POSIX dirfd primitives")
+        self.root = Path(root).expanduser().absolute()
+        try:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._root_fd = os.open(self.root, self._directory_flags())
+        except (OSError, TypeError, ValueError) as exc:
+            raise StorageError(f"MEDIA_ROOT is not usable: {exc}") from exc
+
+        try:
+            self._validate_directory(self._root_fd, "MEDIA_ROOT")
+            for name in _ALLOWED_ROOTS:
+                self._ensure_directory(self._root_fd, name)
+        except Exception:
+            fd = self._root_fd
+            self._root_fd = None
+            os.close(fd)
+            raise
+
+    def __del__(self) -> None:
+        fd = getattr(self, "_root_fd", None)
+        if fd is not None:
+            self._root_fd = None
             try:
-                directory.mkdir(exist_ok=True)
-                mode = os.lstat(directory).st_mode
-            except OSError as exc:
-                raise StorageError(f"managed storage directory is unsafe: {name}") from exc
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                raise StorageError(f"managed storage directory is unsafe: {name}")
+                os.close(fd)
+            except OSError:
+                pass
 
-    def _safe_path(self, key: str) -> Path:
-        if not isinstance(key, str) or not key or "\x00" in key or "\\" in key:
-            raise StorageError("invalid storage key")
-        relative = PurePosixPath(key)
-        parts = relative.parts
-        if (
-            relative.is_absolute()
-            or not parts
-            or parts[0] not in _ALLOWED_ROOTS
-            or any(part in {"", ".", ".."} for part in parts)
-        ):
-            raise StorageError("invalid storage key")
-        path = self.root.joinpath(*parts)
-        try:
-            path.relative_to(self.root)
-        except ValueError as exc:
-            raise StorageError("invalid storage key") from exc
-        self._assert_no_symlinks(path)
-        return path
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
 
-    def _assert_no_symlinks(self, path: Path) -> None:
-        try:
-            relative = path.relative_to(self.root)
-        except ValueError as exc:
-            raise StorageError("path is outside MEDIA_ROOT") from exc
-        current = self.root
-        for part in relative.parts:
-            current /= part
-            try:
-                mode = os.lstat(current).st_mode
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise StorageError(f"could not inspect storage path: {exc}") from exc
-            if stat.S_ISLNK(mode):
-                raise StorageError("symlink in managed storage path")
+    @staticmethod
+    def _read_flags() -> int:
+        return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
-    def _fsync_directory(self, directory: Path) -> None:
+    @staticmethod
+    def _validate_directory(fd: int, label: str) -> None:
         try:
-            fd = os.open(directory, os.O_RDONLY)
-        except OSError:
-            return
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise StorageError(f"could not inspect {label}: {exc}") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise StorageError(f"{label} must be a directory")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise StorageError(f"{label} must be private to the application user")
+
+    def _ensure_directory(self, parent_fd: int, name: str) -> None:
+        created = False
         try:
-            os.fsync(fd)
-        except OSError:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
             pass
+        try:
+            fd = os.open(name, self._directory_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise StorageError(f"managed storage directory is unsafe: {name}") from exc
+        try:
+            self._validate_directory(fd, name)
         finally:
             os.close(fd)
+        if created:
+            self._fsync_directory(parent_fd)
+
+    def _key_parts(self, key: str) -> tuple[str, ...]:
+        if not isinstance(key, str) or not key or "\x00" in key or "\\" in key:
+            raise StorageError("invalid storage key")
+        parts = tuple(key.split("/"))
+        if (
+            not parts
+            or parts[0] not in _ALLOWED_ROOTS
+            or any(not part or part in {".", ".."} for part in parts)
+        ):
+            raise StorageError("invalid storage key")
+        return parts
+
+    def _open_parent(self, parts: tuple[str, ...]) -> int:
+        fd = os.dup(self._root_fd)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, self._directory_flags(), dir_fd=fd)
+                os.close(fd)
+                fd = child
+            return fd
+        except FileNotFoundError as exc:
+            os.close(fd)
+            raise StorageError("managed storage directory is missing") from exc
+        except OSError as exc:
+            os.close(fd)
+            raise StorageError("symlink or invalid managed storage directory") from exc
+
+    def _fsync_directory(self, fd: int) -> None:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise StorageError(f"could not fsync managed storage directory: {exc}") from exc
 
     def _atomic_write(self, key: str, payload: bytes) -> None:
-        path = self._safe_path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._assert_no_symlinks(path)
+        parts = self._key_parts(key)
+        parent_fd: int | None = None
         temporary_name: str | None = None
         fd: int | None = None
         linked = False
         success = False
         try:
-            fd, temporary_name = tempfile.mkstemp(prefix=".upload-", suffix=".tmp", dir=path.parent)
+            parent_fd = self._open_parent(parts)
+            for _ in range(8):
+                candidate = f".upload-{uuid.uuid4().hex}.tmp"
+                try:
+                    fd = os.open(
+                        candidate,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    temporary_name = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if fd is None or temporary_name is None:
+                raise StorageError("could not create a unique temporary media file")
+
             with os.fdopen(fd, "wb") as stream:
                 fd = None
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            # A fully-written temporary inode is linked into place without
-            # replacing an existing key, so readers never see partial bytes.
-            os.link(temporary_name, path, follow_symlinks=False)
+
+            os.link(
+                temporary_name,
+                parts[-1],
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
             linked = True
-            os.unlink(temporary_name)
+            os.unlink(temporary_name, dir_fd=parent_fd)
             temporary_name = None
-            self._fsync_directory(path.parent)
+            self._fsync_directory(parent_fd)
             success = True
         except FileExistsError as exc:
             raise StorageError("storage key collision") from exc
+        except StorageError:
+            raise
         except (OSError, TypeError, ValueError) as exc:
             raise StorageError(f"could not store media: {exc}") from exc
         finally:
@@ -158,98 +218,135 @@ class ManagedStorage:
                     os.close(fd)
                 except OSError:
                     pass
-            if temporary_name is not None:
-                try:
-                    os.unlink(temporary_name)
-                except OSError:
-                    pass
-            if linked and not success:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            if parent_fd is not None:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                if linked and not success:
+                    try:
+                        os.unlink(parts[-1], dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                os.close(parent_fd)
 
     def resolve(self, key: str) -> Path:
-        """Return an existing regular managed path after containment checks."""
-        path = self._safe_path(key)
+        """Return an existing regular managed path after dirfd checks."""
+        parts = self._key_parts(key)
+        parent_fd = self._open_parent(parts)
         try:
-            mode = os.lstat(path).st_mode
-        except FileNotFoundError as exc:
-            raise StorageError("media is missing") from exc
-        except OSError as exc:
-            raise StorageError(f"could not resolve media: {exc}") from exc
-        if not stat.S_ISREG(mode):
-            raise StorageError("managed media is not a regular file")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(path, flags)
+            try:
+                fd = os.open(parts[-1], self._read_flags(), dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                raise StorageError("media is missing") from exc
+            except OSError as exc:
+                raise StorageError("media path is outside MEDIA_ROOT") from exc
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise StorageError("managed media is not a regular file")
             finally:
                 os.close(fd)
-        except StorageError:
-            raise
-        except OSError as exc:
-            raise StorageError("media path is outside MEDIA_ROOT") from exc
-        return path
+        finally:
+            os.close(parent_fd)
+        return self.root.joinpath(*parts)
 
     def open_read(self, key: str):
-        """Open managed media without following a final symlink."""
-        path = self._safe_path(key)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        """Open managed media without following any managed-path symlink."""
+        parts = self._key_parts(key)
+        parent_fd = self._open_parent(parts)
         try:
-            fd = os.open(path, flags)
-            mode = os.fstat(fd).st_mode
-            if not stat.S_ISREG(mode):
+            try:
+                fd = os.open(parts[-1], self._read_flags(), dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                raise StorageError("media is missing") from exc
+            except OSError as exc:
+                raise StorageError(f"could not open media: {exc}") from exc
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise StorageError("managed media is not a regular file")
+                return os.fdopen(fd, "rb")
+            except Exception:
                 os.close(fd)
-                raise StorageError("managed media is not a regular file")
-            return os.fdopen(fd, "rb")
-        except StorageError:
-            raise
-        except FileNotFoundError as exc:
-            raise StorageError("media is missing") from exc
-        except OSError as exc:
-            raise StorageError(f"could not open media: {exc}") from exc
+                raise
+        finally:
+            os.close(parent_fd)
 
     def cleanup(self, *keys: str | None) -> None:
-        """Remove only managed files owned by a failed operation."""
+        """Remove only managed regular files owned by a failed operation."""
         for key in keys:
             if not key:
                 continue
-            path = self._safe_path(key)
+            parts = self._key_parts(key)
+            parent_fd = self._open_parent(parts)
             try:
-                mode = os.lstat(path).st_mode
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(mode):
-                raise StorageError("refusing to remove a managed directory")
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
+                try:
+                    info = os.lstat(parts[-1], dir_fd=parent_fd)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    raise StorageError("symlink in managed storage path")
+                if not stat.S_ISREG(info.st_mode):
+                    raise StorageError("refusing to remove non-file media")
+                try:
+                    os.unlink(parts[-1], dir_fd=parent_fd)
+                except FileNotFoundError:
+                    continue
+                self._fsync_directory(parent_fd)
+            finally:
+                os.close(parent_fd)
 
     def quarantine(self, key: str) -> str | None:
         """Move an existing managed file to a generated quarantine key."""
-        source = self._safe_path(key)
+        source_parts = self._key_parts(key)
+        source_fd = self._open_parent(source_parts)
+        target_key: str | None = None
+        target_parts: tuple[str, ...] | None = None
+        target_fd: int | None = None
+        linked = False
+        success = False
         try:
-            mode = os.lstat(source).st_mode
-        except FileNotFoundError:
-            return None
-        if not stat.S_ISREG(mode):
-            raise StorageError("refusing to quarantine non-file media")
-        suffix = Path(source.name).suffix.lower() or ".bin"
-        target_key = f"quarantine/{uuid.uuid4().hex}{suffix}"
-        target = self._safe_path(target_key)
-        try:
-            os.link(source, target, follow_symlinks=False)
-            source.unlink()
-            self._fsync_directory(source.parent)
-            self._fsync_directory(target.parent)
+            try:
+                info = os.lstat(source_parts[-1], dir_fd=source_fd)
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise StorageError("refusing to quarantine non-file media")
+
+            suffix = Path(source_parts[-1]).suffix.lower() or ".bin"
+            target_key = f"quarantine/{uuid.uuid4().hex}{suffix}"
+            target_parts = self._key_parts(target_key)
+            target_fd = self._open_parent(target_parts)
+            os.link(
+                source_parts[-1],
+                target_parts[-1],
+                src_dir_fd=source_fd,
+                dst_dir_fd=target_fd,
+                follow_symlinks=False,
+            )
+            linked = True
+            os.unlink(source_parts[-1], dir_fd=source_fd)
+            self._fsync_directory(source_fd)
+            self._fsync_directory(target_fd)
+            success = True
+            return target_key
+        except StorageError:
+            raise
         except (OSError, ValueError) as exc:
-            self.cleanup(target_key)
             raise StorageError(f"could not quarantine media: {exc}") from exc
-        return target_key
+        finally:
+            if linked and not success and target_fd is not None and target_parts is not None:
+                try:
+                    os.unlink(target_parts[-1], dir_fd=target_fd)
+                except (FileNotFoundError, OSError):
+                    pass
+            if target_fd is not None:
+                os.close(target_fd)
+            os.close(source_fd)
 
     @staticmethod
     def preview_key(original_key: str) -> str:
@@ -289,15 +386,20 @@ class ManagedStorage:
     @staticmethod
     def _preview_bytes(image: Image.Image) -> bytes:
         preview = image.convert("RGB")
+        clean: Image.Image | None = None
         try:
             preview.thumbnail(
                 (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION),
                 Image.Resampling.LANCZOS,
             )
+            clean = Image.new("RGB", preview.size)
+            clean.paste(preview)
             output = io.BytesIO()
-            preview.save(output, format="JPEG", quality=85, optimize=True, exif=b"")
+            clean.save(output, format="JPEG", quality=85, optimize=True)
             return output.getvalue()
         finally:
+            if clean is not None:
+                clean.close()
             preview.close()
 
     def inspect(self, payload: bytes | bytearray | memoryview) -> ImageInspection:
@@ -357,7 +459,3 @@ class ManagedStorage:
         except Exception:
             self.cleanup(*written)
             raise
-
-
-def mimetype_for_format(image_format: str) -> str:
-    return FORMAT_MIMETYPES.get(image_format.upper(), "application/octet-stream")

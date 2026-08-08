@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 from flask import Flask, redirect, request, url_for
@@ -34,9 +35,14 @@ def _validate_configuration(app: Flask) -> None:
     secret_key = _required_text(app.config, "SECRET_KEY")
 
     media_path = Path(media_root).expanduser()
+    if ".." in media_path.parts:
+        raise RuntimeError("MEDIA_ROOT must not contain lexical traversal")
     try:
-        media_path.mkdir(parents=True, exist_ok=True)
+        media_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        media_path = media_path.resolve(strict=True)
     except OSError as exc:
+        raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
+    except ValueError as exc:
         raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
     if not media_path.is_dir():
         raise RuntimeError("MEDIA_ROOT must be a directory")
@@ -47,6 +53,11 @@ def _validate_configuration(app: Flask) -> None:
         pass
     else:
         raise RuntimeError("MEDIA_ROOT must be outside the static web root")
+    try:
+        if stat.S_IMODE(media_path.stat().st_mode) & 0o077:
+            raise RuntimeError("MEDIA_ROOT must be private to the application user")
+    except OSError as exc:
+        raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
 
     app.config.update(
         DATABASE_URL=database_url,
