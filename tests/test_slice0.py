@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import importlib
+import json
 import subprocess
 import sys
 from array import array
@@ -568,3 +569,187 @@ def test_cli_bad_input_dir_exits_concisely(tmp_path: Path, path_kind: str) -> No
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
     assert "input" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("labels", ['{"portrait": 1}', '{"portrait": []}', '{"portrait": {}}'])
+def test_web_rejects_non_string_label_values(
+    monkeypatch: pytest.MonkeyPatch, labels: str
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={"template": "viengut_case", "format": "png", "labels": labels},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+def test_web_rejects_too_deep_labels_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    labels = "[" * 1100 + "]" * 1100
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={"template": "viengut_case", "format": "png", "labels": labels},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        json.dumps({str(index): "x" for index in range(101)}),
+        json.dumps({"k" * 129: "x"}, ensure_ascii=False),
+        json.dumps({"portrait": "x" * 501}),
+        "{" + " " * (64 * 1024) + "}",
+    ],
+)
+def test_web_rejects_labels_limit_violations(
+    monkeypatch: pytest.MonkeyPatch, labels: str
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={"template": "viengut_case", "format": "png", "labels": labels},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+@pytest.mark.parametrize("template", ["", "bad.name", "../viengut_case", "a" * 65])
+def test_web_rejects_invalid_template_ids(
+    monkeypatch: pytest.MonkeyPatch, template: str
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={"template": template, "format": "png", "labels": "{}"},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+@pytest.mark.parametrize("name", ["bad.name", "a" * 65])
+def test_web_api_rejects_invalid_template_ids(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    response = reloaded_web.app.test_client().get(f"/api/template/{name}")
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+def test_web_uses_trusted_staging_name_for_oversized_filename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    payload = io.BytesIO()
+    Image.new("RGB", (8, 4), "#447799").save(payload, format="PNG")
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={
+            "template": "viengut_case",
+            "format": "png",
+            "labels": "{}",
+            "slot_portrait": (io.BytesIO(payload.getvalue()), "untrusted." + "x" * 300),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert response.mimetype == "image/png"
+    assert len(response.data) > 0
+
+
+@pytest.mark.parametrize(
+    "case_json",
+    [
+        "not-json",
+        "[]",
+        '{"title": 7}',
+        '{"images": []}',
+        '{"images": {"portrait": 7}}',
+        '{"labels": {"portrait": []}}',
+    ],
+)
+def test_cli_rejects_malformed_or_wrong_shape_json_case(
+    tmp_path: Path, case_json: str
+) -> None:
+    case_path = tmp_path / "case.json"
+    case_path.write_text(case_json, encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--json-case",
+            str(case_path),
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert "case" in result.stderr.lower() or "json" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("option", ["--input-dir", "--json-case"])
+def test_cli_rejects_extreme_missing_input_paths(tmp_path: Path, option: str) -> None:
+    extreme_path = tmp_path / ("x" * 5000)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            option,
+            str(extreme_path),
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
