@@ -239,7 +239,7 @@ def open_image(
             raise ImagePolicyError(f"decompression bomb: {exc}") from exc
         except ImagePolicyError:
             raise
-        except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        except (UnidentifiedImageError, OSError, SyntaxError, TypeError, ValueError) as exc:
             raise ImagePolicyError(f"could not decode image: {exc}") from exc
     finally:
         if owned:
