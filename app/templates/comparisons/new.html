@@ -11,7 +11,11 @@
 
     <h2>Canvas</h2>
     <label for="preset_key">{{ form.preset_key.label }}</label>
-    {{ form.preset_key(id="preset_key", value=form.preset_key.data or "a4-landscape") }}
+    <select id="preset_key" name="preset_key">
+      {% for key, label in [('16:9', '16:9'), ('16:10', '16:10'), ('a4-landscape', 'A4 landscape'), ('a4-portrait', 'A4 portrait'), ('custom', 'Custom (mm)')] %}
+        <option value="{{ key }}"{% if (form.preset_key.data or 'a4-landscape') == key %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
     <label for="canvas_width_mm">{{ form.canvas_width_mm.label }}</label>
     {{ form.canvas_width_mm(id="canvas_width_mm", value=form.canvas_width_mm.data or "297") }}
     <label for="canvas_height_mm">{{ form.canvas_height_mm.label }}</label>

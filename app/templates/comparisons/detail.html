@@ -4,81 +4,189 @@
 <section class="panel">
   <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
     <h1>{{ comparison_set.name }}</h1>
-    <span class="muted">{{ 'Read-only' if not current_user.is_editor else 'Editor' }}</span>
+    <span class="muted">{{ 'Editor' if can_edit else 'Read-only' }}</span>
   </div>
   <p class="muted">Patient {{ patient.patient_id }} · {{ patient.name }} · {{ patient.birth_year }}</p>
-  <dl>
-    <dt>Canvas</dt><dd>{{ comparison_set.canvas_width_mm }} × {{ comparison_set.canvas_height_mm }} mm ({{ comparison_set.preset_key }})</dd>
-    <dt>Frame ratio / columns</dt><dd>{{ comparison_set.frame_ratio }} / {{ comparison_set.columns }}</dd>
-    <dt>Capture Date labels</dt><dd>{{ 'shown by default' if comparison_set.date_label_default else 'hidden by default' }}</dd>
-  </dl>
-
-  <h2>Frames</h2>
-  {% if comparison_set.frames %}
-    <table>
-      <thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Label</th><th>Visible</th><th>Order</th></tr></thead>
-      <tbody>
-      {% for frame in comparison_set.frames %}
-        <tr>
-          <td>{{ loop.index }}</td>
-          <td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="140"></td>
-          <td>{{ frame.capture.capture_date }}</td>
-          <td>{{ frame.capture.shot_type.name }}</td>
-          <td>{{ frame.label or '—' }}</td>
-          <td>{{ 'yes' if frame.visible else 'no' }}{% if frame.date_visible_override is not none %}; date {{ 'shown' if frame.date_visible_override else 'hidden' }}{% endif %}</td>
-          <td>
-            {% if current_user.is_editor %}
-              <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}">
-                {{ frame_form.csrf_token }}
-                <input type="hidden" name="version" value="{{ comparison_set.version }}">
-                {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
-                <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
-                {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
-                {% if not loop.last %}<button type="submit" name="direction" value="down">Down</button>{% endif %}
-              </form>
-            {% else %}—{% endif %}
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  {% else %}
-    <p class="muted">No Frames in this Set yet.</p>
+  {% if comparison_set.lock_holder_id and not can_edit %}
+    <p class="flash">This Set is being edited by {{ comparison_set.lock_holder.display_name }}. You can view it, but not save changes.</p>
   {% endif %}
 
-  {% if current_user.is_editor %}
-    <hr>
-    <h2>Add Frame</h2>
-    <p class="muted">Choose one existing Capture, or upload one new image. A new image is first saved through the Capture Library workflow and then referenced here.</p>
-    <form method="post" action="{{ url_for('comparisons.add_frame_route', set_pk=comparison_set.id) }}" enctype="multipart/form-data" novalidate>
-      {{ frame_form.hidden_tag() }}
-      <label for="capture_id">Existing Capture</label>
-      <select id="capture_id" name="capture_id">
-        <option value="">Choose an existing Capture</option>
-        {% for capture in captures %}
-          <option value="{{ capture.id }}">#{{ capture.id }} — {{ capture.capture_date }} — {{ capture.shot_type.name }}</option>
+  {% if can_edit %}
+  <form id="canvas-editor" data-save-url="{{ url_for('comparisons.save', set_pk=comparison_set.id) }}" data-heartbeat-url="{{ url_for('comparisons.lease_heartbeat', set_pk=comparison_set.id) }}" data-preview-url="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <label for="set-title">Set title</label>
+    <input id="set-title" name="title" value="{{ comparison_set.name }}" maxlength="200">
+
+    <h2>Canvas and grid</h2>
+    <label for="preset-key">Canvas preset</label>
+    <select id="preset-key" name="preset_key">
+      {% for key, label in [('16:9', '16:9'), ('16:10', '16:10'), ('a4-landscape', 'A4 landscape'), ('a4-portrait', 'A4 portrait'), ('custom', 'Custom (mm)')] %}
+        <option value="{{ key }}"{% if comparison_set.preset_key == key %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <label for="canvas-width">Canvas width (mm)</label>
+    <input id="canvas-width" name="canvas_width_mm" type="number" min="0.01" step="0.01" value="{{ comparison_set.canvas_width_mm }}">
+    <label for="canvas-height">Canvas height (mm)</label>
+    <input id="canvas-height" name="canvas_height_mm" type="number" min="0.01" step="0.01" value="{{ comparison_set.canvas_height_mm }}">
+    <label for="frame-ratio">Shared Frame ratio (width / height)</label>
+    <input id="frame-ratio" name="frame_ratio" type="number" min="0.01" step="0.01" value="{{ comparison_set.frame_ratio }}">
+    <label for="columns">Columns</label>
+    <input id="columns" name="columns" type="number" min="1" max="100" step="1" value="{{ comparison_set.columns }}">
+    <label><input type="checkbox" name="show_patient_id"{% if comparison_set.show_patient_id %} checked{% endif %}> Show Patient ID</label>
+    <label><input type="checkbox" name="show_patient_name"{% if comparison_set.show_patient_name %} checked{% endif %}> Show Patient name</label>
+    <label><input type="checkbox" name="show_birth_year"{% if comparison_set.show_birth_year %} checked{% endif %}> Show birth year</label>
+    <label><input type="checkbox" name="date_label_default"{% if comparison_set.date_label_default %} checked{% endif %}> Show Capture Date by default</label>
+
+    <h2>Frames</h2>
+    {% if comparison_set.frames %}
+      <table>
+        <thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Visible</th><th>Label</th><th>Date</th><th>Zoom</th><th>Pan X</th><th>Pan Y</th></tr></thead>
+        <tbody id="frame-list">
+        {% for frame in comparison_set.frames %}
+          <tr data-frame-id="{{ frame.id }}">
+            <td>{{ loop.index }}</td>
+            <td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="120"></td>
+            <td>{{ frame.capture.capture_date }}</td>
+            <td>{{ frame.capture.shot_type.name }}</td>
+            <td><input class="frame-visible" type="checkbox"{% if frame.visible %} checked{% endif %} aria-label="Frame {{ loop.index }} visible"></td>
+            <td><input class="frame-label" value="{{ frame.label or '' }}" maxlength="500" aria-label="Frame {{ loop.index }} label"></td>
+            <td>
+              <select class="frame-date" aria-label="Frame {{ loop.index }} date visibility">
+                <option value="inherit"{% if frame.date_visible_override is none %} selected{% endif %}>Inherit</option>
+                <option value="show"{% if frame.date_visible_override is sameas true %} selected{% endif %}>Show</option>
+                <option value="hide"{% if frame.date_visible_override is sameas false %} selected{% endif %}>Hide</option>
+              </select>
+            </td>
+            <td><input class="frame-zoom" type="number" min="1" max="5" step="0.01" value="{{ frame.zoom }}" aria-label="Frame {{ loop.index }} zoom"></td>
+            <td><input class="frame-pan-x" type="number" min="-1" max="1" step="0.01" value="{{ frame.pan_x }}" aria-label="Frame {{ loop.index }} horizontal pan"></td>
+            <td><input class="frame-pan-y" type="number" min="-1" max="1" step="0.01" value="{{ frame.pan_y }}" aria-label="Frame {{ loop.index }} vertical pan"></td>
+          </tr>
         {% endfor %}
-      </select>
-      {% for error in frame_form.capture_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
-      <p class="muted">Or upload a new Capture:</p>
-      <div id="image-dropzone" role="group" aria-label="Upload a new Capture">
-        <label for="image">{{ frame_form.image.label.text }}</label>
-        {{ frame_form.image(id="image", accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*") }}
-        <span class="muted">Or drag and drop an image here.</span>
-      </div>
-      {% for error in frame_form.image.errors %}<div class="error">{{ error }}</div>{% endfor %}
-      <label for="capture_date">{{ frame_form.capture_date.label.text }}</label>
-      {{ frame_form.capture_date(id="capture_date", type="date") }}
-      <label>{{ frame_form.capture_date_confirmed() }} {{ frame_form.capture_date_confirmed.label.text }}</label>
-      {% for error in frame_form.capture_date.errors %}<div class="error">{{ error }}</div>{% endfor %}
-      <label for="shot_type_name">{{ frame_form.shot_type_name.label.text }}</label>
-      {{ frame_form.shot_type_name(id="shot_type_name", autocomplete="off") }}
-      <label>{{ frame_form.create_proposal() }} {{ frame_form.create_proposal.label.text }}</label>
-      {{ frame_form.submit() }}
-    </form>
+        </tbody>
+      </table>
+      <p class="muted">Use the existing Up/Down controls below to change order. Crop values are normalized and the server owns final geometry.</p>
+      <table>
+        <thead><tr><th>Frame</th><th>Order</th></tr></thead>
+        <tbody>
+        {% for frame in comparison_set.frames %}
+          <tr><td>{{ frame.capture.capture_date }} — {{ frame.capture.shot_type.name }}</td><td>
+            <form method="post" action="{{ url_for('comparisons.reorder', set_pk=comparison_set.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="version" value="{{ comparison_set.version }}">
+              {% for ordered_frame in comparison_set.frames %}<input type="hidden" name="frame_ids" value="{{ ordered_frame.id }}">{% endfor %}
+              <input type="hidden" name="move_frame_id" value="{{ frame.id }}">
+              {% if not loop.first %}<button type="submit" name="direction" value="up">Up</button>{% endif %}
+              {% if not loop.last %}<button type="submit" name="direction" value="down">Down</button>{% endif %}
+            </form>
+          </td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No Frames in this Set yet.</p>
+    {% endif %}
+    <button type="submit">Save Canvas and Frames</button>
+    <span id="save-status" class="muted" role="status"></span>
+  </form>
+  <h2>Server preview</h2>
+  <img id="server-preview" src="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Persisted Comparison Set preview" style="max-width:100%;height:auto">
+
+  <hr>
+  <h2>Add Frame</h2>
+  <p class="muted">Choose one existing Capture, or upload one new image. A new image is first saved through the Capture Library workflow and then referenced here.</p>
+  <form method="post" action="{{ url_for('comparisons.add_frame_route', set_pk=comparison_set.id) }}" enctype="multipart/form-data" novalidate>
+    {{ frame_form.hidden_tag() }}
+    <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    <label for="capture_id">Existing Capture</label>
+    <select id="capture_id" name="capture_id">
+      <option value="">Choose an existing Capture</option>
+      {% for capture in captures %}
+        <option value="{{ capture.id }}">#{{ capture.id }} — {{ capture.capture_date }} — {{ capture.shot_type.name }}</option>
+      {% endfor %}
+    </select>
+    {% for error in frame_form.capture_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <p class="muted">Or upload a new Capture:</p>
+    <div id="image-dropzone" role="group" aria-label="Upload a new Capture">
+      <label for="image">{{ frame_form.image.label.text }}</label>
+      {{ frame_form.image(id="image", accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*") }}
+      <span class="muted">Or drag and drop an image here.</span>
+    </div>
+    {% for error in frame_form.image.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label for="capture_date">{{ frame_form.capture_date.label.text }}</label>
+    {{ frame_form.capture_date(id="capture_date", type="date") }}
+    <label>{{ frame_form.capture_date_confirmed() }} {{ frame_form.capture_date_confirmed.label.text }}</label>
+    {% for error in frame_form.capture_date.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label for="shot_type_name">{{ frame_form.shot_type_name.label.text }}</label>
+    {{ frame_form.shot_type_name(id="shot_type_name", autocomplete="off") }}
+    <label>{{ frame_form.create_proposal() }} {{ frame_form.create_proposal.label.text }}</label>
+    {{ frame_form.submit() }}
+  </form>
+  {% else %}
+    <dl>
+      <dt>Canvas</dt><dd>{{ comparison_set.canvas_width_mm }} × {{ comparison_set.canvas_height_mm }} mm ({{ comparison_set.preset_key }})</dd>
+      <dt>Frame ratio / columns</dt><dd>{{ comparison_set.frame_ratio }} / {{ comparison_set.columns }}</dd>
+    </dl>
+    <h2>Frames</h2>
+    {% if comparison_set.frames %}
+      <table><thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Label</th><th>Visible</th></tr></thead><tbody>
+      {% for frame in comparison_set.frames %}<tr><td>{{ loop.index }}</td><td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="140"></td><td>{{ frame.capture.capture_date }}</td><td>{{ frame.capture.shot_type.name }}</td><td>{{ frame.label or '—' }}</td><td>{{ 'yes' if frame.visible else 'no' }}</td></tr>{% endfor %}
+      </tbody></table>
+    {% else %}<p class="muted">No Frames in this Set yet.</p>{% endif %}
   {% endif %}
   <p><a href="{{ url_for('comparisons.index', patient_pk=patient.id) }}">Back to Comparison Sets</a> · <a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
 </section>
+{% if can_edit %}
+<script>
+(() => {
+  const editor = document.getElementById("canvas-editor");
+  const csrf = editor.querySelector('input[name="csrf_token"]').value;
+  const version = () => Number(editor.querySelector('input[name="version"]').value);
+  const clamp = (value, low, high) => Math.min(high, Math.max(low, Number.isFinite(value) ? value : low));
+  const state = () => ({
+    title: editor.querySelector('[name="title"]').value,
+    preset_key: editor.querySelector('[name="preset_key"]').value,
+    canvas_width_mm: Number(editor.querySelector('[name="canvas_width_mm"]').value),
+    canvas_height_mm: Number(editor.querySelector('[name="canvas_height_mm"]').value),
+    frame_ratio: Number(editor.querySelector('[name="frame_ratio"]').value),
+    columns: Number(editor.querySelector('[name="columns"]').value),
+    show_patient_id: editor.querySelector('[name="show_patient_id"]').checked,
+    show_patient_name: editor.querySelector('[name="show_patient_name"]').checked,
+    show_birth_year: editor.querySelector('[name="show_birth_year"]').checked,
+    date_label_default: editor.querySelector('[name="date_label_default"]').checked,
+    frame_ids: [...document.querySelectorAll('#frame-list tr')].map(row => Number(row.dataset.frameId)),
+    frames: [...document.querySelectorAll('#frame-list tr')].map(row => {
+      const date = row.querySelector('.frame-date').value;
+      return {
+        id: Number(row.dataset.frameId),
+        visible: row.querySelector('.frame-visible').checked,
+        label: row.querySelector('.frame-label').value,
+        date_visible_override: date === 'inherit' ? null : date === 'show',
+        zoom: clamp(Number(row.querySelector('.frame-zoom').value), 1, 5),
+        pan_x: clamp(Number(row.querySelector('.frame-pan-x').value), -1, 1),
+        pan_y: clamp(Number(row.querySelector('.frame-pan-y').value), -1, 1)
+      };
+    })
+  });
+  const save = async (event) => {
+    event.preventDefault();
+    const status = document.getElementById('save-status');
+    status.textContent = 'Saving…';
+    const response = await fetch(editor.dataset.saveUrl, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf}, body: JSON.stringify({...state(), version: version()})});
+    if (response.status === 409) { status.textContent = 'Set changed or is locked; reload to continue.'; editor.querySelector('button[type="submit"]').disabled = true; return; }
+    if (!response.ok) { status.textContent = 'Could not save.'; return; }
+    const result = await response.json();
+    editor.querySelector('[name="version"]').value = result.version;
+    document.getElementById('server-preview').src = `${editor.dataset.previewUrl}?version=${result.version}`;
+    status.textContent = `Saved version ${result.version}.`;
+  };
+  editor.addEventListener('submit', save);
+  window.setInterval(async () => {
+    const response = await fetch(editor.dataset.heartbeatUrl, {method: 'POST', headers: {'X-CSRFToken': csrf}});
+    if (response.status === 409) { editor.querySelector('button[type="submit"]').disabled = true; document.getElementById('save-status').textContent = 'Edit lease expired.'; }
+  }, 60 * 1000);
+})();
+</script>
 <script>
 (() => {
   const zone = document.getElementById("image-dropzone");
@@ -94,4 +202,5 @@
   });
 })();
 </script>
+{% endif %}
 {% endblock %}
