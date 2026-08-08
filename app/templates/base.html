@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Clinical Image Comparison{% endblock %}</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #18212b; }
+    body { margin: 0; background: #f2f5f7; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .8rem 1.25rem; color: #fff; background: #173f5f; }
+    header a { color: inherit; }
+    nav { display: flex; align-items: center; gap: 1rem; }
+    nav form { display: inline; }
+    nav button { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; padding: 0; }
+    main { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    .panel { background: #fff; border-radius: .5rem; padding: 1.25rem; box-shadow: 0 1px 4px #0002; }
+    label { display: block; margin: .8rem 0 .25rem; font-weight: 600; }
+    input { box-sizing: border-box; max-width: 32rem; width: 100%; padding: .55rem; border: 1px solid #aab4be; border-radius: .25rem; }
+    input[type=checkbox] { width: auto; }
+    button, .button { display: inline-block; margin-top: 1rem; padding: .55rem .9rem; border: 0; border-radius: .25rem; background: #173f5f; color: #fff; text-decoration: none; cursor: pointer; }
+    .muted { color: #5f6b76; }
+    .error { color: #a52626; }
+    .flash { margin-bottom: 1rem; padding: .7rem; border-radius: .25rem; background: #e4edf5; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: .6rem; border-bottom: 1px solid #dbe1e5; text-align: left; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="{{ url_for('patients.index') }}"><strong>Clinical Image Comparison</strong></a>
+    {% if current_user.is_authenticated %}
+      <nav>
+        <span>{{ current_user.display_name }}</span>
+        <a href="{{ url_for('patients.index') }}">Patients</a>
+        {% if current_user.is_editor %}<a href="{{ url_for('patients.new') }}">New Patient</a>{% endif %}
+        <form method="post" action="{{ url_for('auth.logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit">Log out</button>
+        </form>
+      </nav>
+    {% endif %}
+  </header>
+  <main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

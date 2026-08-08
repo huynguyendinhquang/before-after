@@ -9,11 +9,25 @@ from array import array
 from pathlib import Path
 
 import pytest
+from flask import Flask
 from PIL import Image, ImageDraw, ImageFont
 from werkzeug.datastructures import FileStorage
 
-from app import image_policy
+from app import image_policy, web
 from app.board import BoardTemplate, CaseData, Slot, _font, cover_crop, export, render
+
+
+def legacy_test_app(module=web) -> Flask:
+    application = Flask(__name__)
+    application.config["MAX_CONTENT_LENGTH"] = image_policy.configured_request_limit()
+    application.add_url_rule("/", endpoint="legacy_index", view_func=module.index)
+    application.add_url_rule(
+        "/api/template/<name>", endpoint="legacy_template", view_func=module.api_template
+    )
+    application.add_url_rule(
+        "/render", endpoint="legacy_render", methods=["POST"], view_func=module.do_render
+    )
+    return application
 
 
 def _write_image(path: Path, image_format: str, size: tuple[int, int] = (4, 2), orientation: int | None = None) -> bytes:
@@ -60,11 +74,9 @@ def test_current_renderer_exports_non_empty_png_and_pdf(tmp_path: Path) -> None:
 
 
 def test_web_prototype_path_accepts_generated_fixture() -> None:
-    from app.web import app
-
     payload = io.BytesIO()
     Image.new("RGB", (8, 4), "#447799").save(payload, format="PNG")
-    response = app.test_client().post(
+    response = legacy_test_app().test_client().post(
         "/render",
         data={
             "title": "Generated fixture",
@@ -81,13 +93,11 @@ def test_web_prototype_path_accepts_generated_fixture() -> None:
 
 
 def test_web_rejects_overlong_title_before_render(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app import web
-
     def unexpected_render(*args: object, **kwargs: object) -> None:
         pytest.fail("overlong title reached render")
 
     monkeypatch.setattr(web, "render", unexpected_render)
-    response = web.app.test_client().post(
+    response = legacy_test_app(web).test_client().post(
         "/render",
         data={
             "title": "é" * 501,
@@ -384,9 +394,7 @@ def test_corrupted_tiff_is_rejected_by_open_image() -> None:
 
 
 def test_web_rejects_corrupted_tiff_upload() -> None:
-    from app.web import app
-
-    response = app.test_client().post(
+    response = legacy_test_app().test_client().post(
         "/render",
         data={
             "title": "Generated fixture",
@@ -436,7 +444,7 @@ def test_web_rejects_policy_error_before_saving_and_returns_client_error(monkeyp
         pytest.fail("invalid upload was saved before policy validation")
 
     monkeypatch.setattr(FileStorage, "save", unexpected_save)
-    response = web.app.test_client().post(
+    response = legacy_test_app(web).test_client().post(
         "/render",
         data={
             "title": "Generated fixture",
@@ -456,7 +464,7 @@ def test_web_request_cap_rejects_oversized_multipart_before_save(monkeypatch: py
 
     monkeypatch.setenv(image_policy.MAX_REQUEST_BYTES_ENV, "128")
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={
             "title": "Generated fixture",
@@ -467,7 +475,7 @@ def test_web_request_cap_rejects_oversized_multipart_before_save(monkeypatch: py
         content_type="multipart/form-data",
     )
 
-    assert reloaded_web.app.config["MAX_CONTENT_LENGTH"] == 128
+    assert legacy_test_app(reloaded_web).config["MAX_CONTENT_LENGTH"] == 128
     assert response.status_code == 413
 
 
@@ -512,7 +520,7 @@ def test_web_nonseekable_upload_is_staged_once_and_rendered_from_original_bytes(
     monkeypatch.setattr(reloaded_web, "request", request_stub)
     monkeypatch.setattr(reloaded_web, "render", inspect_render)
 
-    with reloaded_web.app.test_request_context("/render", method="POST"):
+    with legacy_test_app(reloaded_web).test_request_context("/render", method="POST"):
         response = reloaded_web.do_render()
 
     assert response.status_code == 200
@@ -619,7 +627,7 @@ def test_web_rejects_invalid_or_non_object_labels(
 
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={
             "title": "Generated fixture",
@@ -710,7 +718,7 @@ def test_web_rejects_non_string_label_values(
 
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={"template": "viengut_case", "format": "png", "labels": labels},
         content_type="multipart/form-data",
@@ -726,7 +734,7 @@ def test_web_rejects_too_deep_labels_json(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
     labels = "[" * 1100 + "]" * 1100
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={"template": "viengut_case", "format": "png", "labels": labels},
         content_type="multipart/form-data",
@@ -752,7 +760,7 @@ def test_web_rejects_labels_limit_violations(
 
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={"template": "viengut_case", "format": "png", "labels": labels},
         content_type="multipart/form-data",
@@ -770,7 +778,7 @@ def test_web_rejects_invalid_template_ids(
 
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={"template": template, "format": "png", "labels": "{}"},
         content_type="multipart/form-data",
@@ -788,7 +796,7 @@ def test_web_api_rejects_invalid_template_ids(
 
     monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
     reloaded_web = importlib.reload(web)
-    response = reloaded_web.app.test_client().get(f"/api/template/{name}")
+    response = legacy_test_app(reloaded_web).test_client().get(f"/api/template/{name}")
 
     assert response.status_code == 400
     assert response.status_code != 500
@@ -803,7 +811,7 @@ def test_web_uses_trusted_staging_name_for_oversized_filename(
     reloaded_web = importlib.reload(web)
     payload = io.BytesIO()
     Image.new("RGB", (8, 4), "#447799").save(payload, format="PNG")
-    response = reloaded_web.app.test_client().post(
+    response = legacy_test_app(reloaded_web).test_client().post(
         "/render",
         data={
             "template": "viengut_case",
@@ -1217,9 +1225,7 @@ def test_cli_rejects_output_parent_errors(tmp_path: Path, parent_kind: str) -> N
 
 
 def test_web_rejects_unknown_render_format() -> None:
-    from app.web import app
-
-    response = app.test_client().post(
+    response = legacy_test_app().test_client().post(
         "/render",
         data={
             "title": "Generated fixture",

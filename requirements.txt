@@ -1,2 +1,8 @@
 Pillow>=10.0.0
 Flask>=3.0.0
+Flask-SQLAlchemy>=3.1.0
+psycopg[binary]>=3.1.0
+Alembic>=1.13.0
+Flask-Login>=0.6.0
+Flask-WTF>=1.2.0
+gunicorn>=21.0.0
