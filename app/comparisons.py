@@ -205,6 +205,13 @@ def _lease_is_active(comparison_set: ComparisonSet, actor_id: int, now: datetime
     )
 
 
+def _lease_is_available(comparison_set: ComparisonSet, now: datetime) -> bool:
+    expires = comparison_set.lock_expires_at
+    if expires is None or expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc) if expires is not None else None
+    return comparison_set.lock_holder_id is None or expires is None or expires <= now
+
+
 def _claim_lease_locked(
     comparison_set: ComparisonSet,
     actor: User,
@@ -212,13 +219,9 @@ def _claim_lease_locked(
     *,
     acquire_if_free: bool,
 ) -> None:
-    expires = comparison_set.lock_expires_at
-    if expires is not None and expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
     if _lease_is_active(comparison_set, actor.id, now):
         return
-    free = comparison_set.lock_holder_id is None or expires is None or expires <= now
-    if free and acquire_if_free:
+    if _lease_is_available(comparison_set, now) and acquire_if_free:
         comparison_set.lock_holder_id = actor.id
         comparison_set.lock_expires_at = now + timedelta(seconds=EDIT_LEASE_SECONDS)
         return
@@ -342,6 +345,8 @@ def _label(value: object, field: str, *, maximum: int = 500, allow_blank: bool =
         value.encode("utf-8")
     except (UnicodeError, ValueError) as exc:
         raise ComparisonError(f"{field} contains invalid Unicode") from exc
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
+        raise ComparisonError(f"{field} contains invalid control characters")
     value = value.strip()
     if not allow_blank and not value:
         raise ComparisonError(f"{field} is required")
@@ -445,6 +450,8 @@ def _name(value: str | None) -> str:
         value.encode("utf-8")
     except (UnicodeError, ValueError) as exc:
         raise ComparisonError("Set name contains invalid Unicode") from exc
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
+        raise ComparisonError("Set name contains invalid control characters")
     if len(value) > 200:
         raise ComparisonError("Set name is too long")
     return value
@@ -1245,6 +1252,16 @@ def _route_set(set_pk: int, patient_pk: int | None = None) -> ComparisonSet:
     return comparison_set
 
 
+def _detail_flags(comparison_set: ComparisonSet) -> dict[str, bool]:
+    now = _server_now()
+    available = _lease_is_available(comparison_set, now)
+    return {
+        "can_edit": current_user.is_editor and _lease_is_active(comparison_set, current_user.id, now),
+        "can_acquire": current_user.is_editor and available,
+        "lease_active": not available,
+    }
+
+
 @comparisons_bp.get("/patients/<int:patient_pk>/comparison-sets")
 @comparisons_bp.get("/patients/<int:patient_pk>/comparison-sets/")
 @login_required
@@ -1301,19 +1318,13 @@ def new(patient_pk: int):
 @login_required
 def detail(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
-    can_edit = current_user.is_editor and _lease_is_active(
-        comparison_set,
-        current_user.id,
-        _server_now(),
-    )
     return render_template(
         "comparisons/detail.html",
         comparison_set=comparison_set,
         patient=comparison_set.patient,
         captures=list_captures(comparison_set.patient),
         frame_form=FrameForm(),
-        can_edit=can_edit,
-        can_acquire=current_user.is_editor and not can_edit,
+        **_detail_flags(comparison_set),
     )
 
 
@@ -1324,18 +1335,12 @@ def _detail_context(
 ) -> dict[str, object]:
     """Render detail errors with a fresh Set lease/version snapshot."""
     comparison_set = _route_set(set_pk, patient_pk)
-    can_edit = current_user.is_editor and _lease_is_active(
-        comparison_set,
-        current_user.id,
-        _server_now(),
-    )
     return {
         "comparison_set": comparison_set,
         "patient": comparison_set.patient,
         "captures": list_captures(comparison_set.patient),
         "frame_form": frame_form,
-        "can_edit": can_edit,
-        "can_acquire": current_user.is_editor and not can_edit,
+        **_detail_flags(comparison_set),
     }
 
 

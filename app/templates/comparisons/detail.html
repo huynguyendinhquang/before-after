@@ -9,7 +9,7 @@
   <p class="muted">Patient {{ patient.patient_id }} · {{ patient.name }} · {{ patient.birth_year }}</p>
   <input id="current-version" type="hidden" value="{{ comparison_set.version }}">
 
-  {% if comparison_set.lock_holder_id and not can_edit %}
+  {% if lease_active and not can_edit %}
     <p class="flash">This Set is being edited by {{ comparison_set.lock_holder.display_name }}. You can view it, but not save changes.</p>
   {% endif %}
 
