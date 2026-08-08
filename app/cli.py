@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from app.board import BoardTemplate, CaseData, export, render
-from app.image_policy import ImagePolicyError
+from app.image_policy import ImagePolicyError, SUPPORTED_EXTENSIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
@@ -17,8 +17,7 @@ DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
 
 def _collect_from_dir(folder: Path, slot_ids: list[str]) -> dict[str, Path]:
     """Map slot ids to images found in folder (by name prefix or sorted order)."""
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
-    files = sorted(p for p in folder.iterdir() if p.suffix.lower() in exts)
+    files = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS)
     by_stem = {p.stem.lower(): p for p in files}
     images: dict[str, Path] = {}
     unused = list(files)

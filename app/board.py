@@ -143,7 +143,7 @@ def render(template: BoardTemplate, case: CaseData, dpi: float = 300) -> Image.I
         h = int(slot.h * px)
 
         path = case.images.get(slot.id)
-        if path and Path(path).exists():
+        if path:
             src = open_image(path)
             try:
                 cell = place(src, w, h, slot.fit)

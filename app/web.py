@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from app.board import BoardTemplate, CaseData, export, render
-from app.image_policy import ImagePolicyError, configured_request_limit, open_image
+from app.image_policy import ImagePolicyError, configured_request_limit, open_image, read_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = ROOT / "app" / "templates"
@@ -169,7 +169,9 @@ def do_render():
     try:
         labels = json.loads(request.form.get("labels") or "{}")
     except json.JSONDecodeError:
-        labels = {}
+        return jsonify(error="invalid labels"), 400
+    if not isinstance(labels, dict):
+        return jsonify(error="invalid labels"), 400
 
     tmpl = _load_template(tmpl_name)
     images: dict[str, Path] = {}
@@ -181,12 +183,13 @@ def do_render():
                 f = request.files.get(f"slot_{slot.id}")
                 if not f or not f.filename:
                     continue
-                # Validate content and decoded dimensions before writing a
-                # request body into the temporary output directory.
-                with open_image(f.stream):
+                # Stage once so validation and rendering use the same bytes;
+                # FileStorage.save() would see EOF for a consumed stream.
+                payload = read_bounded(f.stream)
+                with open_image(payload):
                     pass
                 dest = tdir / f"{slot.id}{Path(f.filename).suffix or '.jpg'}"
-                f.save(dest)
+                dest.write_bytes(payload)
                 images[slot.id] = dest
 
             case = CaseData(title=title, images=images, labels=labels)
