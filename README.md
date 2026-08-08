@@ -21,12 +21,20 @@ pip install -r requirements.txt
 
 ### Web UI (recommended)
 
+The Slice 1 app requires PostgreSQL and three runtime settings:
+
 ```bash
-python -m app.web
-# open http://127.0.0.1:8765
+export DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_after
+export MEDIA_ROOT=/var/lib/before-after/media
+export SECRET_KEY='replace-with-a-random-secret'
+alembic upgrade head
+flask --app app:create_app create-admin
+flask --app app:create_app run
+# open http://127.0.0.1:5000/login
 ```
 
-Drop images into slots → Preview → Export PNG/PDF.
+The legacy board remains available at `/prototype` during the transition.
+The standalone renderer CLI below remains available for Slice 0 comparisons.
 
 ### CLI
 

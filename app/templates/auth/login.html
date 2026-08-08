@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Log in</h1>
+  <form method="post" novalidate>
+    {{ form.hidden_tag() }}
+    <label for="username">{{ form.username.label }}</label>
+    {{ form.username(id="username", autocomplete="username") }}
+    {% for error in form.username.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label for="password">{{ form.password.label }}</label>
+    {{ form.password(id="password", autocomplete="current-password") }}
+    {% for error in form.password.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    {% for error in form.csrf_token.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    {{ form.submit() }}
+  </form>
+</section>
+{% endblock %}

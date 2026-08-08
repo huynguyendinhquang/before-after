@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Patient {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Patient {{ patient.patient_id }}</h1>
+  <dl>
+    <dt>Name</dt><dd>{{ patient.name }}</dd>
+    <dt>Birth year</dt><dd>{{ patient.birth_year }}</dd>
+    <dt>Consent Confirmation</dt>
+    <dd>Confirmed by {{ patient.consent_confirmed_by.display_name }} at {{ patient.consent_confirmed_at }}</dd>
+  </dl>
+  {% if current_user.is_editor %}
+    <form method="post" action="{{ url_for('patients.confirm_consent', patient_pk=patient.id) }}">
+      {{ consent_form.hidden_tag() }}
+      {{ consent_form.consent_confirmed() }} {{ consent_form.consent_confirmed.label.text }}
+      {{ consent_form.submit() }}
+    </form>
+  {% endif %}
+  <p><a href="{{ url_for('patients.index') }}">Back to Patients</a></p>
+</section>
+{% endblock %}

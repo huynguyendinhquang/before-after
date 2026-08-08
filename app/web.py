@@ -84,6 +84,8 @@ PAGE = r"""
   </main>
   <script>
     const SLOTS = {{ slots_json|safe }};
+    const RENDER_URL = {{ render_url|tojson }};
+    const CSRF_TOKEN = {{ csrf_token|tojson }};
     const root = document.getElementById('slots');
     for (const s of SLOTS) {
       const div = document.createElement('div');
@@ -110,7 +112,8 @@ PAGE = r"""
       for (const inp of document.querySelectorAll('input[data-slot]')) {
         if (inp.files[0]) fd.append('slot_' + inp.dataset.slot, inp.files[0]);
       }
-      const res = await fetch('/render', { method: 'POST', body: fd });
+      if (CSRF_TOKEN) fd.append('csrf_token', CSRF_TOKEN);
+      const res = await fetch(RENDER_URL, { method: 'POST', body: fd });
       if (!res.ok) { alert(await res.text()); return null; }
       return await res.blob();
     }
@@ -154,10 +157,19 @@ def _load_template(name: str = "viengut_case") -> BoardTemplate:
 def index():
     tmpl = _load_template()
     slots = [{"id": s.id, "w": s.w, "h": s.h, "fit": s.fit} for s in tmpl.slots]
+    try:
+        from flask_wtf.csrf import generate_csrf
+
+        csrf_token = generate_csrf()
+    except RuntimeError:
+        csrf_token = ""
+    render_url = "/prototype/render" if request.path.startswith("/prototype") else "/render"
     return render_template_string(
         PAGE,
         slots_json=json.dumps(slots),
         default_title="Patient - YYYY - ID - City",
+        render_url=render_url,
+        csrf_token=csrf_token,
     )
 
 

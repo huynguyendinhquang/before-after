@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Patients{% endblock %}
+{% block content %}
+<section class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+    <h1>Patients</h1>
+    {% if current_user.is_editor %}<a class="button" href="{{ url_for('patients.new') }}">New Patient</a>{% endif %}
+  </div>
+  <form method="get">
+    <label for="q">Search by Patient ID or name</label>
+    <input id="q" name="q" value="{{ query }}" autocomplete="off">
+    <button type="submit">Search</button>
+  </form>
+  {% if patients %}
+    <table>
+      <thead><tr><th>Patient ID</th><th>Name</th><th>Birth year</th></tr></thead>
+      <tbody>
+      {% for patient in patients %}
+        <tr>
+          <td><a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">{{ patient.patient_id }}</a></td>
+          <td>{{ patient.name }}</td>
+          <td>{{ patient.birth_year }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No Patients found.</p>
+  {% endif %}
+</section>
+{% endblock %}

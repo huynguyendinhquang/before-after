@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}New Patient{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>New Patient</h1>
+  <p class="muted">Only Patient identity fields and Consent Confirmation are stored here; the app does not store a full medical record or legal consent form.</p>
+  <form method="post" novalidate>
+    {{ form.hidden_tag() }}
+    <label for="patient_id">{{ form.patient_id.label }}</label>
+    {{ form.patient_id(id="patient_id", autocomplete="off") }}
+    {% for error in form.patient_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label for="name">{{ form.name.label }}</label>
+    {{ form.name(id="name", autocomplete="name") }}
+    {% for error in form.name.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label for="birth_year">{{ form.birth_year.label }}</label>
+    {{ form.birth_year(id="birth_year", min="1000", max="9999") }}
+    {% for error in form.birth_year.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label>{{ form.consent_confirmed() }} {{ form.consent_confirmed.label.text }}</label>
+    {% for error in form.consent_confirmed.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    {{ form.submit() }}
+  </form>
+</section>
+{% endblock %}
