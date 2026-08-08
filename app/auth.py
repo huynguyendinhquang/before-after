@@ -39,9 +39,14 @@ class LoginForm(FlaskForm):
 
 
 def _safe_next_url(value: str | None) -> str | None:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
-    parsed = urlsplit(value)
+    if "\\" in value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
     if parsed.scheme or parsed.netloc or not value.startswith("/") or value.startswith("//"):
         return None
     return value
@@ -69,10 +74,6 @@ def roles_required(*roles: str):
 
 def editor_required(view):
     return roles_required("admin", "editor")(view)
-
-
-def admin_required(view):
-    return roles_required("admin")(view)
 
 
 @login_manager.user_loader

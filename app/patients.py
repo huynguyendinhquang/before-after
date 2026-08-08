@@ -10,7 +10,7 @@ from flask_wtf import FlaskForm
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from wtforms import BooleanField, IntegerField, StringField, SubmitField
-from wtforms.validators import DataRequired, Length, NumberRange
+from wtforms.validators import DataRequired, Length, NumberRange, ValidationError
 
 from app.audit import append_audit
 from app.auth import editor_required
@@ -18,6 +18,11 @@ from app.db import db
 from app.models import Patient, User
 
 patients_bp = Blueprint("patients", __name__, url_prefix="/patients")
+
+
+def _strict_consent_confirmation(_form, field) -> None:
+    if field.raw_data != ["y"]:
+        raise ValidationError("Consent Confirmation is required.")
 
 
 class PatientForm(FlaskForm):
@@ -29,7 +34,7 @@ class PatientForm(FlaskForm):
     )
     consent_confirmed = BooleanField(
         "I confirm that consent was obtained before clinical images are stored.",
-        validators=[DataRequired()],
+        validators=[_strict_consent_confirmation],
     )
     submit = SubmitField("Create Patient")
 
@@ -37,7 +42,7 @@ class PatientForm(FlaskForm):
 class ConsentForm(FlaskForm):
     consent_confirmed = BooleanField(
         "I confirm that consent was obtained before clinical images are stored.",
-        validators=[DataRequired()],
+        validators=[_strict_consent_confirmation],
     )
     submit = SubmitField("Confirm consent")
 
@@ -53,7 +58,7 @@ def create_patient(
     """Create a Patient and its audit event in one transaction."""
     if not actor.is_editor:
         raise PermissionError("only an Editor or Admin can create Patients")
-    if not consent_confirmed:
+    if consent_confirmed is not True:
         raise ValueError("Consent Confirmation is required")
     if not isinstance(patient_id, str) or not patient_id.strip():
         raise ValueError("patient ID is required")

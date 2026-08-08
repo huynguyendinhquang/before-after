@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, func, select, text
 
 from app import create_app
 from app.audit import SYSTEM_ACTOR
+from app.auth import _safe_next_url
 from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
 from app.models import AuditEvent, Patient, User
@@ -40,9 +41,9 @@ def app_config(tmp_path: Path, database_url: str) -> dict[str, object]:
 
 @pytest.fixture(scope="session")
 def migrated_test_database():
-    database_url = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    database_url = os.environ.get("TEST_DATABASE_URL")
     if not database_url:
-        pytest.skip("TEST_DATABASE_URL or DATABASE_URL is required for Slice 1 PostgreSQL tests")
+        pytest.skip("TEST_DATABASE_URL is required for Slice 1 PostgreSQL tests")
 
     database_url = normalize_database_url(database_url)
     engine = create_engine(database_url)
@@ -160,7 +161,7 @@ def test_editor_creates_patient_with_consent_and_viewer_can_only_read(app, tmp_p
         assert event.action == "patient.create"
         assert event.entity_type == "patient"
 
-    database_url = os.environ.get("TEST_DATABASE_URL") or os.environ["DATABASE_URL"]
+    database_url = os.environ["TEST_DATABASE_URL"]
     restarted = create_app(app_config(tmp_path, database_url))
     restarted_client = restarted.test_client()
     login(restarted_client, "/login", "editor")
@@ -198,6 +199,33 @@ def test_patient_creation_requires_consent_and_audit_rolls_back_with_mutation(ap
         assert db.session.scalar(select(func.count(Patient.id))) == 0
 
     from app import patients
+
+    for index, value in enumerate(("0", "false", "arbitrary")):
+        response = client.post(
+            "/patients/new",
+            data={
+                "patient_id": f"VG-BAD-CONSENT-{index}",
+                "name": "Not Stored",
+                "birth_year": "1990",
+                "consent_confirmed": value,
+                "csrf_token": token,
+            },
+        )
+        assert response.status_code == 400
+
+    with app.app_context():
+        actor = db.session.scalar(select(User).where(User.username == "editor"))
+        assert actor is not None
+        for value in ("0", "false", "arbitrary", 1):
+            with pytest.raises(ValueError, match="Consent Confirmation"):
+                patients.create_patient(
+                    actor=actor,
+                    patient_id=f"VG-DIRECT-BAD-{value}",
+                    name="Not Stored",
+                    birth_year=1990,
+                    consent_confirmed=value,
+                )
+        assert db.session.scalar(select(func.count(Patient.id))) == 0
 
     def fail_audit(*args, **kwargs):
         raise RuntimeError("audit failed")
@@ -321,3 +349,17 @@ def test_secure_session_defaults_are_enabled(app) -> None:
         }
     )
     assert production.config["SESSION_COOKIE_SECURE"] is True
+
+
+def test_safe_next_url_rejects_browser_normalized_open_redirects() -> None:
+    assert _safe_next_url("/patients") == "/patients"
+    for value in (
+        "//evil.example",
+        "/\\evil.example",
+        "/patients\\evil.example",
+        "https://evil.example",
+        "patients",
+        "/patients\n",
+        "/patients\x00",
+    ):
+        assert _safe_next_url(value) is None
