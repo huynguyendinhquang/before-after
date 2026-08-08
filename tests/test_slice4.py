@@ -272,6 +272,58 @@ def test_custom_canvas_form_round_trip_and_invalid_values_are_controlled(app) ->
         assert response.status_code == 400
 
 
+@pytest.mark.parametrize("name", ["Bad\x00name", "Bad\x1fname"])
+def test_create_rejects_control_characters_in_set_name(app, name: str) -> None:
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    client = app.test_client()
+    token = login(client, "editor")
+
+    response = client.post(
+        f"/patients/{patient_id}/comparison-sets/new",
+        data={"name": name, "csrf_token": token},
+    )
+
+    assert response.status_code == 400
+    assert "invalid control characters" in response.get_data(as_text=True)
+    with app.app_context():
+        assert db.session.scalar(select(ComparisonSet)) is None
+
+
+@pytest.mark.parametrize("label", ["Bad\x00label", "Bad\x1flabel"])
+def test_save_rejects_control_characters_in_frame_label(app, label: str) -> None:
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, "2024-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Labels")
+        add_set_frame(actor, comparison_set, capture_id)
+        current = db.session.get(ComparisonSet, comparison_set.id)
+        assert current is not None and current.frames
+        set_id = current.id
+        frame_id = current.frames[0].id
+        version = current.version
+
+    client = app.test_client()
+    token = login(client, "editor")
+    response = client.post(
+        f"/comparison-sets/{set_id}/save",
+        json={"version": version, "frames": [{"id": frame_id, "label": label}]},
+        headers={"X-CSRFToken": token},
+    )
+
+    assert response.status_code == 400
+    assert "invalid control characters" in response.json["error"]
+    with app.app_context():
+        saved = db.session.get(ComparisonSet, set_id)
+        assert saved is not None and saved.frames
+        assert saved.version == version
+        assert saved.frames[0].label is None
+
+
 def test_add_frame_without_version_is_conflict(app) -> None:
     editor_id = add_user(app, "editor")
     patient_id = fixture_patient(app, editor_id)
@@ -389,6 +441,43 @@ def test_two_editors_cannot_save_and_stale_version_is_rejected(app):
                 expected_version=current.version - 1,
                 title="Stale",
             )
+
+
+def test_other_editor_and_viewer_see_active_set_read_only(app):
+    owner_id = add_user(app, "owner")
+    other_id = add_user(app, "other")
+    viewer_id = add_user(app, "viewer")
+    patient_id = fixture_patient(app, owner_id)
+    capture_id = fixture_capture(app, owner_id, patient_id, "2024-01-01")
+    with app.app_context():
+        owner = db.session.get(User, owner_id)
+        patient = db.session.get(Patient, patient_id)
+        assert owner is not None and patient is not None
+        comparison_set = create_comparison_set(actor=owner, patient=patient, name="Read-only")
+        add_set_frame(owner, comparison_set, capture_id)
+        current = db.session.get(ComparisonSet, comparison_set.id)
+        assert current is not None and current.frames
+        save_comparison_set(
+            actor=owner,
+            comparison_set=current,
+            expected_version=current.version,
+            title="Visible Canvas",
+            frames=[{"id": current.frames[0].id, "label": "Before"}],
+        )
+        set_id = current.id
+
+    for username in ("other", "viewer"):
+        client = app.test_client()
+        login(client, username)
+        response = client.get(f"/comparison-sets/{set_id}")
+        body = response.get_data(as_text=True)
+        assert response.status_code == 200
+        assert "Visible Canvas" in body
+        assert "Before" in body
+        assert "<dt>Canvas</dt>" in body
+        assert "<h2>Frames</h2>" in body
+        assert 'id="canvas-editor"' not in body
+        assert "Acquire edit lease" not in body
 
 
 def test_expired_edit_lease_can_be_acquired(app):
