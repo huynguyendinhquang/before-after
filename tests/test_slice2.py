@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import re
+import time
 import unicodedata
 from datetime import date
 from pathlib import Path
@@ -225,6 +226,118 @@ def test_atomic_store_reports_directory_fsync_failure_and_cleans(tmp_path: Path,
     assert list((Path(storage.root) / "previews").iterdir()) == []
 
 
+def test_pending_marker_publishes_with_dirfd_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    original_replace = storage_module.os.replace
+    replacements: list[tuple[str, str, int | None, int | None]] = []
+
+    def observe_replace(
+        source: str,
+        target: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert src_dir_fd is not None
+        assert dst_dir_fd == src_dir_fd
+        with os.fdopen(os.open(source, os.O_RDONLY, dir_fd=src_dir_fd), "rb") as marker:
+            payload = marker.read()
+        assert payload.count(b"\n") == 2
+        replacements.append((source, target, src_dir_fd, dst_dir_fd))
+        original_replace(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(storage_module.os, "replace", observe_replace)
+    stored = storage.store(oriented_jpeg())
+    assert len(replacements) == 1
+    source, target, _, _ = replacements[0]
+    assert source.startswith(".pending-") and source.endswith(".tmp")
+    assert target == source.removesuffix(".tmp")
+    assert not (storage.root / "quarantine" / source).exists()
+    assert (storage.root / stored.pending_key).read_bytes().count(b"\n") == 2
+    storage.discard(stored)
+
+
+def test_pending_marker_replace_failure_leaves_no_partial_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("marker publish interrupted")
+
+    monkeypatch.setattr(storage_module.os, "replace", fail_replace)
+    with pytest.raises(StorageError, match="marker publish interrupted"):
+        storage.store(oriented_jpeg())
+
+    for directory in ("originals", "previews", "quarantine"):
+        assert list((storage.root / directory).iterdir()) == []
+
+
+def test_reconcile_expires_malformed_marker_and_temp_without_touching_references(
+    tmp_path: Path,
+) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    orphan = storage.store(oriented_jpeg())
+    referenced = storage.store(oriented_jpeg())
+    storage._release_pending(orphan.pending_key)
+    storage._release_pending(referenced.pending_key)
+
+    old = time.time() - 301
+    orphan_marker = storage.root / orphan.pending_key
+    orphan_marker.write_bytes(b"originals/")
+    referenced_marker = storage.root / referenced.pending_key
+    referenced_marker.write_bytes(b"not-a-key")
+    invalid_marker = storage.root / "quarantine/.pending-not-a-stem"
+    invalid_marker.write_bytes(b"partial")
+    marker_temp = storage.root / "quarantine/.pending-broken.tmp"
+    marker_temp.write_bytes(b"partial")
+    upload_temp = storage.root / "originals/.upload-broken.tmp"
+    upload_temp.write_bytes(b"partial")
+    for path in (
+        orphan_marker,
+        referenced_marker,
+        invalid_marker,
+        marker_temp,
+        upload_temp,
+        storage.resolve(orphan.original_key),
+        storage.resolve(orphan.preview_key),
+        storage.resolve(referenced.original_key),
+        storage.resolve(referenced.preview_key),
+    ):
+        os.utime(path, (old, old))
+
+    removed = storage.reconcile({referenced.original_key}, grace_seconds=0)
+    assert orphan.original_key in removed
+    assert orphan.preview_key in removed
+    assert not orphan_marker.exists()
+    assert not invalid_marker.exists()
+    assert not marker_temp.exists()
+    assert not upload_temp.exists()
+    assert storage.resolve(referenced.original_key).is_file()
+    assert storage.resolve(referenced.preview_key).is_file()
+    assert not referenced_marker.exists()
+
+
+def test_reconcile_rejects_marker_stem_mismatch_without_deleting_recent_media(
+    tmp_path: Path,
+) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    stored = storage.store(oriented_jpeg())
+    storage._release_pending(stored.pending_key)
+    marker = storage.root / stored.pending_key
+    stem = marker.name.removeprefix(".pending-")
+    mismatched = "f" * len(stem)
+    marker.rename(marker.with_name(f".pending-{mismatched}"))
+    old = time.time() - 301
+    os.utime(marker.with_name(f".pending-{mismatched}"), (old, old))
+
+    removed = storage.reconcile(set(), grace_seconds=300)
+    assert removed == [f"quarantine/.pending-{mismatched}"]
+    assert storage.resolve(stored.original_key).is_file()
+    assert storage.resolve(stored.preview_key).is_file()
+
+
+
 def test_capture_workflow_confirms_override_preserves_original_and_survives_restart(
     app, tmp_path: Path, migrated_test_database: str
 ) -> None:
@@ -402,6 +515,57 @@ def test_commit_then_raise_reconciles_and_preserves_committed_media(
     storage = ManagedStorage(app.config["MEDIA_ROOT"])
     assert storage.resolve(capture.storage_key).is_file()
     assert len(list((Path(app.config["MEDIA_ROOT"]) / "originals").iterdir())) == 1
+
+
+def test_inconclusive_commit_reconciliation_preserves_pending_media(
+    app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+
+    with app.app_context():
+        patient = db.session.get(Patient, patient_id)
+        actor = db.session.get(User, editor_id)
+        assert patient is not None and actor is not None
+        shot_type = ShotType(name="Inconclusive reconciliation", created_by_id=editor_id)
+        db.session.add(shot_type)
+        db.session.flush()
+        original_commit = db.session.commit
+
+        def commit_then_raise() -> None:
+            original_commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+        def reconciliation_unavailable(*_args, **_kwargs):
+            raise RuntimeError("reconciliation unavailable")
+
+        monkeypatch.setattr(db.session, "commit", commit_then_raise)
+        monkeypatch.setattr(captures, "_reconcile_capture", reconciliation_unavailable)
+        storage = ManagedStorage(tmp_path / "media")
+        with pytest.raises(captures.CaptureReconciliationError, match="could not be confirmed"):
+            create_capture(
+                actor=actor,
+                patient=patient,
+                upload=oriented_jpeg(),
+                capture_date="2025-02-03",
+                capture_date_confirmed=True,
+                shot_type=shot_type,
+                original_filename="inconclusive.jpg",
+                storage=storage,
+            )
+
+        capture = db.session.scalar(select(Capture))
+        assert capture is not None
+        assert len(list((storage.root / "originals").iterdir())) == 1
+        assert len(list((storage.root / "previews").iterdir())) == 1
+        pending = list((storage.root / "quarantine").glob(".pending-*"))
+        assert len(pending) == 1
+
+        assert storage.reconcile({capture.storage_key}, grace_seconds=0) == []
+        assert not pending[0].exists()
+        assert storage.resolve(capture.storage_key).is_file()
 
 
 def test_filename_persists_without_control_or_bidi_characters() -> None:
