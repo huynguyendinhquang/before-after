@@ -5,18 +5,27 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tempfile
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from app.board import BoardTemplate, CaseData, export, render
+from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, export, render
+from app.image_policy import ImagePolicyError, configured_request_limit, open_image, read_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = ROOT / "app" / "templates"
 DEFAULT_TEMPLATE = TEMPLATE_DIR / "viengut_case.json"
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = configured_request_limit()
+
+_TEMPLATE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+MAX_LABELS_JSON_BYTES = 64 * 1024
+MAX_LABEL_ENTRIES = 100
+MAX_LABEL_KEY_CHARS = 128
+MAX_LABEL_VALUE_CHARS = 500
 
 PAGE = r"""
 <!doctype html>
@@ -128,7 +137,13 @@ PAGE = r"""
 """
 
 
+def _valid_template_id(name: object) -> bool:
+    return isinstance(name, str) and _TEMPLATE_ID.fullmatch(name) is not None
+
+
 def _load_template(name: str = "viengut_case") -> BoardTemplate:
+    if not _valid_template_id(name):
+        raise ValueError("invalid template id")
     path = TEMPLATE_DIR / f"{name}.json"
     if not path.exists():
         path = DEFAULT_TEMPLATE
@@ -148,6 +163,8 @@ def index():
 
 @app.get("/api/template/<name>")
 def api_template(name: str):
+    if not _valid_template_id(name):
+        return jsonify(error="invalid template"), 400
     tmpl = _load_template(name)
     return jsonify(
         {
@@ -162,37 +179,74 @@ def api_template(name: str):
 @app.post("/render")
 def do_render():
     title = request.form.get("title") or "Case"
-    tmpl_name = request.form.get("template") or "viengut_case"
+    if len(title) > MAX_TITLE_CHARS:
+        return jsonify(error="title is too long"), 400
+    raw_template = request.form.get("template")
+    tmpl_name = "viengut_case" if raw_template is None else raw_template
+    if not _valid_template_id(tmpl_name):
+        return jsonify(error="invalid template"), 400
+
     fmt = (request.form.get("format") or "png").lower()
+    if fmt not in {"png", "pdf"}:
+        return jsonify(error="invalid format"), 400
+    raw_labels = request.form.get("labels")
+    raw_labels = "{}" if raw_labels is None else raw_labels
     try:
-        labels = json.loads(request.form.get("labels") or "{}")
-    except json.JSONDecodeError:
-        labels = {}
+        labels_size = len(raw_labels.encode("utf-8"))
+    except UnicodeError:
+        return jsonify(error="invalid labels"), 400
+    if labels_size > MAX_LABELS_JSON_BYTES:
+        return jsonify(error="invalid labels"), 400
+    try:
+        labels = json.loads(raw_labels)
+    except (json.JSONDecodeError, RecursionError):
+        return jsonify(error="invalid labels"), 400
+    if not isinstance(labels, dict) or len(labels) > MAX_LABEL_ENTRIES:
+        return jsonify(error="invalid labels"), 400
+    if any(
+        not isinstance(key, str)
+        or len(key) > MAX_LABEL_KEY_CHARS
+        or not isinstance(value, str)
+        or len(value) > MAX_LABEL_VALUE_CHARS
+        for key, value in labels.items()
+    ):
+        return jsonify(error="invalid labels"), 400
 
     tmpl = _load_template(tmpl_name)
     images: dict[str, Path] = {}
 
-    with tempfile.TemporaryDirectory() as td:
-        tdir = Path(td)
-        for slot in tmpl.slots:
-            f = request.files.get(f"slot_{slot.id}")
-            if not f or not f.filename:
-                continue
-            dest = tdir / f"{slot.id}{Path(f.filename).suffix or '.jpg'}"
-            f.save(dest)
-            images[slot.id] = dest
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tdir = Path(td)
+            for slot in tmpl.slots:
+                f = request.files.get(f"slot_{slot.id}")
+                if not f or not f.filename:
+                    continue
+                # Stage once so validation and rendering use the same bytes;
+                # FileStorage.save() would see EOF for a consumed stream.
+                try:
+                    payload = read_bounded(f.stream)
+                    with open_image(payload):
+                        pass
+                except (ImagePolicyError, OSError, ValueError):
+                    return jsonify(error="invalid image upload"), 400
+                dest = tdir / f"{slot.id}.upload"
+                dest.write_bytes(payload)
+                images[slot.id] = dest
 
-        case = CaseData(title=title, images=images, labels=labels)
-        board = render(tmpl, case, dpi=200 if fmt == "png" else 300)
+            case = CaseData(title=title, images=images, labels=labels)
+            board = render(tmpl, case, dpi=200 if fmt == "png" else 300)
 
-        buf = io.BytesIO()
-        if fmt == "pdf":
-            board.convert("RGB").save(buf, "PDF", resolution=300.0)
+            buf = io.BytesIO()
+            if fmt == "pdf":
+                board.convert("RGB").save(buf, "PDF", resolution=300.0)
+                buf.seek(0)
+                return send_file(buf, mimetype="application/pdf", download_name="case-board.pdf")
+            board.save(buf, "PNG")
             buf.seek(0)
-            return send_file(buf, mimetype="application/pdf", download_name="case-board.pdf")
-        board.save(buf, "PNG")
-        buf.seek(0)
-        return send_file(buf, mimetype="image/png", download_name="case-board.png")
+            return send_file(buf, mimetype="image/png", download_name="case-board.png")
+    except ImagePolicyError:
+        return jsonify(error="invalid image upload"), 400
 
 
 def main():

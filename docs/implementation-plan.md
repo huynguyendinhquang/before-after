@@ -140,6 +140,7 @@ Use Werkzeug's password hashing already supplied through Flask. Keep Pillow for 
 
 - Add `storage.py` with validate, inspect, atomic-store, resolve, preview, quarantine, and cleanup operations.
 - Add `captures.py`, Capture form, Capture Library view, and typeahead.
+- Support file-picker and drag-and-drop input through the same upload command.
 - Treat EXIF `DateTimeOriginal` as a suggestion only; require explicit confirmation.
 - Store original bytes unchanged; create a bounded preview derivative with metadata removed.
 - Reject upload before Consent Confirmation and clean partial files on every failure.

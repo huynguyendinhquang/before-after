@@ -8,16 +8,59 @@ import json
 import sys
 from pathlib import Path
 
-from app.board import BoardTemplate, CaseData, export, render
+from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, export, render
+from app.image_policy import ImagePolicyError, SUPPORTED_EXTENSIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
 
 
+def _string_mapping(value: object, field: str) -> dict[str, str]:
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise ImagePolicyError(f"case {field} must map strings to strings")
+    return value
+
+
+def _validate_title(title: object) -> str:
+    if not isinstance(title, str):
+        raise ImagePolicyError("case title must be a string")
+    if len(title) > MAX_TITLE_CHARS:
+        raise ImagePolicyError(f"case title exceeds {MAX_TITLE_CHARS} characters")
+    return title
+
+
+def _load_json_case(
+    path: Path, default_title: str
+) -> tuple[str, dict[str, Path], dict[str, str]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        raise ImagePolicyError(f"could not read case JSON: {detail}") from exc
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise ImagePolicyError("invalid case JSON") from exc
+
+    if not isinstance(data, dict):
+        raise ImagePolicyError("case JSON must be an object")
+    title = _validate_title(data.get("title", default_title))
+    images = _string_mapping(data.get("images", {}), "images")
+    labels = _string_mapping(data.get("labels", {}), "labels")
+    return title, {key: Path(value) for key, value in images.items()}, labels
+
+
 def _collect_from_dir(folder: Path, slot_ids: list[str]) -> dict[str, Path]:
     """Map slot ids to images found in folder (by name prefix or sorted order)."""
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
-    files = sorted(p for p in folder.iterdir() if p.suffix.lower() in exts)
+    try:
+        files = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS)
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, OSError):
+            detail = exc.strerror or exc.__class__.__name__
+        else:
+            detail = "invalid path"
+        raise ImagePolicyError(f"could not read input directory: {detail}") from exc
     by_stem = {p.stem.lower(): p for p in files}
     images: dict[str, Path] = {}
     unused = list(files)
@@ -65,37 +108,51 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json-case", type=Path, help="Optional case JSON (title/images/labels)")
     args = p.parse_args(argv)
 
-    tmpl = BoardTemplate.load(args.template)
-    slot_ids = [s.id for s in tmpl.slots]
+    try:
+        try:
+            tmpl = BoardTemplate.load(args.template)
+        except OSError as exc:
+            detail = exc.strerror or exc.__class__.__name__
+            raise ImagePolicyError(f"could not read template: {detail}") from exc
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            raise ImagePolicyError("invalid template") from exc
+        slot_ids = [s.id for s in tmpl.slots]
 
-    title = args.title
-    images: dict[str, Path] = {}
-    labels: dict[str, str] = {}
+        title = args.title
+        images: dict[str, Path] = {}
+        labels: dict[str, str] = {}
 
-    if args.json_case:
-        data = json.loads(args.json_case.read_text(encoding="utf-8"))
-        title = data.get("title", title)
-        images.update({k: Path(v) for k, v in data.get("images", {}).items()})
-        labels.update(data.get("labels", {}))
+        if args.json_case:
+            case_title, case_images, case_labels = _load_json_case(args.json_case, title)
+            title = case_title
+            images.update(case_images)
+            labels.update(case_labels)
 
-    if args.input_dir:
-        images.update(_collect_from_dir(args.input_dir, slot_ids))
+        title = _validate_title(title)
 
-    for item in args.slot:
-        if "=" not in item:
-            p.error(f"--slot needs ID=PATH, got {item!r}")
-        sid, path = item.split("=", 1)
-        images[sid] = Path(path)
+        if args.input_dir:
+            images.update(_collect_from_dir(args.input_dir, slot_ids))
 
-    for item in args.label:
-        if "=" not in item:
-            p.error(f"--label needs ID=TEXT, got {item!r}")
-        sid, text = item.split("=", 1)
-        labels[sid] = text
+        for item in args.slot:
+            if "=" not in item:
+                p.error(f"--slot needs ID=PATH, got {item!r}")
+            sid, path = item.split("=", 1)
+            images[sid] = Path(path)
 
-    case = CaseData(title=title, images=images, labels=labels)
-    board = render(tmpl, case, dpi=args.dpi)
-    out = export(board, args.output)
+        for item in args.label:
+            if "=" not in item:
+                p.error(f"--label needs ID=TEXT, got {item!r}")
+            sid, text = item.split("=", 1)
+            labels[sid] = text
+
+        case = CaseData(title=title, images=images, labels=labels)
+        board = render(tmpl, case, dpi=args.dpi)
+        out = export(board, args.output)
+    except (OSError, ValueError, OverflowError) as exc:
+        detail = exc.strerror if isinstance(exc, OSError) else str(exc)
+        print(f"error: {detail or exc.__class__.__name__}", file=sys.stderr)
+        return 2
+
     print(out)
     return 0
 
