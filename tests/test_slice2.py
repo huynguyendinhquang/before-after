@@ -404,6 +404,57 @@ def test_commit_then_raise_reconciles_and_preserves_committed_media(
     assert len(list((Path(app.config["MEDIA_ROOT"]) / "originals").iterdir())) == 1
 
 
+def test_inconclusive_commit_reconciliation_preserves_pending_media(
+    app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+
+    with app.app_context():
+        patient = db.session.get(Patient, patient_id)
+        actor = db.session.get(User, editor_id)
+        assert patient is not None and actor is not None
+        shot_type = ShotType(name="Inconclusive reconciliation", created_by_id=editor_id)
+        db.session.add(shot_type)
+        db.session.flush()
+        original_commit = db.session.commit
+
+        def commit_then_raise() -> None:
+            original_commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+        def reconciliation_unavailable(*_args, **_kwargs):
+            raise RuntimeError("reconciliation unavailable")
+
+        monkeypatch.setattr(db.session, "commit", commit_then_raise)
+        monkeypatch.setattr(captures, "_reconcile_capture", reconciliation_unavailable)
+        storage = ManagedStorage(tmp_path / "media")
+        with pytest.raises(captures.CaptureReconciliationError, match="could not confirm"):
+            create_capture(
+                actor=actor,
+                patient=patient,
+                upload=oriented_jpeg(),
+                capture_date="2025-02-03",
+                capture_date_confirmed=True,
+                shot_type=shot_type,
+                original_filename="inconclusive.jpg",
+                storage=storage,
+            )
+
+        capture = db.session.scalar(select(Capture))
+        assert capture is not None
+        assert len(list((storage.root / "originals").iterdir())) == 1
+        assert len(list((storage.root / "previews").iterdir())) == 1
+        pending = list((storage.root / "quarantine").glob(".pending-*"))
+        assert len(pending) == 1
+
+        assert storage.reconcile({capture.storage_key}, grace_seconds=0) == []
+        assert not pending[0].exists()
+        assert storage.resolve(capture.storage_key).is_file()
+
+
 def test_filename_persists_without_control_or_bidi_characters() -> None:
     filename = captures._filename(
         None,

@@ -18,7 +18,7 @@ from app.auth import editor_required
 from app.db import db
 from app.image_policy import FORMAT_EXTENSIONS, mimetype_for_format, read_bounded
 from app.models import Capture, Patient, ShotType, User
-from app.storage import ImageInspection, ManagedStorage, StorageError
+from app.storage import ImageInspection, ManagedStorage, StorageError, StoredMedia
 
 
 captures_bp = Blueprint("captures", __name__)
@@ -47,6 +47,10 @@ class CaptureError(ValueError):
 
 class ConsentRequired(CaptureError):
     """Raised before any image bytes are stored when consent is absent."""
+
+
+class CaptureReconciliationError(CaptureError):
+    """Raised when a failed commit cannot be verified safely."""
 
 
 def _storage(storage: ManagedStorage | None = None) -> ManagedStorage:
@@ -165,8 +169,6 @@ def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
 def _reconcile_capture(patient_id: int, sha256: str) -> Capture | None:
     """Check commit state in a new session before deciding whether to clean media."""
     db.session.rollback()
-    db.session.close()
-    db.session.remove()
     session = db.session.session_factory()
     try:
         capture = session.scalar(
@@ -174,13 +176,33 @@ def _reconcile_capture(patient_id: int, sha256: str) -> Capture | None:
         )
         if capture is not None:
             session.expunge(capture)
-        session.commit()
         return capture
     except Exception:
         session.rollback()
         raise
     finally:
         session.close()
+
+
+def _settle_committed_attempt(
+    managed: ManagedStorage,
+    stored: StoredMedia | None,
+    committed: Capture,
+) -> None:
+    if stored is None:
+        return
+    winner_keys = {committed.storage_key}
+    try:
+        winner_keys.add(ManagedStorage.preview_key(committed.storage_key))
+    except StorageError:
+        pass
+    if {stored.original_key, stored.preview_key} == winner_keys:
+        try:
+            managed.finalize(stored)
+        except StorageError:
+            pass
+    else:
+        managed.discard(stored)
 
 
 def create_capture(
@@ -208,12 +230,13 @@ def create_capture(
     if capture_date_confirmed is not True:
         raise CaptureError("Capture Date must be explicitly confirmed")
 
+    patient_id = patient.id
     authoritative_date = _capture_date(capture_date)
     payload = _payload(upload)
     managed = _storage(storage)
     if inspection is None:
         inspection = managed.inspect(payload)
-    duplicate = _existing_capture(patient.id, inspection.sha256)
+    duplicate = _existing_capture(patient_id, inspection.sha256)
     if duplicate is not None:
         return duplicate
 
@@ -228,7 +251,7 @@ def create_capture(
         )
         stored = managed.store(payload, inspection)
         capture = Capture(
-            patient_id=patient.id,
+            patient_id=patient_id,
             capture_date=authoritative_date,
             shot_type_id=selected_shot_type.id,
             storage_key=stored.original_key,
@@ -242,22 +265,50 @@ def create_capture(
             updated_by_id=actor.id,
         )
         db.session.add(capture)
-        db.session.flush()
+        try:
+            db.session.flush()
+        except Exception:
+            try:
+                committed = _reconcile_capture(patient_id, inspection.sha256)
+            except Exception as exc:
+                raise CaptureReconciliationError(
+                    "Capture save status could not be confirmed; pending media was preserved for reconciliation"
+                ) from exc
+            if committed is not None:
+                _settle_committed_attempt(managed, stored, committed)
+                return committed
+            raise
         append_audit(
             actor=actor,
             action="capture.create",
             entity_type="capture",
             entity_id=capture.id,
         )
-        db.session.commit()
-        return capture
-    except Exception:
-        committed = _reconcile_capture(patient.id, inspection.sha256)
-        if committed is not None:
-            return committed
+        try:
+            db.session.commit()
+        except Exception:
+            try:
+                committed = _reconcile_capture(patient_id, inspection.sha256)
+            except Exception as exc:
+                raise CaptureReconciliationError(
+                    "Capture save status could not be confirmed; pending media was preserved for reconciliation"
+                ) from exc
+            if committed is not None:
+                _settle_committed_attempt(managed, stored, committed)
+                return committed
+            raise
+    except CaptureReconciliationError:
+        db.session.rollback()
         if stored is not None:
-            managed.cleanup(stored.original_key, stored.preview_key)
+            managed._release_pending(stored.pending_key)
         raise
+    except Exception:
+        db.session.rollback()
+        if stored is not None:
+            managed.discard(stored)
+        raise
+    managed.finalize(stored)
+    return capture
 
 
 def search_shot_types(query: str = "", limit: int = 20) -> list[ShotType]:
@@ -344,7 +395,7 @@ def new(patient_pk: int):
 
     if form.validate_on_submit():
         try:
-            capture = create_capture(
+            create_capture(
                 actor=current_user,
                 patient=patient,
                 upload=staged_payload if staged_payload is not None else form.image.data,
