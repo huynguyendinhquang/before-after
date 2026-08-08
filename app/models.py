@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from flask_login import UserMixin
 from sqlalchemy.orm import validates
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -55,10 +53,6 @@ class User(UserMixin, db.Model):
     @property
     def is_active(self) -> bool:
         return self.active
-
-    @property
-    def is_admin(self) -> bool:
-        return self.role == "admin"
 
     @property
     def is_editor(self) -> bool:
@@ -116,16 +110,6 @@ class Patient(db.Model):
     updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
     archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
 
-    @property
-    def consent_actor_id(self) -> int:
-        """Domain-language alias for the audited consent confirmer."""
-        return self.consent_confirmed_by_id
-
-    @property
-    def consent_confirmed_at_utc(self) -> datetime:
-        return self.consent_confirmed_at
-
-
 class AuditEvent(db.Model):
     __tablename__ = "audit_events"
 
@@ -142,8 +126,3 @@ class AuditEvent(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
 
     actor = db.relationship("User", foreign_keys=[actor_id], lazy="joined")
-
-    @property
-    def timestamp(self) -> datetime:
-        """Compatibility alias for callers that use the audit vocabulary."""
-        return self.created_at

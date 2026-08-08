@@ -27,14 +27,30 @@ The Slice 1 app requires PostgreSQL and three runtime settings:
 export DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_after
 export MEDIA_ROOT=/var/lib/before-after/media
 export SECRET_KEY='replace-with-a-random-secret'
+export APP_ENV=development  # local HTTP development exception for Secure cookies
 alembic upgrade head
 flask --app app:create_app create-admin
 flask --app app:create_app run
 # open http://127.0.0.1:5000/login
 ```
 
-The legacy board remains available at `/prototype` during the transition.
+Production keeps `SESSION_COOKIE_SECURE` enabled and must run behind HTTPS
+(the HTTPS deployment is part of Slice 8). The temporary `/prototype` route is
+available only to Admins/Editors, is CSRF-protected, and audits generated
+output; it is not a standalone `app.web` server or an unaudited Viewer export.
 The standalone renderer CLI below remains available for Slice 0 comparisons.
+
+### PostgreSQL acceptance gate
+
+The ordinary test run may skip database-backed Slice 1 tests when no database
+URL is configured. The mandatory gate requires a disposable clean PostgreSQL
+database, runs the Alembic migration from the test fixture, and fails loudly
+when `TEST_DATABASE_URL` is missing:
+
+```bash
+export TEST_DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_after_test
+./scripts/test-postgres.sh
+```
 
 ### CLI
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 from functools import wraps
 from urllib.parse import urlsplit
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+import click
+from flask import Blueprint, Flask, flash, redirect, render_template, request, url_for
 from flask_login import (
     LoginManager,
     current_user,
@@ -17,8 +18,10 @@ from flask_wtf import FlaskForm
 from wtforms import PasswordField, StringField, SubmitField
 from wtforms.validators import DataRequired, Length
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import db
+from app.audit import append_audit
 from app.models import User
 
 login_manager = LoginManager()
@@ -64,11 +67,6 @@ def roles_required(*roles: str):
     return decorator
 
 
-def role_required(role: str):
-    """Singular-role spelling retained for route callers."""
-    return roles_required(role)
-
-
 def editor_required(view):
     return roles_required("admin", "editor")(view)
 
@@ -112,3 +110,43 @@ def logout():
     logout_user()
     flash("You have been logged out.", "info")
     return redirect(url_for("auth.login"))
+
+
+def register_cli(app: Flask) -> None:
+    @app.cli.command("create-admin")
+    @click.option("--username", prompt="Username")
+    @click.option("--display-name", prompt="Display name")
+    @click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True)
+    def create_admin(username: str, display_name: str, password: str) -> None:
+        """Create an active Admin account during bootstrap."""
+        username = username.strip().casefold()
+        display_name = display_name.strip()
+        if not username:
+            raise click.ClickException("username is required")
+        if not display_name:
+            raise click.ClickException("display name is required")
+        if not password:
+            raise click.ClickException("password is required")
+        if db.session.scalar(select(User).where(User.username == username)) is not None:
+            raise click.ClickException("username already exists")
+
+        user = User(username=username, display_name=display_name, role="admin", active=True)
+        user.set_password(password)
+        db.session.add(user)
+        try:
+            db.session.flush()
+            append_audit(
+                actor=None,
+                action="user.create",
+                entity_type="user",
+                entity_id=user.id,
+                details={"source": "create-admin"},
+            )
+            db.session.commit()
+        except IntegrityError as exc:
+            db.session.rollback()
+            raise click.ClickException("username already exists") from exc
+        except Exception:
+            db.session.rollback()
+            raise
+        click.echo(f"Admin account created: {username}")

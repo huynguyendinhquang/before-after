@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Local web UI: drop images into slots, export PNG/PDF."""
+"""Legacy renderer views, registered by the application factory only."""
 
 from __future__ import annotations
 
@@ -9,17 +8,14 @@ import re
 import tempfile
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import jsonify, render_template_string, request, send_file
 
-from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, export, render
-from app.image_policy import ImagePolicyError, configured_request_limit, open_image, read_bounded
+from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, render
+from app.image_policy import ImagePolicyError, open_image, read_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = ROOT / "app" / "templates"
 DEFAULT_TEMPLATE = TEMPLATE_DIR / "viengut_case.json"
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = configured_request_limit()
 
 _TEMPLATE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MAX_LABELS_JSON_BYTES = 64 * 1024
@@ -153,7 +149,6 @@ def _load_template(name: str = "viengut_case") -> BoardTemplate:
     return BoardTemplate.load(path)
 
 
-@app.get("/")
 def index():
     tmpl = _load_template()
     slots = [{"id": s.id, "w": s.w, "h": s.h, "fit": s.fit} for s in tmpl.slots]
@@ -173,7 +168,6 @@ def index():
     )
 
 
-@app.get("/api/template/<name>")
 def api_template(name: str):
     if not _valid_template_id(name):
         return jsonify(error="invalid template"), 400
@@ -188,7 +182,6 @@ def api_template(name: str):
     )
 
 
-@app.post("/render")
 def do_render():
     title = request.form.get("title") or "Case"
     if len(title) > MAX_TITLE_CHARS:
@@ -259,11 +252,3 @@ def do_render():
             return send_file(buf, mimetype="image/png", download_name="case-board.png")
     except ImagePolicyError:
         return jsonify(error="invalid image upload"), 400
-
-
-def main():
-    app.run(host="127.0.0.1", port=8765, debug=True)
-
-
-if __name__ == "__main__":
-    main()

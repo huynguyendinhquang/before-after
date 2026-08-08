@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import os
 from logging.config import fileConfig
-from urllib.parse import urlsplit
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.db import db
+from app.db import db, normalize_database_url
 from app import models  # noqa: F401 - register all model tables
 
 config = context.config
@@ -17,15 +16,12 @@ if config.config_file_name is not None:
 
 def database_url() -> str:
     value = os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
-    if not value:
-        raise RuntimeError("DATABASE_URL is required for Alembic")
-    value = value.strip()
-    if value.startswith(("postgres://", "postgresql://")):
-        prefix = "postgres://" if value.startswith("postgres://") else "postgresql://"
-        value = "postgresql+psycopg://" + value[len(prefix) :]
-    if urlsplit(value).scheme not in {"postgresql", "postgresql+psycopg"}:
-        raise RuntimeError("DATABASE_URL must use PostgreSQL")
-    return value
+    try:
+        return normalize_database_url(value)
+    except RuntimeError as exc:
+        if "required" in str(exc):
+            raise RuntimeError("DATABASE_URL is required for Alembic") from exc
+        raise
 
 
 target_metadata = db.metadata
