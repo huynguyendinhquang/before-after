@@ -15,12 +15,46 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEMPLATE = ROOT / "app" / "templates" / "viengut_case.json"
 
 
+def _string_mapping(value: object, field: str) -> dict[str, str]:
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise ImagePolicyError(f"case {field} must map strings to strings")
+    return value
+
+
+def _load_json_case(
+    path: Path, default_title: str
+) -> tuple[str, dict[str, Path], dict[str, str]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        raise ImagePolicyError(f"could not read case JSON: {detail}") from exc
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise ImagePolicyError("invalid case JSON") from exc
+
+    if not isinstance(data, dict):
+        raise ImagePolicyError("case JSON must be an object")
+    title = data.get("title", default_title)
+    if not isinstance(title, str):
+        raise ImagePolicyError("case title must be a string")
+    images = _string_mapping(data.get("images", {}), "images")
+    labels = _string_mapping(data.get("labels", {}), "labels")
+    return title, {key: Path(value) for key, value in images.items()}, labels
+
+
 def _collect_from_dir(folder: Path, slot_ids: list[str]) -> dict[str, Path]:
     """Map slot ids to images found in folder (by name prefix or sorted order)."""
     try:
         files = sorted(p for p in folder.iterdir() if p.suffix.lower() in SUPPORTED_EXTENSIONS)
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        raise ImagePolicyError(f"could not read input directory {folder}: {exc.strerror}") from exc
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, OSError):
+            detail = exc.strerror or exc.__class__.__name__
+        else:
+            detail = "invalid path"
+        raise ImagePolicyError(f"could not read input directory: {detail}") from exc
     by_stem = {p.stem.lower(): p for p in files}
     images: dict[str, Path] = {}
     unused = list(files)
@@ -69,7 +103,13 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     try:
-        tmpl = BoardTemplate.load(args.template)
+        try:
+            tmpl = BoardTemplate.load(args.template)
+        except OSError as exc:
+            detail = exc.strerror or exc.__class__.__name__
+            raise ImagePolicyError(f"could not read template: {detail}") from exc
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            raise ImagePolicyError("invalid template") from exc
         slot_ids = [s.id for s in tmpl.slots]
 
         title = args.title
@@ -77,10 +117,10 @@ def main(argv: list[str] | None = None) -> int:
         labels: dict[str, str] = {}
 
         if args.json_case:
-            data = json.loads(args.json_case.read_text(encoding="utf-8"))
-            title = data.get("title", title)
-            images.update({k: Path(v) for k, v in data.get("images", {}).items()})
-            labels.update(data.get("labels", {}))
+            case_title, case_images, case_labels = _load_json_case(args.json_case, title)
+            title = case_title
+            images.update(case_images)
+            labels.update(case_labels)
 
         if args.input_dir:
             images.update(_collect_from_dir(args.input_dir, slot_ids))
