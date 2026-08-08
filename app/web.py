@@ -11,7 +11,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from app.board import BoardTemplate, CaseData, export, render
+from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, export, render
 from app.image_policy import ImagePolicyError, configured_request_limit, open_image, read_bounded
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -179,6 +179,8 @@ def api_template(name: str):
 @app.post("/render")
 def do_render():
     title = request.form.get("title") or "Case"
+    if len(title) > MAX_TITLE_CHARS:
+        return jsonify(error="title is too long"), 400
     raw_template = request.form.get("template")
     tmpl_name = "viengut_case" if raw_template is None else raw_template
     if not _valid_template_id(tmpl_name):

@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from app.board import BoardTemplate, CaseData, export, render
+from app.board import MAX_TITLE_CHARS, BoardTemplate, CaseData, export, render
 from app.image_policy import ImagePolicyError, SUPPORTED_EXTENSIONS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +24,14 @@ def _string_mapping(value: object, field: str) -> dict[str, str]:
     return value
 
 
+def _validate_title(title: object) -> str:
+    if not isinstance(title, str):
+        raise ImagePolicyError("case title must be a string")
+    if len(title) > MAX_TITLE_CHARS:
+        raise ImagePolicyError(f"case title exceeds {MAX_TITLE_CHARS} characters")
+    return title
+
+
 def _load_json_case(
     path: Path, default_title: str
 ) -> tuple[str, dict[str, Path], dict[str, str]]:
@@ -37,9 +45,7 @@ def _load_json_case(
 
     if not isinstance(data, dict):
         raise ImagePolicyError("case JSON must be an object")
-    title = data.get("title", default_title)
-    if not isinstance(title, str):
-        raise ImagePolicyError("case title must be a string")
+    title = _validate_title(data.get("title", default_title))
     images = _string_mapping(data.get("images", {}), "images")
     labels = _string_mapping(data.get("labels", {}), "labels")
     return title, {key: Path(value) for key, value in images.items()}, labels
@@ -121,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
             title = case_title
             images.update(case_images)
             labels.update(case_labels)
+
+        title = _validate_title(title)
 
         if args.input_dir:
             images.update(_collect_from_dir(args.input_dir, slot_ids))

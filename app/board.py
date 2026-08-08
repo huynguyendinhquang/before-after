@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from app.image_policy import open_image
 
 MM = 300 / 25.4  # px per mm at 300 DPI
+MAX_TITLE_CHARS = 500
 
 
 @dataclass
@@ -41,7 +42,14 @@ class BoardTemplate:
     @classmethod
     def load(cls, path: str | Path) -> "BoardTemplate":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        slots = [Slot(**s) for s in data.get("slots", [])]
+        if not isinstance(data, dict):
+            raise ValueError("template JSON must be an object")
+        if "width_mm" not in data or "height_mm" not in data:
+            raise ValueError("template JSON requires width_mm and height_mm")
+        raw_slots = data.get("slots", [])
+        if not isinstance(raw_slots, list) or any(not isinstance(slot, dict) for slot in raw_slots):
+            raise ValueError("template slots must be a list of objects")
+        slots = [Slot(**s) for s in raw_slots]
         return cls(
             name=data.get("name", Path(path).stem),
             width_mm=data["width_mm"],
