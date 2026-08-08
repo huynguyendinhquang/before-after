@@ -110,7 +110,7 @@
     <select id="capture_id" name="capture_id">
       <option value="">Choose an existing Capture</option>
       {% for capture in captures %}
-        <option value="{{ capture.id }}">#{{ capture.id }} — {{ capture.capture_date }} — {{ capture.shot_type.name }}</option>
+        <option value="{{ capture.id }}"{% if frame_form.capture_id.data == capture.id %} selected{% endif %}>#{{ capture.id }} — {{ capture.capture_date }} — {{ capture.shot_type.name }}</option>
       {% endfor %}
     </select>
     {% for error in frame_form.capture_id.errors %}<div class="error">{{ error }}</div>{% endfor %}
@@ -163,6 +163,7 @@
     document.querySelectorAll('[data-version-token]').forEach((input) => { input.value = String(next); });
   };
   const clamp = (value, low, high) => Math.min(high, Math.max(low, Number.isFinite(value) ? value : low));
+  const flag = (name) => editor.querySelector(`input[type="checkbox"][name="${name}"]`).checked;
   const state = () => ({
     title: editor.querySelector('[name="title"]').value,
     preset_key: editor.querySelector('[name="preset_key"]').value,
@@ -170,10 +171,10 @@
     canvas_height_mm: editor.querySelector('[name="canvas_height_mm"]').value,
     frame_ratio: Number(editor.querySelector('[name="frame_ratio"]').value),
     columns: Number(editor.querySelector('[name="columns"]').value),
-    show_patient_id: editor.querySelector('[name="show_patient_id"]').checked,
-    show_patient_name: editor.querySelector('[name="show_patient_name"]').checked,
-    show_birth_year: editor.querySelector('[name="show_birth_year"]').checked,
-    date_label_default: editor.querySelector('[name="date_label_default"]').checked,
+    show_patient_id: flag('show_patient_id'),
+    show_patient_name: flag('show_patient_name'),
+    show_birth_year: flag('show_birth_year'),
+    date_label_default: flag('date_label_default'),
     frame_ids: [...document.querySelectorAll('#frame-list tr')].map(row => Number(row.dataset.frameId)),
     frames: [...document.querySelectorAll('#frame-list tr')].map(row => {
       const date = row.querySelector('.frame-date').value;

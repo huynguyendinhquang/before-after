@@ -14,7 +14,15 @@ from PIL import Image
 from sqlalchemy import create_engine, select, text
 
 from app import create_app
-from app.board import CanvasRenderSpec, FrameRenderSpec, cover_crop_normalized, layout_frames
+from app import comparisons as comparisons_module
+from app.board import (
+    CanvasRenderSpec,
+    FrameRenderSpec,
+    cover_crop_normalized,
+    export as export_board,
+    layout_frames,
+    render_canvas,
+)
 from app.comparisons import (
     ComparisonError,
     EditLeaseError,
@@ -448,6 +456,150 @@ def test_http_save_requires_the_active_lease_and_expected_version(app):
     assert stale.status_code == 409
 
 
+def test_editor_checkbox_flags_can_toggle_every_set_output_flag(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Flags")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        set_id = comparison_set.id
+        version = comparison_set.version
+
+    client = app.test_client()
+    token = login(client, "editor")
+    detail = client.get(f"/comparison-sets/{set_id}")
+    body = detail.get_data(as_text=True)
+    assert detail.status_code == 200
+    assert 'input[type="checkbox"][name="${name}"]' in body
+    assert "editor.querySelector('[name=\"show_patient_id\"]')" not in body
+
+    enabled = client.post(
+        f"/comparison-sets/{set_id}/save",
+        json={
+            "version": version,
+            "show_patient_id": True,
+            "show_patient_name": True,
+            "show_birth_year": True,
+            "date_label_default": True,
+        },
+        headers={"X-CSRFToken": token},
+    )
+    assert enabled.status_code == 200
+    next_version = enabled.json["version"]
+    with app.app_context():
+        saved = db.session.get(ComparisonSet, set_id)
+        assert saved is not None
+        assert all(
+            (
+                saved.show_patient_id,
+                saved.show_patient_name,
+                saved.show_birth_year,
+                saved.date_label_default,
+            )
+        )
+
+    disabled = client.post(
+        f"/comparison-sets/{set_id}/save",
+        json={
+            "version": next_version,
+            "show_patient_id": False,
+            "show_patient_name": False,
+            "show_birth_year": False,
+            "date_label_default": False,
+        },
+        headers={"X-CSRFToken": token},
+    )
+    assert disabled.status_code == 200
+    with app.app_context():
+        saved = db.session.get(ComparisonSet, set_id)
+        assert saved is not None
+        assert not any(
+            (
+                saved.show_patient_id,
+                saved.show_patient_name,
+                saved.show_birth_year,
+                saved.date_label_default,
+            )
+        )
+
+
+def test_save_duplicate_active_name_is_controlled_and_rolls_back(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        create_comparison_set(actor=actor, patient=patient, name="Existing")
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Other")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        set_id = comparison_set.id
+        version = comparison_set.version
+
+    client = app.test_client()
+    token = login(client, "editor")
+    response = client.post(
+        f"/comparison-sets/{set_id}/save",
+        json={"version": version, "title": "Existing"},
+        headers={"X-CSRFToken": token},
+    )
+    assert response.status_code == 409
+    assert "already exists" in response.json["error"]
+    with app.app_context():
+        assert not db.session().in_transaction()
+        saved = db.session.get(ComparisonSet, set_id)
+        assert saved is not None
+        assert saved.name == "Other"
+        assert saved.version == version
+
+
+def test_add_frame_error_keeps_current_editor_context_and_submitted_values(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, "2024-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Errors")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        set_id = comparison_set.id
+        version = comparison_set.version
+
+    client = app.test_client()
+    token = login(client, "editor")
+    response = client.post(
+        f"/comparison-sets/{set_id}/frames",
+        data={
+            "capture_id": str(capture_id),
+            "version": str(version - 1),
+            "csrf_token": token,
+        },
+    )
+    body = response.get_data(as_text=True)
+    assert response.status_code == 409
+    assert 'id="canvas-editor"' in body
+    assert "Add Frame" in body
+    assert "Set version is required" in body
+    assert f'<option value="{capture_id}" selected>' in body
+    assert f'name="version" value="{version}"' in body
+
+
 def test_get_does_not_claim_lease_and_heartbeat_requires_version(app):
     editor_id = add_user(app, "editor")
     patient_id = fixture_patient(app, editor_id)
@@ -518,6 +670,87 @@ def test_preview_limits_are_checked_before_media_open(app, monkeypatch):
             with pytest.raises(PreviewLimitError):
                 render_persisted_set(current)
             assert opened == []
+
+
+def test_preview_decoded_pixel_limit_is_checked_before_media_open(app, monkeypatch):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, "2024-01-01")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Pixels")
+        add_set_frame(actor, comparison_set, capture_id)
+        current = db.session.get(ComparisonSet, comparison_set.id)
+        assert current is not None
+        app.config["COMPARISON_PREVIEW_MAX_PIXELS"] = 1
+        with monkeypatch.context() as patch:
+            opened = []
+            original_open = ManagedStorage.open_read
+
+            def tracked_open(storage, key):
+                opened.append(key)
+                return original_open(storage, key)
+
+            patch.setattr(ManagedStorage, "open_read", tracked_open)
+            with pytest.raises(PreviewLimitError, match="decoded pixels"):
+                render_persisted_set(current)
+            assert opened == []
+
+
+def test_legacy_pdf_export_does_not_overwrite_resolution(tmp_path: Path, monkeypatch) -> None:
+    board = Image.new("RGB", (20, 10), "white")
+    calls = []
+    original_save = Image.Image.save
+
+    def tracked_save(image, *args, **kwargs):
+        calls.append((args, kwargs))
+        return original_save(image, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", tracked_save)
+    try:
+        output = export_board(board, tmp_path / "board.pdf")
+        assert output.exists()
+        assert len(calls) == 1
+        assert calls[0][0][1] == "PDF"
+        assert calls[0][1]["resolution"] == 300.0
+    finally:
+        board.close()
+
+
+def test_render_canvas_clamps_a4_frame_edges_at_150_dpi(monkeypatch) -> None:
+    source = Image.new("RGB", (20, 20), "red")
+    calls = []
+    original_paste = Image.Image.paste
+
+    def tracked_paste(image, value, box=None, mask=None):
+        calls.append((image, value, box))
+        return original_paste(image, value, box, mask)
+
+    monkeypatch.setattr(Image.Image, "paste", tracked_paste)
+    spec = CanvasRenderSpec(
+        width_mm=297,
+        height_mm=210,
+        frame_ratio=1.414,
+        columns=3,
+        frames=[FrameRenderSpec(index, image=source) for index in range(4)],
+    )
+    board = render_canvas(spec, dpi=150)
+    try:
+        board_calls = [call for call in calls if call[0] is board]
+        assert len(board_calls) == 4
+        for _, cell, box in board_calls:
+            assert isinstance(box, tuple) and len(box) == 2
+            x, y = box
+            assert 0 <= x < board.width
+            assert 0 <= y < board.height
+            assert x + cell.width <= board.width
+            assert y + cell.height <= board.height
+            assert cell.width > 0 and cell.height > 0
+    finally:
+        board.close()
+        source.close()
 
 
 def test_renderer_applies_exif_before_geometry_without_mutating_source() -> None:

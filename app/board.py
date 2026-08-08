@@ -358,7 +358,7 @@ def export(board: Image.Image, out: str | Path) -> Path:
     else:
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             out = out.with_suffix(".png")
-    board.save(out)
+        board.save(out)
     return out
 
 
@@ -667,6 +667,20 @@ def _draw_render_text(draw: ImageDraw.ImageDraw, text: str, xy: tuple[int, int],
     draw.text(xy, text, fill="#111111", font=font)
 
 
+def _pixel_edges(
+    start_mm: float,
+    end_mm: float,
+    px: float,
+    limit: int,
+) -> tuple[int, int]:
+    """Convert a positive mm interval to clamped, non-empty pixel edges."""
+    start = max(0, min(limit, math.floor(start_mm * px)))
+    end = max(0, min(limit, math.ceil(end_mm * px)))
+    if end <= start:
+        raise ValueError("frame geometry has no pixels at this DPI")
+    return start, end
+
+
 def render_canvas(spec: CanvasRenderSpec | object, dpi: float = 300) -> Image.Image:
     """Render a persisted Set-shaped spec synchronously into a new image."""
     if not _is_finite_number(dpi) or not 1 <= dpi <= MAX_RENDER_DPI:
@@ -687,10 +701,20 @@ def render_canvas(spec: CanvasRenderSpec | object, dpi: float = 300) -> Image.Im
     by_id = {frame.id: frame for frame in visible}
     for geometry in geometries:
         frame = by_id[geometry.id]
-        x = int(round(geometry.x_mm * px))
-        y = int(round(geometry.y_mm * px))
-        target_width = max(1, int(round(geometry.width_mm * px)))
-        target_height = max(1, int(round(geometry.height_mm * px)))
+        left, right = _pixel_edges(
+            geometry.x_mm,
+            geometry.x_mm + geometry.width_mm,
+            px,
+            width,
+        )
+        top, bottom = _pixel_edges(
+            geometry.y_mm,
+            geometry.y_mm + geometry.height_mm,
+            px,
+            height,
+        )
+        x, y = left, top
+        target_width, target_height = right - left, bottom - top
         source = _render_source(frame.image)
         if source is None:
             draw.rectangle(

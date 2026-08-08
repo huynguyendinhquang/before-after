@@ -23,7 +23,7 @@ from app.comparisons import (
     create_comparison_set,
     reorder_frames,
 )
-from app.captures import CaptureReconciliationError, create_capture
+from app.captures import CaptureReconciliationError, PendingCapture, create_capture
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, ComparisonSet, Frame, Patient, ShotType, User
 from app.storage import ManagedStorage, StorageError
@@ -435,6 +435,65 @@ def test_inline_commit_raise_after_commit_returns_success(app, monkeypatch: pyte
 
     media_root = Path(app.config["MEDIA_ROOT"])
     assert list((media_root / "quarantine").iterdir()) == []
+
+
+def test_inline_duplicate_reconciliation_rechecks_lock_and_discards_attempt_media(
+    app, monkeypatch: pytest.MonkeyPatch
+):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+    capture_id = stored_capture(app, editor_id, patient_id, jpeg("blue"), "2024-01-01")
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Recheck")
+        acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        set_id = comparison_set.id
+        version = comparison_set.version
+        marker = object()
+        discarded: list[object] = []
+
+        class Storage:
+            def discard(self, stored: object) -> None:
+                discarded.append(stored)
+
+        def fake_prepare(**_kwargs: object) -> PendingCapture:
+            db.session.rollback()
+            session = db.session.session_factory()
+            try:
+                current = session.get(ComparisonSet, set_id)
+                assert current is not None
+                current.version += 1
+                session.commit()
+                capture = session.get(Capture, capture_id)
+                assert capture is not None
+                session.expunge(capture)
+            finally:
+                session.close()
+            return PendingCapture(capture, Storage(), marker)
+
+        monkeypatch.setattr(comparisons_module, "prepare_capture", fake_prepare)
+        with pytest.raises(StaleVersionError):
+            add_frame(
+                actor=actor,
+                comparison_set=comparison_set,
+                upload=b"duplicate payload",
+                capture_date="2024-01-01",
+                capture_date_confirmed=True,
+                shot_type_name="Anterior",
+                expected_version=version,
+            )
+        assert discarded == [marker]
+        assert db.session.scalar(select(func.count(Frame.id))) == 0
 
 
 def test_inline_finalize_failure_returns_committed_success_and_preserves_marker(

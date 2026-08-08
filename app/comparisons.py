@@ -44,7 +44,7 @@ from app.captures import (
 )
 from app.db import db
 from app.models import Capture, ComparisonSet, Frame, Patient, User
-from app.image_policy import ImagePolicyError, read_bounded
+from app.image_policy import DEFAULT_MAX_PIXELS, ImagePolicyError, read_bounded
 from app.storage import ImageInspection, ManagedStorage, StorageError
 
 
@@ -80,6 +80,7 @@ EDIT_LEASE_SECONDS = 5 * 60
 DEFAULT_RENDER_DPI = 150
 DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES = 100
 DEFAULT_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_PREVIEW_MAX_PIXELS = DEFAULT_MAX_PIXELS
 
 
 class ComparisonSetForm(FlaskForm):
@@ -678,6 +679,13 @@ def add_frame(
                 inspection=inspection,
             )
             selected = pending.capture
+            # prepare_capture may reconcile a duplicate in a separate session;
+            # that rollback releases the Set row lock held above.
+            comparison_set, _ = _write_guard(
+                actor=actor,
+                comparison_set=comparison_set,
+                expected_version=expected_version,
+            )
 
         if comparison_set is None or comparison_set.archived_at is not None:
             raise ComparisonError("Comparison Set is unavailable")
@@ -1076,6 +1084,7 @@ def _materialize_render_spec(
         DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES,
     )
     max_bytes = _preview_limit("COMPARISON_PREVIEW_MAX_BYTES", DEFAULT_PREVIEW_MAX_BYTES)
+    max_pixels = _preview_limit("COMPARISON_PREVIEW_MAX_PIXELS", DEFAULT_PREVIEW_MAX_PIXELS)
     storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
     session = db.session.session_factory()
     try:
@@ -1109,13 +1118,28 @@ def _materialize_render_spec(
             if len(visible_frames) > max_frames:
                 raise PreviewLimitError("Preview contains too many visible Frames")
             total_bytes = 0
+            total_pixels = 0
             for frame in visible_frames:
                 try:
                     total_bytes += int(frame.capture.byte_count)
+                    width = frame.capture.width
+                    height = frame.capture.height
+                    if (
+                        isinstance(width, bool)
+                        or not isinstance(width, int)
+                        or width <= 0
+                        or isinstance(height, bool)
+                        or not isinstance(height, int)
+                        or height <= 0
+                    ):
+                        raise ValueError
+                    total_pixels += width * height
                 except (TypeError, ValueError, OverflowError) as exc:
                     raise ComparisonError("Capture media metadata is invalid") from exc
             if total_bytes > max_bytes:
                 raise PreviewLimitError("Preview media exceeds its byte limit")
+            if total_pixels > max_pixels:
+                raise PreviewLimitError("Preview decoded pixels exceed their limit")
 
             frames: list[FrameRenderSpec] = []
             for frame in visible_frames:
@@ -1293,6 +1317,28 @@ def detail(set_pk: int, patient_pk: int | None = None):
     )
 
 
+def _detail_context(
+    set_pk: int,
+    patient_pk: int | None,
+    frame_form: FrameForm,
+) -> dict[str, object]:
+    """Render detail errors with a fresh Set lease/version snapshot."""
+    comparison_set = _route_set(set_pk, patient_pk)
+    can_edit = current_user.is_editor and _lease_is_active(
+        comparison_set,
+        current_user.id,
+        _server_now(),
+    )
+    return {
+        "comparison_set": comparison_set,
+        "patient": comparison_set.patient,
+        "captures": list_captures(comparison_set.patient),
+        "frame_form": frame_form,
+        "can_edit": can_edit,
+        "can_acquire": current_user.is_editor and not can_edit,
+    }
+
+
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/frames")
 @comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/frames")
 @editor_required
@@ -1302,10 +1348,7 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
     if not form.validate_on_submit():
         return render_template(
             "comparisons/detail.html",
-            comparison_set=comparison_set,
-            patient=comparison_set.patient,
-            captures=list_captures(comparison_set.patient),
-            frame_form=form,
+            **_detail_context(set_pk, patient_pk, form),
         ), 400
 
     filename = getattr(form.image.data, "filename", None) if form.image.data else None
@@ -1338,39 +1381,25 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
         form.capture_id.errors.append(str(exc))
         return render_template(
             "comparisons/detail.html",
-            comparison_set=comparison_set,
-            patient=comparison_set.patient,
-            captures=list_captures(comparison_set.patient),
-            frame_form=form,
+            **_detail_context(set_pk, patient_pk, form),
         ), 409
     except StaleVersionError as exc:
         form.capture_id.errors.append(str(exc))
         return render_template(
             "comparisons/detail.html",
-            comparison_set=comparison_set,
-            patient=comparison_set.patient,
-            captures=list_captures(comparison_set.patient),
-            frame_form=form,
-            can_edit=False,
+            **_detail_context(set_pk, patient_pk, form),
         ), 409
     except EditLeaseError as exc:
         form.capture_id.errors.append(str(exc))
         return render_template(
             "comparisons/detail.html",
-            comparison_set=comparison_set,
-            patient=comparison_set.patient,
-            captures=list_captures(comparison_set.patient),
-            frame_form=form,
-            can_edit=False,
+            **_detail_context(set_pk, patient_pk, form),
         ), 409
     except (CaptureError, ComparisonError, StorageError, IntegrityError) as exc:
         form.capture_id.errors.append(str(exc))
         return render_template(
             "comparisons/detail.html",
-            comparison_set=comparison_set,
-            patient=comparison_set.patient,
-            captures=list_captures(comparison_set.patient),
-            frame_form=form,
+            **_detail_context(set_pk, patient_pk, form),
         ), 400
     flash("Frame added.", "success")
     new_version = db.session.scalar(
@@ -1452,6 +1481,8 @@ def save(set_pk: int, patient_pk: int | None = None):
         return jsonify(error=str(exc)), 409
     except EditLeaseError as exc:
         return jsonify(error=str(exc)), 409
+    except IntegrityError:
+        return jsonify(error="An active Set with this name already exists for the Patient"), 409
     except ComparisonError as exc:
         return jsonify(error=str(exc)), 400
     if request.is_json:
