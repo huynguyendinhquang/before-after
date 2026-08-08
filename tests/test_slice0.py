@@ -80,6 +80,77 @@ def test_web_prototype_path_accepts_generated_fixture() -> None:
     assert len(response.data) > 0
 
 
+def test_web_rejects_overlong_title_before_render(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import web
+
+    def unexpected_render(*args: object, **kwargs: object) -> None:
+        pytest.fail("overlong title reached render")
+
+    monkeypatch.setattr(web, "render", unexpected_render)
+    response = web.app.test_client().post(
+        "/render",
+        data={
+            "title": "é" * 501,
+            "template": "viengut_case",
+            "format": "png",
+            "labels": "{}",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+
+
+def test_cli_rejects_overlong_direct_title(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "é" * 501,
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
+
+
+def test_cli_rejects_overlong_json_case_title(tmp_path: Path) -> None:
+    case_path = tmp_path / "case.json"
+    case_path.write_text(json.dumps({"title": "é" * 501}), encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--json-case",
+            str(case_path),
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
+
+
 @pytest.mark.parametrize(
     ("orientation", "expected_size"),
     [(1, (4, 2)), (6, (2, 4)), (8, (2, 4))],
@@ -786,6 +857,45 @@ def test_cli_rejects_malformed_or_wrong_shape_json_case(
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
     assert "case" in result.stderr.lower() or "json" in result.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    "template_data",
+    [
+        [],
+        {"height_mm": 210, "slots": []},
+        {"width_mm": 297, "slots": []},
+        {"width_mm": 297, "height_mm": 210, "slots": {}},
+        {"width_mm": 297, "height_mm": 210, "slots": [[]]},
+    ],
+)
+def test_cli_rejects_malformed_template_shapes(
+    tmp_path: Path, template_data: object
+) -> None:
+    template_path = tmp_path / "template.json"
+    template_path.write_text(json.dumps(template_data), encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--template",
+            str(template_path),
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
 
 
 @pytest.mark.parametrize("option", ["--input-dir", "--json-case"])
