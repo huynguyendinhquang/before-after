@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,15 @@ from app.image_policy import open_image
 
 MM = 300 / 25.4  # px per mm at 300 DPI
 MAX_TITLE_CHARS = 500
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 @dataclass
@@ -46,10 +56,58 @@ class BoardTemplate:
             raise ValueError("template JSON must be an object")
         if "width_mm" not in data or "height_mm" not in data:
             raise ValueError("template JSON requires width_mm and height_mm")
+        if not _is_finite_number(data["width_mm"]) or not _is_finite_number(data["height_mm"]):
+            raise ValueError("template width_mm and height_mm must be finite numbers")
+        if data["width_mm"] <= 0 or data["height_mm"] <= 0:
+            raise ValueError("template width_mm and height_mm must be positive")
+        if not isinstance(data.get("title", {}), dict):
+            raise ValueError("template title must be an object")
+
         raw_slots = data.get("slots", [])
         if not isinstance(raw_slots, list) or any(not isinstance(slot, dict) for slot in raw_slots):
             raise ValueError("template slots must be a list of objects")
-        slots = [Slot(**s) for s in raw_slots]
+
+        required = {"id", "x", "y", "w", "h"}
+        allowed = required | {"label", "fit"}
+        slot_ids: set[str] = set()
+        slots: list[Slot] = []
+        for index, slot in enumerate(raw_slots):
+            missing = required - slot.keys()
+            if missing:
+                raise ValueError(
+                    f"template slot {index} missing required fields: {', '.join(sorted(missing))}"
+                )
+            unexpected = slot.keys() - allowed
+            if unexpected:
+                raise ValueError(
+                    f"template slot {index} has unexpected fields: {', '.join(sorted(unexpected))}"
+                )
+
+            slot_id = slot["id"]
+            if not isinstance(slot_id, str) or not slot_id:
+                raise ValueError(f"template slot {index} id must be a non-empty string")
+            if slot_id in slot_ids:
+                raise ValueError("template slot IDs must be unique")
+            slot_ids.add(slot_id)
+
+            if not _is_finite_number(slot["x"]) or not _is_finite_number(slot["y"]):
+                raise ValueError(f"template slot {index} x/y must be finite numbers")
+            if (
+                not _is_finite_number(slot["w"])
+                or not _is_finite_number(slot["h"])
+                or slot["w"] <= 0
+                or slot["h"] <= 0
+            ):
+                raise ValueError(f"template slot {index} w/h must be finite positive numbers")
+            if not isinstance(slot.get("label", ""), str):
+                raise ValueError(f"template slot {index} label must be a string")
+            if not isinstance(slot.get("fit", "cover"), str) or slot.get("fit", "cover") not in {
+                "cover",
+                "contain",
+            }:
+                raise ValueError(f"template slot {index} fit must be cover or contain")
+            slots.append(Slot(**slot))
+
         return cls(
             name=data.get("name", Path(path).stem),
             width_mm=data["width_mm"],
