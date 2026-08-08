@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from app.image_policy import open_image
 
 MM = 300 / 25.4  # px per mm at 300 DPI
 
@@ -78,7 +80,7 @@ def _font_bold(size: int) -> ImageFont.ImageFont:
 
 def cover_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
     """Scale image to cover (tw, th) and center-crop — PowerCLIP fill."""
-    img = img.convert("RGB")
+    img = ImageOps.exif_transpose(img).convert("RGB")
     sw, sh = img.size
     scale = max(tw / sw, th / sh)
     nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
@@ -90,7 +92,7 @@ def cover_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
 
 def contain_fit(img: Image.Image, tw: int, th: int, bg: str = "#000000") -> Image.Image:
     """Scale image to fit inside (tw, th), letterbox."""
-    img = img.convert("RGB")
+    img = ImageOps.exif_transpose(img).convert("RGB")
     sw, sh = img.size
     scale = min(tw / sw, th / sh)
     nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
@@ -142,8 +144,11 @@ def render(template: BoardTemplate, case: CaseData, dpi: float = 300) -> Image.I
 
         path = case.images.get(slot.id)
         if path and Path(path).exists():
-            src = Image.open(path)
-            cell = place(src, w, h, slot.fit)
+            src = open_image(path)
+            try:
+                cell = place(src, w, h, slot.fit)
+            finally:
+                src.close()
             board.paste(cell, (x, y))
         else:
             # empty placeholder
