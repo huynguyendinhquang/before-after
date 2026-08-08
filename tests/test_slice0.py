@@ -336,3 +336,183 @@ def test_web_request_cap_rejects_oversized_multipart_before_save(monkeypatch: py
 
     assert reloaded_web.app.config["MAX_CONTENT_LENGTH"] == 128
     assert response.status_code == 413
+
+
+def test_web_nonseekable_upload_is_staged_once_and_rendered_from_original_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    payload_stream = io.BytesIO()
+    Image.new("RGB", (8, 4), "#447799").save(payload_stream, format="PNG")
+    payload = payload_stream.getvalue()
+    source = _NonSeekableStream(payload, content_length=0)
+    storage = FileStorage(stream=source, filename="fixture.png", content_length=0)
+    request_stub = type(
+        "RequestStub",
+        (),
+        {
+            "form": {
+                "title": "Generated fixture",
+                "template": "viengut_case",
+                "format": "png",
+                "labels": "{}",
+            },
+            "files": {"slot_portrait": storage},
+        },
+    )()
+    staged: dict[str, bytes] = {}
+    save_calls: list[bool] = []
+    original_save = FileStorage.save
+
+    def tracking_save(self: FileStorage, destination: object, *args: object, **kwargs: object) -> None:
+        save_calls.append(True)
+        original_save(self, destination, *args, **kwargs)
+
+    def inspect_render(template: object, case: CaseData, dpi: int) -> Image.Image:
+        staged["portrait"] = Path(case.images["portrait"]).read_bytes()
+        return Image.new("RGB", (1, 1), "white")
+
+    monkeypatch.setattr(FileStorage, "save", tracking_save)
+    monkeypatch.setattr(reloaded_web, "request", request_stub)
+    monkeypatch.setattr(reloaded_web, "render", inspect_render)
+
+    with reloaded_web.app.test_request_context("/render", method="POST"):
+        response = reloaded_web.do_render()
+
+    assert response.status_code == 200
+    assert staged["portrait"] == payload
+    assert save_calls == []
+    assert source.closed is False
+
+
+def test_decompression_bomb_warning_range_is_an_image_policy_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_stream = io.BytesIO()
+    Image.new("RGB", (4, 2), "#447799").save(payload_stream, format="PNG")
+    original_bomb_limit = Image.MAX_IMAGE_PIXELS
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 4)
+
+    with pytest.raises(image_policy.ImagePolicyError, match="decompression"):
+        image_policy.open_image(payload_stream.getvalue(), max_pixels=100)
+
+    assert Image.MAX_IMAGE_PIXELS == 4
+    assert original_bomb_limit != 4
+
+
+class _OversizedChunk(bytearray):
+    def __bytes__(self) -> bytes:
+        raise AssertionError("oversized chunk must be rejected before coercion")
+
+
+class _OversizedChunkStream:
+    def __init__(self) -> None:
+        self.read_sizes: list[int] = []
+        self.closed = False
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int = -1) -> _OversizedChunk:
+        self.read_sizes.append(size)
+        return _OversizedChunk(b"x" * (size + 1))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_bounded_read_rejects_oversized_return_before_retaining_chunk() -> None:
+    source = _OversizedChunkStream()
+
+    with pytest.raises(image_policy.ImagePolicyError, match="byte"):
+        image_policy.open_image(source, max_bytes=8)
+
+    assert source.read_sizes == [9]
+    assert source.closed is False
+
+
+def test_png_without_terminal_iend_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "fixture.png"
+    payload = _write_image(source, "PNG", size=(16, 16))
+    assert payload.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+
+    with pytest.raises(image_policy.ImagePolicyError, match="IEND"):
+        image_policy.open_image(payload[:-12])
+
+
+def test_jpeg_without_terminal_eoi_is_rejected() -> None:
+    image = Image.new("RGB", (16, 16))
+    image.putdata([(x * 31 % 256, y * 47 % 256, (x + y) * 19 % 256) for y in range(16) for x in range(16)])
+    payload_stream = io.BytesIO()
+    image.save(payload_stream, format="JPEG", quality=95)
+    payload = payload_stream.getvalue()
+    assert payload.endswith(b"\xff\xd9")
+
+    with pytest.raises(image_policy.ImagePolicyError, match="EOI"):
+        image_policy.open_image(payload[:-2])
+
+
+@pytest.mark.parametrize("labels", ["not-json", "[]", '\"caption\"', "null"])
+def test_web_rejects_invalid_or_non_object_labels(
+    monkeypatch: pytest.MonkeyPatch, labels: str
+) -> None:
+    from app import web
+
+    monkeypatch.delenv(image_policy.MAX_REQUEST_BYTES_ENV, raising=False)
+    reloaded_web = importlib.reload(web)
+    response = reloaded_web.app.test_client().post(
+        "/render",
+        data={
+            "title": "Generated fixture",
+            "template": "viengut_case",
+            "format": "png",
+            "labels": labels,
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.status_code != 500
+
+
+def test_image_policy_normalizes_io_and_type_failures(tmp_path: Path) -> None:
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    bad_sources: list[object] = [tmp_path / "missing.png", directory, object()]
+
+    for source in bad_sources:
+        with pytest.raises(image_policy.ImagePolicyError):
+            image_policy.open_image(source)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("path_kind", ["directory", "missing"])
+def test_cli_bad_local_image_path_exits_concisely(tmp_path: Path, path_kind: str) -> None:
+    image_path = tmp_path / path_kind
+    if path_kind == "directory":
+        image_path.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--slot",
+            f"portrait={image_path}",
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    assert "image" in result.stderr.lower()
