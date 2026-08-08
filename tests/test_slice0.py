@@ -4,6 +4,7 @@ import io
 import importlib
 import subprocess
 import sys
+from array import array
 from pathlib import Path
 
 import pytest
@@ -434,6 +435,29 @@ def test_bounded_read_rejects_oversized_return_before_retaining_chunk() -> None:
     assert source.closed is False
 
 
+class _TypedMemoryviewStream:
+    def __init__(self) -> None:
+        self.chunk = memoryview(array("I", [1, 2]))
+        self.read_count = 0
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int = -1) -> memoryview:
+        self.read_count += 1
+        if self.read_count == 1:
+            return self.chunk
+        return memoryview(b"")
+
+
+def test_bounded_read_counts_typed_memoryview_bytes() -> None:
+    source = _TypedMemoryviewStream()
+    assert source.chunk.nbytes > len(source.chunk)
+
+    with pytest.raises(image_policy.ImagePolicyError, match="exceeds byte limit"):
+        image_policy.read_bounded(source, max_bytes=source.chunk.nbytes - 1)
+
+
 def test_png_without_terminal_iend_is_rejected(tmp_path: Path) -> None:
     source = tmp_path / "fixture.png"
     payload = _write_image(source, "PNG", size=(16, 16))
@@ -516,3 +540,31 @@ def test_cli_bad_local_image_path_exits_concisely(tmp_path: Path, path_kind: str
     assert result.returncode != 0
     assert "Traceback" not in result.stderr
     assert "image" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("path_kind", ["missing", "file"])
+def test_cli_bad_input_dir_exits_concisely(tmp_path: Path, path_kind: str) -> None:
+    input_dir = tmp_path / path_kind
+    if path_kind == "file":
+        input_dir.write_bytes(b"not a directory")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--input-dir",
+            str(input_dir),
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert "input" in result.stderr.lower()
