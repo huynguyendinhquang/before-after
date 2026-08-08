@@ -13,6 +13,7 @@ from PIL import Image
 from sqlalchemy import create_engine, func, select, text
 
 from app import create_app
+from app import comparisons as comparisons_module
 from app.comparisons import (
     ComparisonError,
     SamePatientError,
@@ -21,9 +22,10 @@ from app.comparisons import (
     create_comparison_set,
     reorder_frames,
 )
-from app.captures import create_capture
+from app.captures import CaptureReconciliationError, create_capture
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, ComparisonSet, Frame, Patient, ShotType, User
+from app.storage import ManagedStorage, StorageError
 
 
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
@@ -346,6 +348,182 @@ def test_inline_capture_and_frame_share_one_commit_and_failed_media_is_discarded
     media_root = Path(app.config["MEDIA_ROOT"])
     assert len(list((media_root / "originals").iterdir())) == 1
     assert len(list((media_root / "previews").iterdir())) == 1
+
+
+def test_inline_commit_raise_after_commit_returns_success(app, monkeypatch: pytest.MonkeyPatch):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Commit")
+        original_commit = db.session.commit
+
+        def commit_then_raise() -> None:
+            original_commit()
+            raise RuntimeError("commit completed")
+
+        monkeypatch.setattr(db.session, "commit", commit_then_raise)
+        frame = add_frame(
+            actor=actor,
+            comparison_set=comparison_set,
+            upload=jpeg("red"),
+            capture_date="2024-01-01",
+            capture_date_confirmed=True,
+            shot_type_name="Anterior",
+        )
+        assert frame.id is not None
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
+        assert db.session.scalar(select(func.count(Frame.id))) == 1
+
+    media_root = Path(app.config["MEDIA_ROOT"])
+    assert list((media_root / "quarantine").iterdir()) == []
+
+
+def test_inline_finalize_failure_returns_committed_success_and_preserves_marker(
+    app, monkeypatch: pytest.MonkeyPatch
+):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+
+    def fail_finalize(_storage: ManagedStorage, _stored: object) -> None:
+        raise StorageError("finalization unavailable")
+
+    monkeypatch.setattr(ManagedStorage, "finalize", fail_finalize)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Finalize")
+        frame = add_frame(
+            actor=actor,
+            comparison_set=comparison_set,
+            upload=jpeg("red"),
+            capture_date="2024-01-01",
+            capture_date_confirmed=True,
+            shot_type_name="Anterior",
+        )
+        assert frame.id is not None
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
+        assert db.session.scalar(select(func.count(Frame.id))) == 1
+
+    media_root = Path(app.config["MEDIA_ROOT"])
+    assert len(list((media_root / "quarantine").glob(".pending-*"))) == 1
+
+
+def test_inline_inconclusive_commit_preserves_pending_media(app, monkeypatch: pytest.MonkeyPatch):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+
+    def fail_reconcile(**_kwargs: object) -> None:
+        raise RuntimeError("reconciliation unavailable")
+
+    def fail_commit() -> None:
+        raise RuntimeError("commit outcome unknown")
+
+    monkeypatch.setattr(comparisons_module, "_inline_commit_state", fail_reconcile)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Unknown")
+        monkeypatch.setattr(db.session, "commit", fail_commit)
+        with pytest.raises(CaptureReconciliationError, match="preserved"):
+            add_frame(
+                actor=actor,
+                comparison_set=comparison_set,
+                upload=jpeg("red"),
+                capture_date="2024-01-01",
+                capture_date_confirmed=True,
+                shot_type_name="Anterior",
+            )
+        assert db.session.scalar(select(func.count(Capture.id))) == 0
+        assert db.session.scalar(select(func.count(Frame.id))) == 0
+
+    media_root = Path(app.config["MEDIA_ROOT"])
+    assert len(list((media_root / "quarantine").glob(".pending-*"))) == 1
+
+
+def test_reorder_rolls_back_direct_call_validation_and_stale_failures(app):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+    capture_id = stored_capture(app, editor_id, patient_id, jpeg("blue"), "2024-01-01")
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="Locks")
+        frame = add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+        version = db.session.get(ComparisonSet, comparison_set.id).version
+
+        with pytest.raises(StaleVersionError):
+            reorder_frames(
+                actor=actor,
+                comparison_set=comparison_set,
+                ordered_frame_ids=[frame.id],
+                expected_version=version - 1,
+            )
+        assert not db.session().in_transaction()
+
+        with pytest.raises(ComparisonError, match="Frame order"):
+            reorder_frames(
+                actor=actor,
+                comparison_set=comparison_set,
+                ordered_frame_ids=[1.5],
+                expected_version=version,
+            )
+        assert not db.session().in_transaction()
+
+        reorder_frames(
+            actor=actor,
+            comparison_set=comparison_set,
+            ordered_frame_ids=[frame.id],
+            expected_version=version,
+        )
+
+
+def test_json_reorder_requires_positive_integer_frame_ids(app):
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    patient_id = create_patient(app, client, "SET-0001")
+    add_shot_type(app, editor_id)
+    capture_id = stored_capture(app, editor_id, patient_id, jpeg("blue"), "2024-01-01")
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="JSON")
+        frame = add_frame(actor=actor, comparison_set=comparison_set, capture_id=capture_id)
+        set_id = comparison_set.id
+        version = comparison_set.version
+        frame_id = frame.id
+
+    token = csrf_token(client, f"/comparison-sets/{set_id}")
+    for value in ("true", "1.5", f'"{frame_id}"', "NaN", "Infinity", "0", "-1"):
+        response = client.post(
+            f"/comparison-sets/{set_id}/reorder",
+            data=f'{{"frame_ids":[{value}],"version":{version}}}',
+            content_type="application/json",
+            headers={"X-CSRFToken": token},
+        )
+        assert response.status_code == 400, (value, response.get_data(as_text=True))
 
 
 def test_manual_frame_order_is_preserved_and_stale_versions_are_rejected(app):

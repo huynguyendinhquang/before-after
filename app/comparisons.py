@@ -158,6 +158,43 @@ def _number(value: object, field: str) -> float:
     return number
 
 
+def _frame_ids(values: object) -> list[int]:
+    try:
+        values = iter(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ComparisonError("Frame order is invalid") from exc
+    result: list[int] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ComparisonError("Frame order is invalid")
+        result.append(value)
+    return result
+
+
+def _form_frame_ids(values: object) -> list[int]:
+    try:
+        values = iter(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ComparisonError("Frame order is invalid") from exc
+    result: list[int] = []
+    for value in values:
+        if isinstance(value, bool):
+            raise ComparisonError("Frame order is invalid")
+        if isinstance(value, int):
+            frame_id = value
+        elif isinstance(value, str):
+            try:
+                frame_id = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ComparisonError("Frame order is invalid") from exc
+        else:
+            raise ComparisonError("Frame order is invalid")
+        if frame_id <= 0:
+            raise ComparisonError("Frame order is invalid")
+        result.append(frame_id)
+    return result
+
+
 def _millimetres(value: object, field: str) -> Decimal:
     if isinstance(value, bool):
         raise ComparisonError(f"{field} must be a positive number")
@@ -341,23 +378,18 @@ def _capture_for_frame(capture: Capture | int | None, capture_id: int | None) ->
 
 
 def _inline_commit_state(
-    pending: PendingCapture,
+    capture_id: int,
     comparison_set_id: int,
     frame_id: int,
 ) -> tuple[Capture | None, bool]:
     session = db.session.session_factory()
     try:
-        capture_state = inspect(pending.capture)
-        capture_id = (
-            capture_state.identity[0]
-            if capture_state.identity
-            else capture_state.dict.get("id")
-        )
         capture = session.scalar(select(Capture).where(Capture.id == capture_id))
         frame_saved = session.scalar(
             select(Frame.id).where(
                 Frame.id == frame_id,
                 Frame.comparison_set_id == comparison_set_id,
+                Frame.capture_id == capture_id,
             )
         ) is not None
         if capture is not None:
@@ -426,6 +458,8 @@ def add_frame(
             raise SamePatientError("Capture belongs to another Patient")
         if selected.archived_at is not None:
             raise ComparisonError("Capture is unavailable")
+        capture_id = selected.id
+        comparison_set_id = comparison_set.id
 
         automatic_position = position is None
         existing_frames: list[Frame] = []
@@ -456,6 +490,7 @@ def add_frame(
         )
         db.session.add(frame)
         db.session.flush()
+        frame_id = frame.id
         canonical = [frame.id for frame in existing_frames] == [
             item.id
             for item in sorted(existing_frames, key=_frame_capture_order_key)
@@ -491,26 +526,39 @@ def add_frame(
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
-        if pending is None:
-            raise
         try:
-            committed, frame_saved = _inline_commit_state(pending, comparison_set.id, frame.id)
+            committed, frame_saved = _inline_commit_state(
+                capture_id=capture_id,
+                comparison_set_id=comparison_set_id,
+                frame_id=frame_id,
+            )
         except Exception as reconciliation_exc:
-            pending.preserve()
+            if pending is not None:
+                pending.preserve()
             raise CaptureReconciliationError(
                 "Capture and Frame save status could not be confirmed; pending media was preserved for reconciliation"
             ) from reconciliation_exc
-        if committed is not None:
-            pending.settle(committed)
-            if frame_saved:
-                return frame
-            raise CaptureReconciliationError(
-                "Capture commit was confirmed but its Frame was not"
-            ) from exc
-        pending.discard()
-        raise
+        if committed is not None and frame_saved:
+            if pending is not None:
+                try:
+                    pending.settle(committed)
+                except Exception:
+                    pending.preserve()
+            return frame
+        if committed is None and not frame_saved:
+            if pending is not None:
+                pending.discard()
+            raise
+        if pending is not None:
+            pending.preserve()
+        raise CaptureReconciliationError(
+            "Capture and Frame save status could not be confirmed; pending media was preserved for reconciliation"
+        ) from exc
     if pending is not None:
-        pending.finalize()
+        try:
+            pending.finalize()
+        except Exception:
+            pending.preserve()
     return frame
 
 
@@ -529,35 +577,32 @@ def reorder_frames(
         expected_version = int(expected_version)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ComparisonError("Set version is required") from exc
-    if expected_version <= 0:
-        raise ComparisonError("Set version is required")
-    comparison_set = _active_set(comparison_set)
     try:
-        ordered_ids = [int(value) for value in ordered_frame_ids]
-    except (TypeError, ValueError) as exc:
-        raise ComparisonError("Frame order is invalid") from exc
-    locked_set = _locked_comparison_set(comparison_set)
-    if locked_set is None or locked_set.archived_at is not None:
-        raise ComparisonError("Comparison Set is unavailable")
-    if locked_set.patient is None or locked_set.patient.archived_at is not None:
-        raise ComparisonError("Patient is unavailable")
-    if locked_set.version != expected_version:
-        raise StaleVersionError("Set has changed; reload before reordering")
+        if expected_version <= 0:
+            raise ComparisonError("Set version is required")
+        comparison_set = _active_set(comparison_set)
+        ordered_ids = _frame_ids(ordered_frame_ids)
+        locked_set = _locked_comparison_set(comparison_set)
+        if locked_set is None or locked_set.archived_at is not None:
+            raise ComparisonError("Comparison Set is unavailable")
+        if locked_set.patient is None or locked_set.patient.archived_at is not None:
+            raise ComparisonError("Patient is unavailable")
+        if locked_set.version != expected_version:
+            raise StaleVersionError("Set has changed; reload before reordering")
 
-    frames = list(
-        db.session.scalars(
-            select(Frame)
-            .where(Frame.comparison_set_id == locked_set.id)
-            .order_by(Frame.position, Frame.id)
+        frames = list(
+            db.session.scalars(
+                select(Frame)
+                .where(Frame.comparison_set_id == locked_set.id)
+                .order_by(Frame.position, Frame.id)
+            )
         )
-    )
-    expected = {frame.id for frame in frames}
-    if len(ordered_ids) != len(expected) or set(ordered_ids) != expected:
-        raise ComparisonError("Frame order must include every Frame exactly once")
+        expected = {frame.id for frame in frames}
+        if len(ordered_ids) != len(expected) or set(ordered_ids) != expected:
+            raise ComparisonError("Frame order must include every Frame exactly once")
 
-    by_id = {frame.id: frame for frame in frames}
-    offset = max((frame.position for frame in frames), default=-1) + len(frames) + 1
-    try:
+        by_id = {frame.id: frame for frame in frames}
+        offset = max((frame.position for frame in frames), default=-1) + len(frames) + 1
         for index, frame in enumerate(frames):
             frame.position = offset + index
         db.session.flush()
@@ -706,6 +751,15 @@ def add_frame_route(set_pk: int, patient_pk: int | None = None):
                 create_proposal=form.create_proposal.data,
                 original_filename=filename,
             )
+    except CaptureReconciliationError as exc:
+        form.capture_id.errors.append(str(exc))
+        return render_template(
+            "comparisons/detail.html",
+            comparison_set=comparison_set,
+            patient=comparison_set.patient,
+            captures=list_captures(comparison_set.patient),
+            frame_form=form,
+        ), 409
     except (CaptureError, ComparisonError, StorageError, IntegrityError) as exc:
         form.capture_id.errors.append(str(exc))
         return render_template(
@@ -745,9 +799,9 @@ def reorder(set_pk: int, patient_pk: int | None = None):
                 raise ComparisonError("Frame is already at that edge")
             current[index], current[other] = current[other], current[index]
             raw_ids = current
-        except (ValueError, IndexError) as exc:
+        except (ValueError, IndexError, ComparisonError) as exc:
             raw_ids = []
-            error: Exception = ComparisonError("Frame order is invalid")
+            error = exc if isinstance(exc, ComparisonError) else ComparisonError("Frame order is invalid")
         else:
             error = None
     else:
@@ -756,6 +810,8 @@ def reorder(set_pk: int, patient_pk: int | None = None):
     try:
         if error is not None:
             raise error
+        if not request.is_json:
+            raw_ids = _form_frame_ids(raw_ids)
         ordered = reorder_frames(
             actor=current_user,
             comparison_set=comparison_set,
