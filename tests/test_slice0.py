@@ -923,3 +923,122 @@ def test_cli_rejects_extreme_missing_input_paths(tmp_path: Path, option: str) ->
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
     assert result.stderr.startswith("error:")
+
+
+def _valid_template() -> dict[str, object]:
+    return {
+        "width_mm": 297,
+        "height_mm": 210,
+        "title": {},
+        "slots": [{"id": "portrait", "x": 8, "y": 18, "w": 95, "h": 175}],
+    }
+
+
+def _run_template_cli(tmp_path: Path, template_data: object) -> subprocess.CompletedProcess[str]:
+    template_path = tmp_path / "template.json"
+    template_path.write_text(json.dumps(template_data), encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.cli",
+            "--title",
+            "Generated fixture",
+            "--template",
+            str(template_path),
+            "--dpi",
+            "20",
+            "-o",
+            str(tmp_path / "board.png"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_template_cli_rejects(result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert result.stderr.startswith("error:")
+
+
+@pytest.mark.parametrize("missing", ["id", "x", "y", "w", "h"])
+def test_cli_rejects_template_slot_missing_required_field(tmp_path: Path, missing: str) -> None:
+    template = _valid_template()
+    del template["slots"][0][missing]  # type: ignore[index]
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+def test_cli_rejects_template_slot_unexpected_field(tmp_path: Path) -> None:
+    template = _valid_template()
+    template["slots"][0]["unexpected"] = "not allowed"  # type: ignore[index]
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", None),
+        ("id", ""),
+        ("x", "left"),
+        ("y", True),
+        ("x", float("nan")),
+        ("y", float("inf")),
+        ("w", 0),
+        ("h", -1),
+        ("w", True),
+        ("h", "wide"),
+        ("w", float("nan")),
+        ("label", 7),
+        ("label", None),
+        ("fit", 1),
+        ("fit", "stretch"),
+    ],
+)
+def test_cli_rejects_template_slot_invalid_field(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    template = _valid_template()
+    template["slots"][0][field] = value  # type: ignore[index]
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+def test_cli_rejects_template_duplicate_slot_ids(tmp_path: Path) -> None:
+    template = _valid_template()
+    template["slots"].append(  # type: ignore[union-attr]
+        {"id": "portrait", "x": 108, "y": 18, "w": 58, "h": 78}
+    )
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("width_mm", "wide"),
+        ("height_mm", "tall"),
+        ("width_mm", 0),
+        ("height_mm", 0),
+        ("width_mm", -1),
+        ("height_mm", -1),
+    ],
+)
+def test_cli_rejects_template_invalid_dimensions(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    template = _valid_template()
+    template[field] = value
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
+
+
+@pytest.mark.parametrize("title", ["not an object", ["not", "an", "object"]])
+def test_cli_rejects_template_non_object_title(tmp_path: Path, title: object) -> None:
+    template = _valid_template()
+    template["title"] = title
+
+    _assert_template_cli_rejects(_run_template_cli(tmp_path, template))
