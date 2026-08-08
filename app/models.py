@@ -1,4 +1,4 @@
-"""Persistence models for identity, Patients, consent, and audit history."""
+"""Persistence models for identity, Patients, Captures, and audit history."""
 
 from __future__ import annotations
 
@@ -109,6 +109,117 @@ class Patient(db.Model):
     created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
     updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
     archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
+
+
+class ShotType(db.Model):
+    __tablename__ = "shot_types"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    state = db.Column(db.String(16), nullable=False, default="canonical", server_default="canonical")
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    canonical_target_id = db.Column(
+        db.Integer,
+        db.ForeignKey("shot_types.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.func.now(),
+        onupdate=db.func.now(),
+    )
+
+    __table_args__ = (
+        db.CheckConstraint(
+            "state IN ('canonical', 'proposal', 'merged')",
+            name="ck_shot_types_state",
+        ),
+        db.CheckConstraint("length(trim(name)) > 0", name="ck_shot_types_name_not_blank"),
+        db.CheckConstraint(
+            "canonical_target_id IS NULL OR canonical_target_id <> id",
+            name="ck_shot_types_target_not_self",
+        ),
+        db.UniqueConstraint("name", name="uq_shot_types_name"),
+    )
+
+    created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
+    canonical_target = db.relationship(
+        "ShotType",
+        remote_side=[id],
+        foreign_keys=[canonical_target_id],
+        lazy="joined",
+    )
+
+
+class Capture(db.Model):
+    __tablename__ = "captures"
+
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(
+        db.Integer,
+        db.ForeignKey("patients.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    capture_date = db.Column(db.Date, nullable=False)
+    shot_type_id = db.Column(
+        db.Integer,
+        db.ForeignKey("shot_types.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    storage_key = db.Column(db.String(512), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    format = db.Column(db.String(16), nullable=False)
+    width = db.Column(db.Integer, nullable=False)
+    height = db.Column(db.Integer, nullable=False)
+    byte_count = db.Column(db.BigInteger, nullable=False)
+    sha256 = db.Column(db.String(64), nullable=False)
+    archived_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    archived_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    updated_by_id = db.Column(
+        db.Integer,
+        db.ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.func.now(),
+        onupdate=db.func.now(),
+    )
+
+    __table_args__ = (
+        db.CheckConstraint("length(trim(storage_key)) > 0", name="ck_captures_storage_key_not_blank"),
+        db.CheckConstraint("length(trim(original_filename)) > 0", name="ck_captures_filename_not_blank"),
+        db.CheckConstraint("format IN ('BMP', 'JPEG', 'PNG', 'TIFF', 'WEBP')", name="ck_captures_format"),
+        db.CheckConstraint("width > 0 AND height > 0", name="ck_captures_dimensions"),
+        db.CheckConstraint("byte_count > 0", name="ck_captures_byte_count"),
+        db.CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_captures_sha256"),
+        db.UniqueConstraint("storage_key", name="uq_captures_storage_key"),
+        db.UniqueConstraint("patient_id", "sha256", name="uq_captures_patient_sha256"),
+        db.Index("ix_captures_patient_capture_date", "patient_id", "capture_date"),
+    )
+
+    patient = db.relationship("Patient", foreign_keys=[patient_id], lazy="joined")
+    shot_type = db.relationship("ShotType", foreign_keys=[shot_type_id], lazy="joined")
+    archived_by = db.relationship("User", foreign_keys=[archived_by_id], lazy="joined")
+    created_by = db.relationship("User", foreign_keys=[created_by_id], lazy="joined")
+    updated_by = db.relationship("User", foreign_keys=[updated_by_id], lazy="joined")
 
 class AuditEvent(db.Model):
     __tablename__ = "audit_events"

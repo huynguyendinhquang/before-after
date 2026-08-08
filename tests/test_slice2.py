@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import os
+import re
+from datetime import date
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
+import pytest
+from PIL import Image
+from sqlalchemy import create_engine, func, select, text
+
+from app import create_app
+from app import captures
+from app.captures import ConsentRequired, create_capture
+from app.db import db, normalize_database_url
+from app.models import AuditEvent, Capture, Patient, ShotType, User
+from app.storage import ManagedStorage, StorageError
+
+
+CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
+
+
+def csrf_token(client, path: str) -> str:
+    response = client.get(path)
+    assert response.status_code == 200
+    match = CSRF_RE.search(response.get_data(as_text=True))
+    assert match, response.get_data(as_text=True)
+    return match.group(1)
+
+
+def app_config(tmp_path: Path, database_url: str) -> dict[str, object]:
+    return {
+        "TESTING": True,
+        "APP_ENV": "test",
+        "DATABASE_URL": database_url,
+        "MEDIA_ROOT": str(tmp_path / "media"),
+        "SECRET_KEY": "slice-2-test-secret",
+        "SESSION_COOKIE_SECURE": False,
+    }
+
+
+@pytest.fixture(scope="session")
+def migrated_test_database():
+    database_url = os.environ.get("TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("TEST_DATABASE_URL is required for Slice 2 PostgreSQL tests")
+
+    database_url = normalize_database_url(database_url)
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        connection.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
+    alembic_config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    alembic_config.set_main_option("sqlalchemy.url", database_url)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    try:
+        command.upgrade(alembic_config, "head")
+    finally:
+        monkeypatch.undo()
+    yield database_url
+
+
+@pytest.fixture
+def app(tmp_path: Path, migrated_test_database: str):
+    application = create_app(app_config(tmp_path, migrated_test_database))
+    with application.app_context():
+        db.session.execute(
+            text("TRUNCATE audit_events, captures, shot_types, patients, users RESTART IDENTITY CASCADE")
+        )
+        db.session.commit()
+    yield application
+    with application.app_context():
+        db.session.rollback()
+        db.session.execute(
+            text("TRUNCATE audit_events, captures, shot_types, patients, users RESTART IDENTITY CASCADE")
+        )
+        db.session.commit()
+
+
+def add_user(application, username: str, role: str) -> int:
+    with application.app_context():
+        user = User(username=username, display_name=username.title(), role=role, active=True)
+        user.set_password("correct horse battery staple")
+        db.session.add(user)
+        db.session.commit()
+        return user.id
+
+
+def login(client, path: str, username: str) -> None:
+    token = csrf_token(client, path)
+    response = client.post(
+        "/login",
+        data={"username": username, "password": "correct horse battery staple", "csrf_token": token},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+
+
+def create_patient(application, client) -> int:
+    token = csrf_token(client, "/patients/new")
+    response = client.post(
+        "/patients/new",
+        data={
+            "patient_id": "CAP-0001",
+            "name": "Capture Fixture",
+            "birth_year": "1990",
+            "consent_confirmed": "y",
+            "csrf_token": token,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    with application.app_context():
+        patient = db.session.scalar(select(Patient).where(Patient.patient_id == "CAP-0001"))
+        assert patient is not None
+        return patient.id
+
+
+def oriented_jpeg() -> bytes:
+    image = Image.new("RGB", (8, 4), "#447799")
+    exif = image.getexif()
+    exif[274] = 6
+    exif[36867] = "2024:03:04 05:06:07"
+    stream = io.BytesIO()
+    image.save(stream, format="JPEG", exif=exif.tobytes())
+    return stream.getvalue()
+
+
+def test_capture_workflow_confirms_override_preserves_original_and_survives_restart(
+    app, tmp_path: Path, migrated_test_database: str
+) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+    with app.app_context():
+        shot_type = ShotType(name="Anterior", state="canonical", created_by_id=editor_id)
+        db.session.add(shot_type)
+        db.session.commit()
+
+    payload = oriented_jpeg()
+    token = csrf_token(client, f"/patients/{patient_id}/captures/new")
+    response = client.post(
+        f"/patients/{patient_id}/captures/new",
+        data={
+            "image": (io.BytesIO(payload), "../../original-with-exif.jpg"),
+            "capture_date": "2025-02-03",
+            "capture_date_confirmed": "y",
+            "shot_type_name": "Anterior",
+            "csrf_token": token,
+        },
+        content_type="multipart/form-data",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302, response.get_data(as_text=True)
+
+    with app.app_context():
+        capture = db.session.scalar(select(Capture))
+        assert capture is not None
+        capture_id = capture.id
+        assert capture.capture_date == date(2025, 2, 3)
+        assert capture.sha256 == hashlib.sha256(payload).hexdigest()
+        assert capture.original_filename == "original-with-exif.jpg"
+        assert capture.storage_key.startswith("originals/")
+        assert ".." not in capture.storage_key
+        original_key = capture.storage_key
+        event = db.session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "capture.create")
+        )
+        assert event is not None
+        assert event.actor_id == editor_id
+
+    storage = ManagedStorage(tmp_path / "media")
+    assert storage.resolve(original_key).read_bytes() == payload
+    assert len(list((tmp_path / "media" / "originals").iterdir())) == 1
+    preview_response = client.get(f"/captures/{capture_id}/preview")
+    assert preview_response.status_code == 200
+    assert preview_response.headers["Cache-Control"] == "no-store"
+    with Image.open(io.BytesIO(preview_response.data)) as preview:
+        preview.load()
+        assert max(preview.size) <= 1600
+        assert len(preview.getexif()) == 0
+    original_response = client.get(f"/captures/{capture_id}/original")
+    assert original_response.status_code == 200
+    assert original_response.headers["Cache-Control"] == "no-store"
+    assert original_response.data == payload
+
+    restarted = create_app(app_config(tmp_path, migrated_test_database))
+    restarted_client = restarted.test_client()
+    login(restarted_client, "/login", "editor")
+    library = restarted_client.get(f"/patients/{patient_id}/captures")
+    assert library.status_code == 200
+    assert "Anterior" in library.get_data(as_text=True)
+    assert restarted_client.get(f"/captures/{capture_id}/preview").status_code == 200
+
+
+def test_duplicate_has_one_original_and_viewer_cannot_mutate(app) -> None:
+    add_user(app, "editor", "editor")
+    add_user(app, "viewer", "viewer")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+    with app.app_context():
+        editor = db.session.scalar(select(User).where(User.username == "editor"))
+        assert editor is not None
+        db.session.add(ShotType(name="Lateral", state="canonical", created_by_id=editor.id))
+        db.session.commit()
+
+    payload = oriented_jpeg()
+    path = f"/patients/{patient_id}/captures/new"
+    token = csrf_token(client, path)
+    fields = {
+        "capture_date": "2025-02-03",
+        "capture_date_confirmed": "y",
+        "shot_type_name": "Lateral",
+        "csrf_token": token,
+    }
+    first = dict(fields, image=(io.BytesIO(payload), "first.jpg"))
+    assert client.post(path, data=first, content_type="multipart/form-data").status_code == 302
+    second = dict(fields, image=(io.BytesIO(payload), "second.jpg"))
+    assert client.post(path, data=second, content_type="multipart/form-data").status_code == 302
+
+    with app.app_context():
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
+    assert len(list((Path(app.config["MEDIA_ROOT"]) / "originals").iterdir())) == 1
+
+    client.post("/logout", data={"csrf_token": csrf_token(client, "/patients")})
+    login(client, "/login", "viewer")
+    assert client.get(path).status_code == 403
+    assert client.post(path, data={}).status_code == 403
+
+
+def test_failed_audit_transaction_cleans_media_and_capture_row(app, monkeypatch: pytest.MonkeyPatch) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "/login", "editor")
+    patient_id = create_patient(app, client)
+    with app.app_context():
+        patient = db.session.get(Patient, patient_id)
+        assert patient is not None
+        shot_type = ShotType(name="Oblique", state="canonical", created_by_id=editor_id)
+        db.session.add(shot_type)
+        db.session.flush()
+        actor = db.session.get(User, editor_id)
+        assert actor is not None
+
+        def fail_audit(**_kwargs: object) -> None:
+            raise RuntimeError("audit failed")
+
+        monkeypatch.setattr(captures, "append_audit", fail_audit)
+        with pytest.raises(RuntimeError, match="audit failed"):
+            create_capture(
+                actor=actor,
+                patient=patient,
+                upload=oriented_jpeg(),
+                capture_date="2025-02-03",
+                capture_date_confirmed=True,
+                shot_type=shot_type,
+                original_filename="failed.jpg",
+            )
+        assert db.session.scalar(select(func.count(Capture.id))) == 0
+        assert db.session.scalar(select(func.count(AuditEvent.id))) == 1
+
+    media_root = Path(app.config["MEDIA_ROOT"])
+    assert list((media_root / "originals").iterdir()) == []
+    assert list((media_root / "previews").iterdir()) == []
+
+
+def test_consent_confirmation_and_storage_path_safety_fail_before_storage(app, tmp_path: Path) -> None:
+    editor_id = add_user(app, "editor", "editor")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        assert actor is not None
+        no_consent = Patient(id=999, consent_confirmed_at=None, archived_at=None)
+        with pytest.raises(ConsentRequired):
+            create_capture(
+                actor=actor,
+                patient=no_consent,
+                upload=oriented_jpeg(),
+                capture_date="2025-02-03",
+                capture_date_confirmed=True,
+                shot_type_name="Proposal only",
+                create_proposal=True,
+            )
+
+    storage = ManagedStorage(tmp_path / "safe-media")
+    for key in ("../outside", "/tmp/outside", "originals/../outside", "previews\\escape"):
+        with pytest.raises(StorageError):
+            storage.resolve(key)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"do not read")
+    (tmp_path / "safe-media" / "originals" / "link").symlink_to(outside)
+    with pytest.raises(StorageError):
+        storage.open_read("originals/link")
+    assert outside.read_bytes() == b"do not read"
+    assert list((tmp_path / "safe-media" / "originals").iterdir()) == [
+        tmp_path / "safe-media" / "originals" / "link"
+    ]
+
+
+def test_managed_storage_accepts_all_policy_formats(tmp_path: Path) -> None:
+    storage = ManagedStorage(tmp_path / "media")
+    for image_format in ("BMP", "JPEG", "PNG", "TIFF", "WEBP"):
+        stream = io.BytesIO()
+        Image.new("RGB", (8, 4), "#447799").save(stream, format=image_format)
+        inspection = storage.inspect(stream.getvalue())
+        stored = storage.store(stream.getvalue(), inspection)
+        assert storage.resolve(stored.original_key).read_bytes() == stream.getvalue()
+        storage.cleanup(stored.original_key, stored.preview_key)

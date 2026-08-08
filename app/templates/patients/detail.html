@@ -16,6 +16,28 @@
       {{ consent_form.submit() }}
     </form>
   {% endif %}
+  <hr>
+  <h2>Capture Library</h2>
+  {% if current_user.is_editor %}
+    <p><a class="button" href="{{ url_for('captures.new', patient_pk=patient.id) }}">Add Capture</a></p>
+  {% endif %}
+  {% if captures %}
+    <table>
+      <thead><tr><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Format</th></tr></thead>
+      <tbody>
+      {% for capture in captures %}
+        <tr>
+          <td><a href="{{ url_for('captures.original', capture_pk=capture.id) }}"><img src="{{ url_for('captures.preview', capture_pk=capture.id) }}" alt="Capture {{ capture.id }}" width="120"></a></td>
+          <td>{{ capture.capture_date }}</td>
+          <td>{{ capture.shot_type.name }}{% if capture.shot_type.state == 'proposal' %} (Proposal){% endif %}</td>
+          <td>{{ capture.format }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No Captures stored yet.</p>
+  {% endif %}
   <p><a href="{{ url_for('patients.index') }}">Back to Patients</a></p>
 </section>
 {% endblock %}

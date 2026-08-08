@@ -140,7 +140,14 @@ def detail(patient_pk: int):
     patient = db.session.get(Patient, patient_pk)
     if patient is None or patient.archived_at is not None:
         abort(404)
-    return render_template("patients/detail.html", patient=patient, consent_form=ConsentForm())
+    from app.captures import list_captures
+
+    return render_template(
+        "patients/detail.html",
+        patient=patient,
+        consent_form=ConsentForm(),
+        captures=list_captures(patient),
+    )
 
 
 @patients_bp.post("/<int:patient_pk>/consent")

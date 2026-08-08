@@ -10,6 +10,7 @@ from flask_login import current_user
 from flask_wtf.csrf import CSRFError, CSRFProtect
 
 from app.auth import auth_bp, editor_required, login_manager, register_cli
+from app.captures import captures_bp
 from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
 from app.patients import patients_bp
@@ -39,6 +40,13 @@ def _validate_configuration(app: Flask) -> None:
         raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
     if not media_path.is_dir():
         raise RuntimeError("MEDIA_ROOT must be a directory")
+    static_root = Path(app.static_folder).resolve()
+    try:
+        media_path.relative_to(static_root)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("MEDIA_ROOT must be outside the static web root")
 
     app.config.update(
         DATABASE_URL=database_url,
@@ -118,6 +126,7 @@ def create_app(config: dict | None = None) -> Flask:
     csrf.init_app(app)
     app.register_blueprint(auth_bp)
     app.register_blueprint(patients_bp)
+    app.register_blueprint(captures_bp)
     _register_prototype_routes(app)
     register_cli(app)
 
@@ -135,7 +144,7 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.after_request
     def no_store_authenticated_patient_pages(response):
-        if current_user.is_authenticated and request.path.startswith(("/patients", "/prototype")):
+        if current_user.is_authenticated and request.path.startswith(("/patients", "/captures", "/shot-types", "/prototype")):
             response.headers["Cache-Control"] = "no-store"
         return response
 

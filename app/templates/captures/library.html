@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Capture Library — {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+    <h1>Capture Library — {{ patient.patient_id }}</h1>
+    {% if current_user.is_editor %}<a class="button" href="{{ url_for('captures.new', patient_pk=patient.id) }}">Add Capture</a>{% endif %}
+  </div>
+  {% if captures %}
+    <table>
+      <thead><tr><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Original</th></tr></thead>
+      <tbody>
+      {% for capture in captures %}
+        <tr>
+          <td><img src="{{ url_for('captures.preview', capture_pk=capture.id) }}" alt="Capture {{ capture.id }}" width="160"></td>
+          <td>{{ capture.capture_date }}</td>
+          <td>{{ capture.shot_type.name }}{% if capture.shot_type.state == 'proposal' %} (Proposal){% endif %}</td>
+          <td><a href="{{ url_for('captures.original', capture_pk=capture.id) }}">Open original</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No Captures stored yet.</p>
+  {% endif %}
+  <p><a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">Back to Patient</a></p>
+</section>
+{% endblock %}
