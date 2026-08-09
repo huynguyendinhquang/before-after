@@ -5,6 +5,24 @@ set -euo pipefail
 # systemd ExecStartPre/ExecStopPost commands. This process must never assume
 # that a failed or unknown systemctl result means the app is stopped.
 service_unit="${BACKUP_SERVICE_UNIT:-before-after.service}"
+media_root="${MEDIA_ROOT:-}"
+if [[ -z "$media_root" || ! -d "$media_root" || -L "$media_root" ]]; then
+    echo "backup failed: MEDIA_ROOT must be a real directory" >&2
+    exit 1
+fi
+lock_path="$media_root/.backup.lock"
+if [[ ! -f "$lock_path" || -L "$lock_path" ]]; then
+    echo "backup failed: persistent application/backup lock is unavailable" >&2
+    exit 1
+fi
+exec {backup_lock_fd}>>"$lock_path"
+flock_bin=$(command -v flock || true)
+if [[ -z "$flock_bin" ]]; then
+    echo "backup failed: flock is required" >&2
+    exit 1
+fi
+"$flock_bin" --exclusive "$backup_lock_fd"
+export BACKUP_LOCK_FD="$backup_lock_fd"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir/.."
 

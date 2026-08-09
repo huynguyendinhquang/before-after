@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import fcntl
 from datetime import datetime, timezone
 import fnmatch
@@ -25,8 +26,9 @@ import sys
 import tempfile
 import time
 from typing import Callable, Iterator
-from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import uuid
+
+from app.db import postgres_route, sanitized_postgres_environment
 
 
 GENERATION_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$")
@@ -40,23 +42,7 @@ _STAGING_OWNER_NAME = ".staging-owner.json"
 _STAGING_OWNER_FORMAT = "before-after.backup-staging.v1"
 _STAGING_RE = re.compile(r"^\.staging-([0-9a-f]{32})$")
 POSTGRES_CLIENTS = ("pg_dump", "pg_restore", "psql")
-_PG_ENV_QUERY_KEYS = {
-    "application_name",
-    "channel_binding",
-    "connect_timeout",
-    "gssencmode",
-    "hostaddr",
-    "keepalives",
-    "keepalives_count",
-    "keepalives_idle",
-    "keepalives_interval",
-    "sslcert",
-    "sslkey",
-    "sslmode",
-    "sslrootcert",
-}
-
-
+_POSIX_ACL_XATTRS = frozenset({"system.posix_acl_access", "system.posix_acl_default"})
 class OpsError(RuntimeError):
     """Raised when an operational safety or backup invariant fails."""
 
@@ -358,39 +344,17 @@ def _validate_backup_storage(
 
 
 def _native_postgres_url(value: object) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise OpsError("DATABASE_URL is required")
-    value = value.strip()
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"postgresql", "postgresql+psycopg", "postgres"}:
-        raise OpsError("DATABASE_URL must use PostgreSQL")
-    scheme = "postgresql"
-    return urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    try:
+        return postgres_route(value).sqlalchemy_url
+    except RuntimeError as exc:
+        raise OpsError(str(exc)) from exc
 
 
 def _postgres_settings(value: str) -> dict[str, str | None]:
-    native = _native_postgres_url(value)
-    parsed = urlsplit(native)
     try:
-        port = parsed.port
-    except ValueError as exc:
-        raise OpsError("PostgreSQL URL has an invalid port") from exc
-    database = unquote(parsed.path.lstrip("/"))
-    if not database:
-        raise OpsError("PostgreSQL URL must include a database")
-    query = parse_qs(parsed.query, keep_blank_values=False)
-    settings: dict[str, str | None] = {
-        "PGHOST": parsed.hostname,
-        "PGPORT": str(port or 5432),
-        "PGUSER": unquote(parsed.username) if parsed.username is not None else None,
-        "PGDATABASE": database,
-        "PGPASSWORD": unquote(parsed.password) if parsed.password is not None else None,
-    }
-    for key in _PG_ENV_QUERY_KEYS:
-        values = query.get(key)
-        if values:
-            settings["PG" + key.upper()] = unquote(values[0])
-    return settings
+        return dict(postgres_route(value).environment())
+    except RuntimeError as exc:
+        raise OpsError(str(exc)) from exc
 
 
 def _pgpass_escape(value: str) -> str:
@@ -401,14 +365,12 @@ def _pgpass_escape(value: str) -> str:
 
 @contextmanager
 def _postgres_environment(value: str, *, base: dict[str, str] | None = None) -> Iterator[dict[str, str]]:
-    settings = _postgres_settings(value)
-    environment = dict(os.environ if base is None else base)
-    for key in {"PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD", "PGPASSFILE", "PGHOSTADDR"}:
-        environment.pop(key, None)
-    password = settings.pop("PGPASSWORD")
-    for key, setting in settings.items():
-        if setting is not None:
-            environment[key] = setting
+    try:
+        settings = dict(postgres_route(value).environment())
+        environment = sanitized_postgres_environment(value, base=base)
+    except RuntimeError as exc:
+        raise OpsError(str(exc)) from exc
+    password = settings.pop("PGPASSWORD", None)
     passfile: Path | None = None
     if password is not None:
         escaped_user = _pgpass_escape(settings.get("PGUSER") or "*")
@@ -528,59 +490,276 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _copy_regular_file(
-    source: Path,
+def _directory_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    except AttributeError as exc:
+        raise OpsError("descriptor-based media backup requires POSIX no-follow primitives") from exc
+
+
+def _file_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    except AttributeError as exc:
+        raise OpsError("descriptor-based media backup requires POSIX no-follow primitives") from exc
+
+
+def _open_directory_path(path: Path) -> int:
+    """Open a managed directory component-by-component without following links."""
+    descriptor: int | None = None
+    completed = False
+    try:
+        descriptor = os.open("/", _directory_flags())
+        for part in path.absolute().parts[1:]:
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                raise OpsError("managed media path contains traversal")
+            try:
+                before = os.lstat(part, dir_fd=descriptor)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise OpsError("managed media path contains a non-directory")
+                child = os.open(part, _directory_flags(), dir_fd=descriptor)
+            except OpsError:
+                raise
+            except OSError as exc:
+                raise OpsError("managed media path is not safely openable") from exc
+            try:
+                after = os.fstat(child)
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise OpsError("managed media path changed identity")
+            except Exception:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        completed = True
+        return descriptor
+    except OpsError:
+        raise
+    except OSError as exc:
+        raise OpsError("managed media path is not safely openable") from exc
+    finally:
+        if descriptor is not None and not completed:
+            os.close(descriptor)
+
+
+def _media_directory_info(info: os.stat_result, label: str) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        raise OpsError(f"{label} must be a directory")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o007 or mode & 0o020 or mode & 0o070 != 0o050:
+        raise OpsError(f"{label} must be group-readable and not writable")
+
+
+def _assert_no_posix_acl_fd(fd: int, label: str) -> None:
+    try:
+        names = os.listxattr(fd)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL}:
+            return
+        raise OpsError(f"could not inspect ACLs for {label}") from exc
+    if _POSIX_ACL_XATTRS.intersection(
+        name.decode() if isinstance(name, bytes) else name for name in names
+    ):
+        raise OpsError(f"POSIX ACLs are not allowed in media: {label}")
+
+
+def _media_file_info(info: os.stat_result, label: str) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise OpsError(f"{label} must be a regular file")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o007 or mode & 0o020 or mode & 0o040 != 0o040:
+        raise OpsError(f"{label} must be group-readable and not writable")
+
+
+def _entry_lstat(parent_fd: int, name: str) -> os.stat_result:
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except OSError as exc:
+        raise OpsError("could not inspect media entry") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise OpsError("symlinks are not allowed in media backups")
+    if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+        raise OpsError("media backup accepts regular files and directories only")
+    return info
+
+
+def _open_media_entry(parent_fd: int, name: str, *, directory: bool, before: os.stat_result) -> int:
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(before.st_mode):
+        raise OpsError("media entry changed type")
+    try:
+        descriptor = os.open(
+            name,
+            _directory_flags() if directory else _file_flags(),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        try:
+            current = os.lstat(name, dir_fd=parent_fd)
+        except OSError:
+            current = None
+        if current is not None and (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+            raise OpsError("media entry changed identity") from exc
+        raise OpsError("could not safely open media entry") from exc
+    try:
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise OpsError("media entry changed identity")
+        if not expected(after.st_mode):
+            raise OpsError("media entry changed type")
+        _assert_no_posix_acl_fd(descriptor, name)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _copy_regular_descriptor(
+    source_fd: int,
     destination: Path,
-    *,
-    source_media: bool = False,
+    source_info: os.stat_result,
 ) -> tuple[int, str]:
-    _private_file(source, label="media source", media=source_media)
+    _assert_no_posix_acl_fd(source_fd, "media source")
     _assert_no_symlink_components(destination.parent)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _assert_no_symlink_components(destination.parent, allow_missing_leaf=False)
     os.chmod(destination.parent, 0o700)
+    descriptor: int | None = None
     try:
-        with source.open("rb") as source_stream, destination.open("xb") as destination_stream:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        size = 0
+        with os.fdopen(os.dup(source_fd), "rb") as source_stream, os.fdopen(descriptor, "wb") as destination_stream:
+            descriptor = None
             while chunk := source_stream.read(1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
                 destination_stream.write(chunk)
             destination_stream.flush()
             os.fsync(destination_stream.fileno())
-        os.chmod(destination, 0o600)
+        after = os.fstat(source_fd)
+        if (
+            (after.st_dev, after.st_ino) != (source_info.st_dev, source_info.st_ino)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_size != source_info.st_size
+        ):
+            raise OpsError("media source changed while it was copied")
+        if size <= 0:
+            raise OpsError("media backup rejects empty sources")
+        return size, digest.hexdigest()
     except FileExistsError as exc:
         raise OpsError("backup destination file collision") from exc
+    except OpsError:
+        raise
     except OSError as exc:
         raise OpsError("could not copy media into backup staging") from exc
-    return _sha256_file(destination)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _copy_media_tree(
+    source_fd: int,
+    destination: Path,
+    relative: Path,
+    entries: list[dict[str, object]],
+) -> None:
+    _media_directory_info(os.fstat(source_fd), "media source directory")
+    _assert_no_posix_acl_fd(source_fd, "media source directory")
+    try:
+        with os.scandir(source_fd) as source_entries:
+            names = [entry.name for entry in source_entries]
+    except OSError as exc:
+        raise OpsError("could not list media source") from exc
+    for name in names:
+        before = _entry_lstat(source_fd, name)
+        if _is_recovery_marker(name):
+            raise OpsError(
+                "recovery required: MEDIA_ROOT contains an active recovery marker; "
+                "reconcile it as before-after before retrying the backup"
+            )
+        child_relative = relative / name
+        if stat.S_ISDIR(before.st_mode):
+            child_fd = _open_media_entry(source_fd, name, directory=True, before=before)
+            child_destination = destination / name
+            try:
+                _media_directory_info(os.fstat(child_fd), "media source directory")
+                _ensure_private_output_directory(child_destination)
+                _copy_media_tree(child_fd, child_destination, child_relative, entries)
+            finally:
+                os.close(child_fd)
+            continue
+        child_fd = _open_media_entry(source_fd, name, directory=False, before=before)
+        try:
+            source_info = os.fstat(child_fd)
+            _media_file_info(source_info, "media source")
+            size, digest = _copy_regular_descriptor(
+                child_fd,
+                destination / name,
+                source_info,
+            )
+        finally:
+            os.close(child_fd)
+        entries.append(
+            {
+                "path": _safe_relative_path(Path("media") / child_relative),
+                "bytes": size,
+                "sha256": digest,
+            }
+        )
 
 
 def _copy_media(source_root: Path, staging_media: Path) -> list[dict[str, object]]:
     _private_directory(source_root, create=False, media=True)
     _ensure_private_output_directory(staging_media)
+    source_fd = _open_directory_path(source_root)
     entries: list[dict[str, object]] = []
-    for directory_name in MEDIA_DIRS:
-        source_directory = source_root / directory_name
-        destination_directory = staging_media / directory_name
-        _private_directory(source_directory, create=False, media=True)
-        _ensure_private_output_directory(destination_directory)
-        for current, directories, files in os.walk(source_directory, topdown=True, followlinks=False):
-            current_path = Path(current)
-            _private_directory(current_path, create=False, media=True)
-            for name in directories:
-                path = current_path / name
-                if os.path.islink(path):
-                    raise OpsError("symlinks are not allowed in media backups")
-                _private_directory(path, create=False, media=True)
-            for name in files:
-                source_path = current_path / name
-                if os.path.islink(source_path):
-                    raise OpsError("symlinks are not allowed in media backups")
-                if not source_path.is_file():
-                    raise OpsError("media backup accepts regular files only")
-                relative = source_path.relative_to(source_root)
-                relative_string = _safe_relative_path(Path("media") / relative)
-                destination = staging_media / relative
-                size, digest = _copy_regular_file(source_path, destination, source_media=True)
-                entries.append({"path": relative_string, "bytes": size, "sha256": digest})
+    try:
+        _media_directory_info(os.fstat(source_fd), "MEDIA_ROOT")
+        _assert_no_posix_acl_fd(source_fd, "MEDIA_ROOT")
+        try:
+            with os.scandir(source_fd) as source_entries:
+                root_names = [entry.name for entry in source_entries]
+        except OSError as exc:
+            raise OpsError("could not list MEDIA_ROOT") from exc
+        if not set(MEDIA_DIRS).issubset(root_names):
+            raise OpsError("MEDIA_ROOT is missing a managed directory")
+        for name in root_names:
+            before = _entry_lstat(source_fd, name)
+            if name in MEDIA_DIRS:
+                if not stat.S_ISDIR(before.st_mode):
+                    raise OpsError("managed media directory changed type")
+                child_fd = _open_media_entry(source_fd, name, directory=True, before=before)
+                try:
+                    _media_directory_info(os.fstat(child_fd), name)
+                    destination = staging_media / name
+                    _ensure_private_output_directory(destination)
+                    _copy_media_tree(child_fd, destination, Path(name), entries)
+                finally:
+                    os.close(child_fd)
+                continue
+            if name == ".reconcile.lock":
+                if not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o600:
+                    raise OpsError("reconciliation lock has unsafe permissions or type")
+                continue
+            if name == ".backup.lock":
+                mode = stat.S_IMODE(before.st_mode)
+                if not stat.S_ISREG(before.st_mode) or mode != 0o660:
+                    raise OpsError("MEDIA_ROOT coordination lock has unsafe permissions or type")
+                continue
+            if _is_recovery_marker(name):
+                raise OpsError("recovery required: MEDIA_ROOT changed during backup")
+            raise OpsError("MEDIA_ROOT contains unmanaged content")
+    finally:
+        os.close(source_fd)
     return sorted(entries, key=lambda item: str(item["path"]))
 
 
@@ -606,39 +785,67 @@ def _reject_recovery_marker(path: Path) -> None:
     )
 
 
+def _snapshot_media_directory(fd: int, *, root: bool) -> None:
+    """Validate the stopped media tree through directory descriptors only."""
+    _media_directory_info(os.fstat(fd), "MEDIA_ROOT" if root else "media directory")
+    _assert_no_posix_acl_fd(fd, "MEDIA_ROOT" if root else "media directory")
+    try:
+        with os.scandir(fd) as source_entries:
+            names = [entry.name for entry in source_entries]
+    except OSError as exc:
+        raise OpsError("could not list MEDIA_ROOT") from exc
+    if root and not set(MEDIA_DIRS).issubset(names):
+        raise OpsError("MEDIA_ROOT is missing a managed directory")
+    for name in names:
+        before = _entry_lstat(fd, name)
+        is_directory = stat.S_ISDIR(before.st_mode)
+        if root and is_directory and name not in MEDIA_DIRS:
+            raise OpsError("MEDIA_ROOT contains unmanaged content")
+        if root and not is_directory:
+            if name == ".reconcile.lock":
+                _private_mode = stat.S_IMODE(before.st_mode)
+                if not stat.S_ISREG(before.st_mode) or _private_mode != 0o600:
+                    raise OpsError("reconciliation lock has unsafe permissions or type")
+                continue
+            if name == ".backup.lock":
+                mode = stat.S_IMODE(before.st_mode)
+                if not stat.S_ISREG(before.st_mode) or mode != 0o660:
+                    raise OpsError("MEDIA_ROOT coordination lock has unsafe permissions or type")
+                continue
+            if _is_recovery_marker(name):
+                raise OpsError(
+                    "recovery required: MEDIA_ROOT contains an active recovery marker; "
+                    "reconcile it as before-after before retrying the backup"
+                )
+            raise OpsError("MEDIA_ROOT contains unmanaged content")
+        if not is_directory:
+            if _is_recovery_marker(name):
+                raise OpsError(
+                    "recovery required: MEDIA_ROOT contains an active recovery marker; "
+                    "reconcile it as before-after before retrying the backup"
+                )
+            _media_file_info(before, "media source")
+            continue
+        child_fd = _open_media_entry(fd, name, directory=True, before=before)
+        try:
+            _snapshot_media_directory(child_fd, root=False)
+        finally:
+            os.close(child_fd)
+
+
 def _assert_media_snapshot_ready(source_root: Path) -> None:
     """Refuse a snapshot that would omit an in-flight media operation.
 
     Recovery markers are application-private and intentionally not group
-    readable.  The backup identity cannot safely reconcile them, so the
+    readable. The backup identity cannot safely reconcile them, so the
     stopped-app precondition fails closed instead of copying a mixed pair.
-    The root reconciliation lock is a quiescent coordination file and is
-    deliberately excluded from the published media set.
     """
-    for current, directories, files in os.walk(source_root, topdown=True, followlinks=False):
-        current_path = Path(current)
-        _private_directory(current_path, create=False, media=True)
-        for name in directories:
-            path = current_path / name
-            if path.is_symlink():
-                raise OpsError("MEDIA_ROOT contains a symlink")
-            if _is_recovery_marker(name):
-                _reject_recovery_marker(path)
-            if current_path == source_root and name not in MEDIA_DIRS:
-                raise OpsError("MEDIA_ROOT contains unmanaged content")
-            _private_directory(path, create=False, media=True)
-        for name in files:
-            path = current_path / name
-            if path.is_symlink() or not path.is_file():
-                raise OpsError("MEDIA_ROOT contains an unsupported file type")
-            if name == ".reconcile.lock" and current_path == source_root:
-                _private_file(path, label="reconciliation lock")
-                continue
-            if _is_recovery_marker(name):
-                _reject_recovery_marker(path)
-            if current_path == source_root:
-                raise OpsError("MEDIA_ROOT contains unmanaged content")
-            _private_file(path, label="media source", media=True)
+    _private_directory(source_root, create=False, media=True)
+    source_fd = _open_directory_path(source_root)
+    try:
+        _snapshot_media_directory(source_fd, root=True)
+    finally:
+        os.close(source_fd)
 
 
 def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -677,20 +884,42 @@ def _validate_generation_name(name: str) -> None:
 
 
 @contextmanager
-def _backup_operation_lock(root: Path) -> Iterator[None]:
+def _backup_operation_lock(
+    root: Path,
+    *,
+    lock_path: Path | None = None,
+) -> Iterator[None]:
     """Serialize backup publication and explicitly requested stale cleanup."""
-    lock_path = root / _BACKUP_LOCK_NAME
+    lock_path = lock_path or root / _BACKUP_LOCK_NAME
     descriptor: int | None = None
+    inherited_fd = os.environ.get("BACKUP_LOCK_FD") if lock_path.name == ".backup.lock" else None
     try:
+        if inherited_fd is not None:
+            try:
+                descriptor = int(inherited_fd)
+                info = os.fstat(descriptor)
+                expected = os.lstat(lock_path)
+                if (
+                    not stat.S_ISREG(expected.st_mode)
+                    or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)
+                ):
+                    raise ValueError
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise OpsError("backup operation lock is already held") from exc
+            except (OSError, ValueError) as exc:
+                raise OpsError("inherited backup lock is unsafe") from exc
+            yield
+            return
         descriptor = os.open(
             lock_path,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            0o600,
+            0o660 if lock_path.name == ".backup.lock" else 0o600,
         )
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise OpsError("backup operation lock is unsafe")
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, 0o660 if lock_path.name == ".backup.lock" else 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     except OpsError:
@@ -698,7 +927,7 @@ def _backup_operation_lock(root: Path) -> Iterator[None]:
     except OSError as exc:
         raise OpsError("could not acquire backup operation lock") from exc
     finally:
-        if descriptor is not None:
+        if descriptor is not None and inherited_fd is None:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
@@ -833,22 +1062,25 @@ def create_backup(
     if _path_overlap(source, destination_root):
         raise OpsError("backup root must not contain or be contained by MEDIA_ROOT")
     _validate_backup_storage(source, destination_root, storage_policy=_storage_policy)
-    _assert_media_snapshot_ready(source)
-    postgres_metadata = (
-        postgres_preflight(
-            database_url,
-            pg_dump=pg_dump,
-            pg_restore=pg_restore,
-            psql=psql,
-        )
-        if _storage_policy is None or (pg_dump, pg_restore, psql) == ("pg_dump", "pg_restore", "psql")
-        else {"test_only": True}
+    operation_lock = _backup_operation_lock(
+        destination_root,
+        lock_path=source / ".backup.lock",
     )
-    operation_lock = _backup_operation_lock(destination_root)
     operation_lock.__enter__()
     staging: Path | None = None
     old_umask = os.umask(0o077)
     try:
+        _assert_media_snapshot_ready(source)
+        postgres_metadata = (
+            postgres_preflight(
+                database_url,
+                pg_dump=pg_dump,
+                pg_restore=pg_restore,
+                psql=psql,
+            )
+            if _storage_policy is None or (pg_dump, pg_restore, psql) == ("pg_dump", "pg_restore", "psql")
+            else {"test_only": True}
+        )
         _cleanup_staging_locked(destination_root, age_seconds=24 * 60 * 60)
         generation = _generation_name()
         _validate_generation_name(generation)
@@ -901,6 +1133,12 @@ def create_backup(
         _write_json(staging / MANIFEST_NAME, manifest)
         _private_directory(staging, create=False)
         _private_file(staging / MANIFEST_NAME, label="backup manifest")
+        if not _generation_is_verified(
+            staging,
+            expected_name=generation,
+            allow_staging_owner=True,
+        ):
+            raise OpsError("backup generation content verification failed")
         try:
             (staging / _STAGING_OWNER_NAME).unlink()
         except OSError as exc:
@@ -932,12 +1170,21 @@ def create_backup(
             operation_lock.__exit__(None, None, None)
 
 
-def _generation_is_verified(generation: Path) -> bool:
+def _generation_is_verified(
+    generation: Path,
+    *,
+    expected_name: str | None = None,
+    allow_staging_owner: bool = False,
+) -> bool:
     """Return true only for the same restorable-v2 verifier used by restore."""
     try:
         from ops.restore_check import verify_generation
 
-        verify_generation(generation)
+        verify_generation(
+            generation,
+            expected_name=expected_name,
+            allow_staging_owner=allow_staging_owner,
+        )
         return True
     except (ImportError, OSError, OpsError, UnicodeError, ValueError, TypeError):
         return False

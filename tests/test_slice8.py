@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import grp
@@ -10,13 +11,14 @@ import stat
 import subprocess
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 import pytest
 
-from ops.backup import OpsError, create_backup, postgres_preflight, prune_generations
+from ops.backup import OpsError, create_backup, generation_names, postgres_preflight, prune_generations
 from ops.restore_check import (
     _drop_owned_database,
     _owner_marker_path,
@@ -62,8 +64,11 @@ def test_production_proxy_configuration_trusts_only_configured_hop(tmp_path: Pat
 
 def private_media_root(path: Path) -> Path:
     path.mkdir(mode=0o2750)
+    os.chmod(path, 0o2750)
     for name in ("originals", "previews", "derivatives", "quarantine"):
-        (path / name).mkdir(mode=0o2750)
+        child = path / name
+        child.mkdir(mode=0o2750)
+        os.chmod(child, 0o2750)
     return path
 
 
@@ -93,6 +98,99 @@ def fake_pg_restore(path: Path) -> Path:
     )
     script.chmod(0o700)
     return script
+
+
+def test_deployment_secret_commands_pass_only_protected_file_paths() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bootstrap = (root / "deploy/bootstrap.sh").read_text(encoding="ascii")
+    runbook = (root / "docs/deployment.md").read_text(encoding="ascii")
+
+    for text in (bootstrap, runbook):
+        assert 'DATABASE_URL="$DATABASE_URL"' not in text
+        assert 'SECRET_KEY="$SECRET_KEY"' not in text
+        assert "RESTORE_SMOKE_PASSWORD" not in text
+    assert 'source "$1"' in bootstrap
+    assert 'source "$1"' in runbook
+    assert "--smoke-password-file" in runbook
+    assert "--smoke-password '" not in runbook
+
+
+def test_web_socket_group_does_not_expose_app_environment() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bootstrap = (root / "deploy/bootstrap.sh").read_text(encoding="ascii")
+    service = (root / "deploy/systemd/before-after.service").read_text(encoding="ascii")
+    environment = (root / "deploy/before-after.env.example").read_text(encoding="ascii")
+
+    assert "ensure_group before-after-web" in bootstrap
+    assert "usermod --append --groups before-after-media,before-after-web before-after" in bootstrap
+    assert "usermod --remove --groups before-after,before-after-media www-data" in bootstrap
+    assert "usermod --append --groups before-after-web www-data" in bootstrap
+    assert "Group=before-after-web" in service
+    assert "SupplementaryGroups=before-after before-after-media" in service
+    assert "root:before-after" in environment
+    assert "before-after-web" in (root / "docs/deployment.md").read_text(encoding="ascii")
+
+
+def test_media_permission_verify_checks_root_identity_and_mode(tmp_path: Path) -> None:
+    import deploy.media_permissions as permissions
+
+    media = private_media_root(tmp_path / "media")
+    owner = pwd.getpwuid(os.geteuid()).pw_name
+    group = grp.getgrgid(os.getegid()).gr_name
+    os.chmod(media, 0o750)
+    with pytest.raises(permissions.PermissionError, match="MEDIA_ROOT.*mode"):
+        permissions.run(str(media), owner, group, mutate=False, require_backup_lock=False)
+
+
+def test_media_permission_patterns_keep_crash_left_markers_private(tmp_path: Path) -> None:
+    from app.storage import ManagedStorage, apply_media_permissions
+
+    storage = ManagedStorage(tmp_path / "media")
+    for directory, name in (
+        ("quarantine", ".pending-" + "a" * 32 + ".tmp"),
+        ("quarantine", ".capture-delete-" + "b" * 32 + ".tmp"),
+        ("originals", ".upload-crash.tmp"),
+        ("quarantine", ".restore-crash"),
+    ):
+        (storage.root / directory / name).write_bytes(b"marker")
+    apply_media_permissions(storage.root)
+    for entry in storage.root.rglob(".*"):
+        if entry.is_file() and entry.name != ".":
+            assert stat.S_IMODE(entry.stat().st_mode) == 0o600
+
+
+def test_backup_role_sql_is_dedicated_and_read_only() -> None:
+    root = Path(__file__).resolve().parents[1]
+    environment = (root / "deploy/before-after-backup.env.example").read_text(encoding="ascii")
+    sql = (root / "deploy/postgres-backup-role.sql").read_text(encoding="ascii")
+    assert "before_after_backup:" in environment
+    assert "GRANT pg_read_all_data TO before_after_backup" in sql
+    assert "GRANT CONNECT" in sql and "GRANT SELECT ON ALL SEQUENCES" in sql
+    assert "GRANT INSERT" not in sql and "GRANT UPDATE" not in sql and "GRANT DELETE" not in sql
+    assert "NOCREATEDB NOCREATEROLE" in sql
+
+
+def test_inherited_backup_lock_fd_is_upgraded_and_contention_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.backup as backup_module
+
+    lock = tmp_path / ".backup.lock"
+    lock.write_bytes(b"")
+    descriptor = os.open(lock, os.O_RDWR)
+    competing = os.open(lock, os.O_RDWR)
+    try:
+        monkeypatch.setenv("BACKUP_LOCK_FD", str(descriptor))
+        with backup_module._backup_operation_lock(tmp_path, lock_path=lock):
+            pass
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        fcntl.flock(competing, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(OpsError, match="already held"):
+            with backup_module._backup_operation_lock(tmp_path, lock_path=lock):
+                pass
+    finally:
+        os.close(competing)
+        os.close(descriptor)
 
 
 def test_managed_storage_uses_media_group_modes(tmp_path: Path) -> None:
@@ -131,6 +229,98 @@ def test_permission_repair_keeps_markers_private_and_reconcile_works(tmp_path: P
     assert stat.S_IMODE(restore_marker.stat().st_mode) == 0o600
     assert stat.S_IMODE(clinical.stat().st_mode) == 0o640
     storage.reconcile(set(), grace_seconds=3600, now=clinical.stat().st_mtime + 3600)
+
+
+def test_permission_helper_rejects_symlink_swap_without_touching_victim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deploy.media_permissions as permissions
+
+    media = private_media_root(tmp_path / "media")
+    race = media / "originals" / "race.bin"
+    race.write_bytes(b"safe")
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"do not touch")
+    real_open = permissions.os.open
+
+    def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == "race.bin" and dir_fd is not None:
+            race.unlink()
+            race.symlink_to(victim)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(permissions.os, "open", swap_before_open)
+    with pytest.raises(permissions.PermissionError, match="safely open|symlink"):
+        permissions.run(
+            str(media),
+            pwd.getpwuid(os.geteuid()).pw_name,
+            grp.getgrgid(os.getegid()).gr_name,
+            mutate=True,
+            require_backup_lock=False,
+        )
+    assert victim.read_bytes() == b"do not touch"
+
+
+@pytest.mark.parametrize("entry_kind", ["file", "directory", "symlink", "special"])
+def test_permission_helper_rejects_unmanaged_root_entries(
+    tmp_path: Path, entry_kind: str
+) -> None:
+    import deploy.media_permissions as permissions
+
+    media = private_media_root(tmp_path / "media")
+    entry = media / "unmanaged"
+    if entry_kind == "file":
+        entry.write_bytes(b"unmanaged")
+    elif entry_kind == "directory":
+        entry.mkdir(mode=0o750)
+    elif entry_kind == "symlink":
+        entry.symlink_to(tmp_path / "victim")
+    else:
+        os.mkfifo(entry)
+    owner = pwd.getpwuid(os.geteuid()).pw_name
+    group = grp.getgrgid(os.getegid()).gr_name
+    with pytest.raises(permissions.PermissionError, match="unmanaged|symlink|special"):
+        permissions.run(str(media), owner, group, mutate=False, require_backup_lock=False)
+
+
+def test_permission_helper_rejects_directory_rename_swap_without_touching_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deploy.media_permissions as permissions
+
+    media = private_media_root(tmp_path / "media")
+    race = media / "originals" / "race"
+    race.mkdir(mode=0o750)
+    (race / "safe.bin").write_bytes(b"safe")
+    outside = tmp_path / "outside-tree"
+    outside.mkdir(mode=0o700)
+    (outside / "nested").mkdir(mode=0o700)
+    canary = outside / "nested" / "canary.bin"
+    canary.write_bytes(b"root-owned canary")
+    os.chmod(canary, 0o600)
+    before = (canary.read_bytes(), canary.stat().st_ino, stat.S_IMODE(canary.stat().st_mode))
+    original_race = media / "originals" / "race-original"
+    real_open = permissions.os.open
+    swapped = False
+
+    def rename_swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "race" and dir_fd is not None and not swapped:
+            swapped = True
+            race.rename(original_race)
+            outside.rename(race)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(permissions.os, "open", rename_swap_before_open)
+    owner = pwd.getpwuid(os.geteuid()).pw_name
+    group = grp.getgrgid(os.getegid()).gr_name
+    with pytest.raises(permissions.PermissionError, match="changed identity"):
+        permissions.run(
+            str(media), owner, group, mutate=True, require_backup_lock=False
+        )
+
+    race.rename(outside)
+    assert (canary.read_bytes(), canary.stat().st_ino, stat.S_IMODE(canary.stat().st_mode)) == before
 
 
 def test_restore_owner_markers_hash_nested_target_identity(tmp_path: Path) -> None:
@@ -265,6 +455,144 @@ def test_backup_staging_cleanup_failure_is_poisoned(tmp_path: Path, monkeypatch:
     assert list(backup_root.glob(".staging-*"))
 
 
+def test_crash_after_database_comment_recovers_marker_without_recreating_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "restored-media"
+    target_url = "postgresql://restore@127.0.0.1/before_after_restore_" + "a" * 32
+    marker = "before-after-restore-" + "b" * 32
+    run_id = marker.rsplit("-", 1)[1]
+    registry = parent / f".restore-run-{run_id}.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "format": "before-after.restore-run.v1",
+                "run_id": run_id,
+                "database_name": restore_module._database_name(target_url),
+                "server_identity": ["cluster", "server"],
+                "ownership_marker": marker,
+                "target_media_identity": str(target.resolve()),
+                "state": "created",
+                "created_at": 1,
+            }
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    registry.chmod(0o600)
+    monkeypatch.setattr(restore_module, "_connection_server_identity", lambda _url: ("cluster", "server"))
+    monkeypatch.setattr(restore_module, "_database_state", lambda _url: (True, marker, True))
+
+    recovered = restore_module.recover_provisioning(
+        target_database_url=target_url,
+        restore_parent=parent,
+        target_media_root=target,
+    )
+
+    assert recovered == marker
+    assert not registry.exists()
+    assert restore_module._owner_marker_path(parent, target).read_text(encoding="ascii").strip() == marker
+
+
+def test_recovery_rejects_owned_but_non_pristine_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "restored-media"
+    target_url = "postgresql://restore@127.0.0.1/before_after_restore_" + "a" * 32
+    marker = "before-after-restore-" + "b" * 32
+    run_id = marker.rsplit("-", 1)[1]
+    registry = parent / f".restore-run-{run_id}.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "format": "before-after.restore-run.v1",
+                "run_id": run_id,
+                "database_name": restore_module._database_name(target_url),
+                "server_identity": ["cluster", "server"],
+                "ownership_marker": marker,
+                "target_media_identity": str(target.resolve()),
+                "state": "created",
+                "created_at": 1,
+            }
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    registry.chmod(0o600)
+    monkeypatch.setattr(restore_module, "_connection_server_identity", lambda _url: ("cluster", "server"))
+    monkeypatch.setattr(restore_module, "_database_state", lambda _url: (True, marker, False))
+
+    with pytest.raises(OpsError, match="not pristine|manual empty-DB cleanup"):
+        restore_module.recover_provisioning(
+            target_database_url=target_url,
+            restore_parent=parent,
+            target_media_root=target,
+        )
+    assert registry.exists()
+
+
+def test_provision_recovers_after_empty_media_directory_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "restored-media"
+    target.mkdir(mode=0o700)
+    marker = "before-after-restore-" + "b" * 32
+    restore_module._write_owner_marker(parent, target, marker)
+    target_url = "postgresql://restore@127.0.0.1/before_after_restore_" + "a" * 32
+    monkeypatch.setattr(restore_module, "_database_state", lambda _url: (True, marker, True))
+
+    def fail_create(*_args, **_kwargs):
+        raise AssertionError("recovery must not create the database again")
+
+    monkeypatch.setattr(restore_module, "create_isolated_database", fail_create)
+    recovered = restore_module.provision_isolated_target(
+        target_database_url=target_url,
+        target_media_root=target,
+        restore_parent=parent,
+        production_database_urls=("postgresql://production@127.0.0.1/clinic",),
+    )
+
+    assert recovered == marker
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+
+
+def test_recovery_rejects_nonempty_owned_media_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "restored-media"
+    target.mkdir(mode=0o700)
+    (target / "stray.bin").write_bytes(b"must not adopt")
+    target_url = "postgresql://restore@127.0.0.1/before_after_restore_" + "a" * 32
+    marker = "before-after-restore-" + "b" * 32
+    restore_module._write_owner_marker(parent, target, marker)
+    monkeypatch.setattr(restore_module, "_database_state", lambda _url: (True, marker, True))
+
+    with pytest.raises(OpsError, match="not empty|manual cleanup"):
+        restore_module.recover_provisioning(
+            target_database_url=target_url,
+            restore_parent=parent,
+            target_media_root=target,
+        )
+    assert (target / "stray.bin").read_bytes() == b"must not adopt"
+
+
 def test_provision_validates_media_before_database_creation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import ops.restore_check as restore_module
 
@@ -344,9 +672,8 @@ def test_cleanup_requires_exact_database_ownership_comment(
     assert not any("DROP DATABASE" in statement or "COMMENT ON DATABASE" in statement for statement in statements)
 @pytest.mark.host_probe
 def test_backup_user_can_read_media_but_cannot_modify_or_delete(tmp_path: Path) -> None:
-    if os.environ.get("FIXED_GATE_DAC_PROOF") == "1":
-        proof = os.environ.get("DAC_PROOF_MARKER")
-        assert proof and Path(proof).read_text(encoding="ascii") == "before-after.dac-proof.v1\n"
+    if proof := os.environ.get("DAC_PROOF_MARKER"):
+        assert Path(proof).read_text(encoding="ascii") == "before-after.dac-proof.v1\n"
         return
     if os.geteuid() != 0:
         pytest.skip("effective backup-user check requires root")
@@ -719,6 +1046,11 @@ def _synthetic_backup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 
 
 def test_backup_script_rejects_unknown_systemctl_and_stop_is_a_privileged_precondition(tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    media.mkdir(mode=0o750)
+    lock = media / ".backup.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o660)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "systemctl").write_text(
@@ -728,7 +1060,7 @@ def test_backup_script_rejects_unknown_systemctl_and_stop_is_a_privileged_precon
     result = subprocess.run(
         ["bash", "ops/backup.sh"],
         cwd=Path(__file__).resolve().parents[1],
-        env={**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"},
+        env={**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin", "MEDIA_ROOT": str(media)},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -799,6 +1131,29 @@ def test_stale_staging_is_ignored_by_selection_and_explicit_cleanup(tmp_path: Pa
     assert stale.exists()
     assert cleanup_stale_staging(backup, age_seconds=0, now=2) == [stale.name]
     assert not stale.exists()
+
+
+def test_zero_byte_media_is_rejected_without_publish_or_retention_change(tmp_path: Path) -> None:
+    media, backup, old_generation, restore = _synthetic_backup(tmp_path)
+    empty = media / "originals" / "empty.bin"
+    empty.write_bytes(b"")
+    os.chmod(empty, 0o640)
+    before = generation_names(backup)
+
+    with pytest.raises(OpsError, match="empty"):
+        create_backup(
+            media_root=media,
+            backup_root=backup,
+            database_url="postgresql://user:secret@127.0.0.1/clinic",
+            pg_dump=str(fake_pg_dump(tmp_path)),
+            pg_restore=str(restore),
+            retention=1,
+            _storage_policy=lambda _media, _backup: None,
+        )
+
+    assert generation_names(backup) == before
+    assert old_generation.exists()
+    assert not list(backup.glob(".staging-*"))
 
 
 def test_corrupt_pgdump_is_rejected_before_publish(tmp_path: Path) -> None:
@@ -1057,6 +1412,75 @@ def test_smoke_failure_cleans_database_state_and_assets(tmp_path: Path, monkeypa
     assert not source_staging.exists()
 
 
+def test_smoke_account_cleanup_disables_and_invalidates_audited_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+    import types
+    import ops.restore_check as restore_module
+    db_module = importlib.import_module("app.db")
+    import sqlalchemy
+
+    class UserQuery:
+        def where(self, *_args):
+            return self
+
+    class Session:
+        def scalar(self, _query):
+            return user
+
+        def commit(self):
+            committed.append(True)
+
+        def rollback(self):
+            rolled_back.append(True)
+
+    class Application:
+        def app_context(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class UserStub:
+        username = "username"
+
+    old_hash = "old-hash"
+    committed: list[bool] = []
+    rolled_back: list[bool] = []
+    password_hashes: list[str] = []
+    user = types.SimpleNamespace(
+        username="smoke-editor",
+        active=True,
+        session_version=4,
+        display_name="Temporary restore smoke account",
+    )
+
+    def set_password(value: str) -> None:
+        password_hashes.append(value)
+        user.password_hash = "randomized-hash"
+
+    user.password_hash = old_hash
+    user.set_password = set_password
+    monkeypatch.setattr(sqlalchemy, "select", lambda *_args: UserQuery())
+    monkeypatch.setattr(db_module, "db", types.SimpleNamespace(session=Session()))
+    monkeypatch.setattr(restore_module.secrets, "token_urlsafe", lambda _size: "random-secret")
+    monkeypatch.setattr(sys.modules["app.models"], "User", UserStub)
+
+    restore_module.remove_smoke_account(Application(), "smoke-editor")
+
+    assert user.active is False
+    assert user.session_version == 5
+    assert user.password_hash != old_hash
+    assert password_hashes == ["random-secret"]
+    assert user.display_name == "Disabled restore smoke account"
+    assert committed == [True]
+    assert rolled_back == []
+
+
 def test_restore_cleanup_deletion_failure_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import ops.restore_check as restore_module
 
@@ -1195,8 +1619,9 @@ def test_postgres_identity_fails_closed_without_cluster_identifier(monkeypatch: 
 def test_runtime_evidence_requires_trusted_detached_signature(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import ops.evidence as evidence
 
-    repo = tmp_path
-    artifact_dir = repo / "artifacts"
+    repo = tmp_path / "repo"
+    repo.mkdir(mode=0o700)
+    artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir(mode=0o700)
     junit = artifact_dir / "slice8-fixed-gate.junit.xml"
     junit.write_text(
@@ -1213,6 +1638,7 @@ def test_runtime_evidence_requires_trusted_detached_signature(tmp_path: Path, mo
         "format": "before-after.fixed-gate.v1",
         "completed_fixed_gate": True,
         "commit": "a" * 40,
+        "tree": "b" * 40,
         "output_artifact": junit.name,
         "output_sha256": hashlib.sha256(junit.read_bytes()).hexdigest(),
         "dac_proof_artifact": dac.name,
@@ -1248,12 +1674,21 @@ def test_runtime_evidence_requires_trusted_detached_signature(tmp_path: Path, mo
     )
     monkeypatch.setenv("FIXED_GATE_ARTIFACT", str(artifact))
     monkeypatch.setenv("BUILD_SHA", "a" * 40)
+    monkeypatch.setenv("BUILD_TREE_SHA", "b" * 40)
     monkeypatch.setenv("EVIDENCE_PUBLIC_KEY", str(public))
     monkeypatch.setenv("EVIDENCE_SIGNATURE", str(signature))
     monkeypatch.setattr(evidence, "CHECK_COMMANDS", {"check": ["true"]})
+    monkeypatch.setattr(evidence, "_repository_worktree_clean", lambda _repo: True)
     output = tmp_path / "local-evidence.json"
     assert evidence.generate(output, repo, certification=True) == 0
-    assert json.loads(output.read_text())["runtime_checks"] == "passed"
+    result = json.loads(output.read_text())
+    assert result["runtime_checks"] == "passed"
+    serialized = json.dumps(result)
+    assert str(tmp_path) not in serialized
+    assert str(public) not in serialized
+    assert all("command" not in check for check in result["checks"].values())
+    assert result["fixed_gate"]["artifact"] == artifact.name
+    assert result["fixed_gate"]["signature"] == signature.name
 
     metadata["slice8_tests_executed"] = 3
     artifact.write_text(json.dumps(metadata), encoding="ascii")
@@ -1289,6 +1724,29 @@ def test_runtime_evidence_requires_trusted_detached_signature(tmp_path: Path, mo
     assert evidence._fixed_gate_evidence(repo)[0]["status"] == "unverified"
 
 
+def test_fixed_gate_worktree_rejects_tracked_and_untracked_changes(
+    tmp_path: Path,
+) -> None:
+    import ops.evidence as evidence
+
+    repo = tmp_path / "repo"
+    repo.mkdir(mode=0o700)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    tracked = repo / "tracked"
+    tracked.write_text("clean\n", encoding="ascii")
+    subprocess.run(["git", "add", "tracked"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=repo, check=True)
+    assert evidence._repository_worktree_clean(repo)
+
+    tracked.write_text("dirty\n", encoding="ascii")
+    assert not evidence._repository_worktree_clean(repo)
+    subprocess.run(["git", "checkout", "--", "tracked"], cwd=repo, check=True)
+    (repo / "untracked").write_text("untracked\n", encoding="ascii")
+    assert not evidence._repository_worktree_clean(repo)
+
+
 def test_owner_marker_hashes_canonical_target_path(tmp_path: Path) -> None:
     from ops.restore_check import _owner_marker_path
 
@@ -1297,3 +1755,279 @@ def test_owner_marker_hashes_canonical_target_path(tmp_path: Path) -> None:
     target = parent / "nested" / "media"
     expected = parent / (".restore-owner-" + hashlib.sha256(str(target.resolve()).encode()).hexdigest())
     assert _owner_marker_path(parent, target) == expected
+
+
+@pytest.mark.parametrize("port", [0, 65536, -1])
+def test_postgres_route_rejects_invalid_authority_port(port: int) -> None:
+    from app.db import postgres_route
+
+    with pytest.raises(RuntimeError, match="invalid port"):
+        postgres_route(f"postgresql://user:password@127.0.0.1:{port}/clinic")
+
+
+def test_postgres_route_is_single_and_clears_inherited_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.db import postgres_route, sanitized_postgres_environment
+    import ops.backup as backup_module
+
+    url = "postgresql://user:secret@db.example/clinic"
+    monkeypatch.setenv("PGPORT", "6543")
+    monkeypatch.setenv("PGSERVICE", "wrong-service")
+    monkeypatch.setenv("PGSERVICEFILE", "/tmp/wrong-service.conf")
+    monkeypatch.setenv("PGTARGETSESSIONATTRS", "read-write")
+    route = postgres_route(url)
+    environment = sanitized_postgres_environment(url, base=dict(os.environ))
+    settings = backup_module._postgres_settings(url)
+    kwargs = route.psycopg_kwargs()
+
+    assert environment["PGHOST"] == kwargs["host"] == settings["PGHOST"] == "db.example"
+    assert environment["PGPORT"] == kwargs["port"] == settings["PGPORT"] == "5432"
+    assert environment["PGTARGETSESSIONATTRS"] == kwargs["target_session_attrs"] == "any"
+    assert "PGSERVICE" not in environment
+    assert "PGSERVICEFILE" not in environment
+    assert environment["DATABASE_URL"] == route.sqlalchemy_url
+
+    for ambiguous in (
+        "postgresql://user:secret@db-one,db-two/clinic",
+        "postgresql://user:secret@db.example/clinic?port=5432,5433",
+        "postgresql://user:secret@db.example/clinic?target_session_attrs=read-write",
+    ):
+        with pytest.raises(RuntimeError):
+            postgres_route(ambiguous)
+
+
+def test_postgres_socket_route_sets_port_without_inheriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.engine import make_url
+
+    from app import create_app
+    from app.db import postgres_route, sanitized_postgres_environment
+
+    monkeypatch.setenv("PGPORT", "6543")
+    route = postgres_route("postgresql:///clinic?host=%2Fvar%2Frun%2Fpostgresql")
+    parsed = make_url(route.sqlalchemy_url)
+    assert route.sqlalchemy_url.startswith("postgresql+psycopg:///clinic?")
+    assert parsed.host is None
+    assert parsed.database == "clinic"
+    assert parsed.query["host"] == "/var/run/postgresql"
+    application = create_app(
+        {
+            "TESTING": True,
+            "DATABASE_URL": "postgresql:///clinic?host=%2Fvar%2Frun%2Fpostgresql",
+            "MEDIA_ROOT": str(tmp_path / "media"),
+            "SECRET_KEY": "socket-route-test",
+        }
+    )
+    assert application.config["SQLALCHEMY_DATABASE_URI"] == route.sqlalchemy_url
+    environment = sanitized_postgres_environment(route.sqlalchemy_url)
+    assert environment["PGHOST"] == "/var/run/postgresql"
+    assert environment["PGPORT"] == "5432"
+    assert environment["PGTARGETSESSIONATTRS"] == "any"
+    assert "PGPORT=6543" not in "\\n".join(f"{k}={v}" for k, v in environment.items())
+
+
+@pytest.mark.parametrize(
+    ("catalog_result", "expected_pristine"),
+    [
+        ((True,) * 17, True),
+        ((True, True, True, False, *([True] * 13)), False),
+    ],
+)
+def test_recovery_pristine_catalog_check_requires_exact_pristine_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_result: tuple[bool, ...],
+    expected_pristine: bool,
+) -> None:
+    import types
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    statements: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            statements.append(statement)
+            self.statement = statement
+
+        def fetchone(self):
+            if "pg_database" in self.statement:
+                return (None,)
+            return catalog_result
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=lambda **_kwargs: Connection()))
+    exists, comment, pristine = restore_module._database_state(
+        "postgresql://restore@127.0.0.1/before_after_restore_" + "a" * 32
+    )
+    assert (exists, comment, pristine) == (True, None, expected_pristine)
+    catalog_sql = " ".join(statements)
+    assert all(name in catalog_sql for name in ("pg_namespace", "pg_class", "pg_proc", "pg_type", "pg_extension", "pg_operator"))
+    assert "pg_user_mapping" not in catalog_sql
+
+
+def test_evidence_output_replaces_destination_symlink_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.evidence as evidence
+
+    victim = tmp_path / "victim.json"
+    victim.write_text("victim", encoding="ascii")
+    output = tmp_path / "evidence.json"
+    output.symlink_to(victim)
+    monkeypatch.setattr(evidence, "CHECK_COMMANDS", {"check": ["true"]})
+
+    assert evidence.generate(output, tmp_path) == 0
+    assert not output.is_symlink()
+    assert victim.read_text(encoding="ascii") == "victim"
+    assert json.loads(output.read_text(encoding="ascii"))["clinical_data"] == "not_collected"
+
+
+def test_backup_media_copy_rejects_swap_to_symlink_without_touching_victim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ops.backup as backup_module
+
+    media = private_media_root(tmp_path / "media")
+    race = media / "originals" / "race.bin"
+    race.write_bytes(b"safe")
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"do not copy")
+    staging = tmp_path / "staging" / "media"
+    staging.parent.mkdir(mode=0o700)
+    real_open = backup_module.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "race.bin" and dir_fd is not None and not swapped:
+            swapped = True
+            race.unlink()
+            race.symlink_to(victim)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(backup_module, "_assert_media_snapshot_ready", lambda _root: None)
+    monkeypatch.setattr(backup_module.os, "open", swap_before_open)
+    with pytest.raises(OpsError, match="symlink|safely open|identity"):
+        backup_module._copy_media(media, staging)
+    assert victim.read_bytes() == b"do not copy"
+
+
+def test_app_and_backup_flocks_do_not_overlap_during_restart(tmp_path: Path) -> None:
+    lock = tmp_path / "backup.lock"
+    lock.write_bytes(b"")
+    events = tmp_path / "events"
+    app_code = (
+        "from pathlib import Path; import sys,time; "
+        "p=Path(sys.argv[1]); p.open('a').write('app-start\\n'); time.sleep(.45); "
+        "p.open('a').write('app-end\\n')"
+    )
+    backup_code = (
+        "from pathlib import Path; import sys,time; "
+        "p=Path(sys.argv[1]); p.open('a').write('backup-start\\n'); time.sleep(.45); "
+        "p.open('a').write('backup-end\\n')"
+    )
+    app = subprocess.Popen(["flock", "--shared", str(lock), sys.executable, "-c", app_code, str(events)])
+    deadline = time.time() + 3
+    while not events.exists() and time.time() < deadline:
+        time.sleep(0.01)
+    backup = subprocess.Popen(["flock", "--exclusive", str(lock), sys.executable, "-c", backup_code, str(events)])
+    time.sleep(0.1)
+    assert "backup-start" not in events.read_text(encoding="ascii")
+    assert app.wait(timeout=3) == 0
+    restart = subprocess.Popen(["flock", "--shared", str(lock), sys.executable, "-c", app_code, str(events)])
+    assert backup.wait(timeout=3) == 0
+    assert restart.wait(timeout=3) == 0
+    lines = events.read_text(encoding="ascii").splitlines()
+    assert lines.index("backup-end") < lines.index("app-start", 2)
+    service = (Path(__file__).resolve().parents[1] / "deploy/systemd/before-after.service").read_text()
+    backup_service = (Path(__file__).resolve().parents[1] / "deploy/systemd/before-after-backup.service").read_text()
+    assert "flock --shared" in service
+    assert "Conflicts=" not in backup_service
+
+
+def test_fixed_gate_hermetic_environment_and_required_cases(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(mode=0o700)
+    artifact_dir = tmp_path / "gate-artifacts"
+    artifact_dir.mkdir(mode=0o700)
+    commit = "a" * 40
+    tree = "b" * 40
+    (fake_bin / "git").write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2\" in\n"
+        "  'status --porcelain=v1') exit 0;;\n"
+        "  'rev-parse HEAD') printf '%s\\n' " + commit + ";;\n"
+        "  'rev-parse HEAD^{tree}') printf '%s\\n' " + tree + ";;\n"
+        "esac\n",
+        encoding="ascii",
+    )
+    (fake_bin / "docker").write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    for client in ("pg_dump", "pg_restore", "psql"):
+        (fake_bin / client).write_text("#!/bin/sh\nprintf '%s\\n' 'PostgreSQL 16.0'\n", encoding="ascii")
+    log = tmp_path / "pytest-env"
+    real_python = sys.executable
+    (fake_bin / "python").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = '-m' ] && [ \"$2\" = 'pytest' ]; then\n"
+        "  env | sort > " + str(log) + "\n"
+        "  out=; prev=; for arg in \"$@\"; do if [ \"$prev\" = '--junitxml' ]; then out=$arg; fi; prev=$arg; done\n"
+        "  printf '%s' '<testsuite tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"0\"><testcase classname=\"tests.test_slice8\" name=\"test_actual_postgresql_backup_restore_and_authenticated_smoke\"/><testcase classname=\"tests.test_slice8\" name=\"test_backup_user_can_read_media_but_cannot_modify_or_delete\"/></testsuite>' > \"$out\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exec " + real_python + " \"$@\"\n",
+        encoding="ascii",
+    )
+    for path in fake_bin.iterdir():
+        path.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "PYTHON_BIN": str(fake_bin / "python"),
+        "TEST_DATABASE_URL": "postgresql://user:password@127.0.0.1/clinic",
+        "BUILD_SHA": commit,
+        "FIXED_GATE_ARTIFACT_DIR": str(artifact_dir),
+        "PYTEST_ADDOPTS": "-k malicious",
+        "PYTEST_PLUGINS": "malicious_plugin",
+        "PYTHONPATH": str(tmp_path / "malicious"),
+        "EVIDENCE_PUBLIC_KEY": str(tmp_path / "malicious-key"),
+        "PGSERVICE": "wrong-service",
+    }
+    result = subprocess.run(
+        ["bash", "scripts/test-postgres.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = log.read_text(encoding="ascii").splitlines()
+    observed_keys = {line.split("=", 1)[0] for line in observed if "=" in line}
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in observed_keys
+    assert "PYTEST_ADDOPTS" not in observed_keys
+    assert "PYTEST_PLUGINS" not in observed_keys
+    assert "PYTHONPATH" not in observed_keys
+    assert "BUILD_SHA" not in observed_keys
+    assert "EVIDENCE_PUBLIC_KEY" not in observed_keys
+    assert "FIXED_GATE_ARTIFACT_DIR" not in observed_keys
+    metadata = json.loads((artifact_dir / "slice8-fixed-gate.json").read_text(encoding="ascii"))
+    assert metadata["commit"] == commit
+    assert metadata["tree"] == tree
+    assert metadata["mandatory_skips"] == 0

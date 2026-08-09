@@ -23,8 +23,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadOnlyPaths=/var/lib/before-after/media /opt/before-after
-ReadWritePaths=/mnt/clinic-backup/before-after
+# The lock itself must be writable by the backup group; managed media remains
+# read-only while the exclusive lock is held through dump and publication.
+ReadOnlyPaths=/var/lib/before-after/media/originals /var/lib/before-after/media/previews /var/lib/before-after/media/derivatives /var/lib/before-after/media/quarantine /opt/before-after
+ReadWritePaths=/var/lib/before-after/media/.backup.lock /mnt/clinic-backup/before-after
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

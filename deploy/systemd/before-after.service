@@ -6,15 +6,19 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=before-after
-Group=before-after
-SupplementaryGroups=before-after-media
+# The socket is owned by the web group; the supplementary secret group keeps
+# the root-owned environment readable without exposing it to nginx.
+Group=before-after-web
+SupplementaryGroups=before-after before-after-media
 WorkingDirectory=/opt/before-after
 EnvironmentFile=/etc/before-after/before-after.env
 Environment="PATH=/opt/before-after/.venv/bin:/usr/local/bin:/usr/bin"
 RuntimeDirectory=before-after
 RuntimeDirectoryMode=0750
 UMask=0007
-ExecStart=/usr/bin/env gunicorn --workers 2 --bind unix:/run/before-after/gunicorn.sock --timeout 120 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'app:create_app()'
+# Hold the shared side of the persistent backup lock for the entire Gunicorn
+# lifetime. A backup takes the exclusive side before checking app state.
+ExecStart=/usr/bin/flock --shared /var/lib/before-after/media/.backup.lock /usr/bin/env gunicorn --workers 2 --bind unix:/run/before-after/gunicorn.sock --timeout 120 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'app:create_app()'
 Restart=on-failure
 RestartSec=5s
 

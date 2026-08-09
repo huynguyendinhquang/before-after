@@ -22,6 +22,7 @@ from typing import Callable, Iterable, Iterator
 from urllib.parse import unquote, urlsplit, urlunsplit
 import uuid
 
+from app.db import postgres_route, scoped_postgres_environment
 from ops.backup import (
     DATABASE_DUMP_NAME,
     GENERATION_RE,
@@ -44,6 +45,17 @@ from ops.backup import (
 )
 
 
+def _psycopg_connect(value: str, **overrides):
+    """Connect with explicit canonical route settings, never ambient PG* state."""
+    try:
+        import psycopg
+        parameters = postgres_route(value).psycopg_kwargs()
+    except RuntimeError as exc:
+        raise OpsError(str(exc)) from exc
+    parameters.update(overrides)
+    return psycopg.connect(**parameters)
+
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
 _OWNER_MARKER_RE = re.compile(r"^before-after-restore-[0-9a-f]{32}$")
@@ -54,6 +66,8 @@ _RESTORE_STAGING_LOCK_NAME = ".restore-staging.lock"
 _RESTORE_REGISTRY_FORMAT = "before-after.restore-run.v1"
 _RESTORE_REGISTRY_RE = re.compile(r"^\.restore-run-([0-9a-f]{32})\.json$")
 _GENERATED_DATABASE_RE = re.compile(r"^before_after_restore_[0-9a-f]{32}$")
+_RESTORE_STAGING_OWNER_NAME = ".staging-owner.json"
+_SMOKE_ACCOUNT_DISPLAY_NAME = "Temporary restore smoke account"
 
 
 @dataclass(frozen=True)
@@ -386,17 +400,25 @@ def _walk_files(root: Path) -> set[str]:
     return result
 
 
-def verify_generation(path: str | os.PathLike[str]) -> VerifiedGeneration:
+def verify_generation(
+    path: str | os.PathLike[str],
+    *,
+    expected_name: str | None = None,
+    allow_staging_owner: bool = False,
+) -> VerifiedGeneration:
     """Verify manifest, checksums, modes, paths, and absence of partial files."""
     generation_path = _path(path, "backup generation")
     _assert_no_symlink_components(generation_path, allow_missing_leaf=False)
-    if GENERATION_RE.fullmatch(generation_path.name) is None:
+    published_name = generation_path.name if expected_name is None else expected_name
+    if GENERATION_RE.fullmatch(published_name) is None:
+        raise OpsError("backup generation name is invalid")
+    if published_name != generation_path.name and not allow_staging_owner:
         raise OpsError("backup generation name is invalid")
     _private_directory(generation_path, create=False)
     manifest = _load_json(generation_path / MANIFEST_NAME)
     if manifest.get("format_version") != MANIFEST_FORMAT_VERSION:
         raise OpsError("backup manifest format is unsupported")
-    if manifest.get("complete") is not True or manifest.get("generation") != generation_path.name:
+    if manifest.get("complete") is not True or manifest.get("generation") != published_name:
         raise OpsError("backup generation is incomplete")
     database = manifest.get("database")
     media = manifest.get("media")
@@ -462,13 +484,16 @@ def verify_generation(path: str | os.PathLike[str]) -> VerifiedGeneration:
         raise OpsError("backup generation has no PostgreSQL dump")
     actual_paths = _walk_files(generation_path)
     actual_paths.discard(MANIFEST_NAME)
+    if allow_staging_owner:
+        _private_file(generation_path / _RESTORE_STAGING_OWNER_NAME, label="backup staging owner marker")
+        actual_paths.discard(_RESTORE_STAGING_OWNER_NAME)
     if actual_paths != paths:
         raise OpsError("backup generation contains partial or unlisted files")
     for directory_name in MEDIA_DIRS:
         media_directory = generation_path / "media" / directory_name
         _private_directory(media_directory, create=False)
     return VerifiedGeneration(
-        name=generation_path.name,
+        name=published_name,
         path=generation_path,
         manifest=manifest,
         files=tuple(sorted(entries, key=lambda item: str(item["path"]))),
@@ -589,7 +614,7 @@ def _connection_database_identity(value: str) -> tuple[object, ...]:
     except ImportError as exc:
         raise OpsError("psycopg is required to establish production database identity") from exc
     try:
-        with psycopg.connect(_native_postgres_url(value), connect_timeout=5) as connection:
+        with scoped_postgres_environment(value), _psycopg_connect(value, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT inet_server_addr()::text, inet_server_port(), current_database(), "
@@ -632,7 +657,7 @@ def _connection_server_identity(value: str) -> tuple[object, ...]:
     except ImportError as exc:
         raise OpsError("psycopg is required to establish PostgreSQL server identity") from exc
     try:
-        with psycopg.connect(_maintenance_database_url(value), connect_timeout=5) as connection:
+        with scoped_postgres_environment(value), _psycopg_connect(_maintenance_database_url(value), connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT inet_server_addr()::text, inet_server_port()")
                 address, port = (cursor.fetchone() or (None, None))[:2]
@@ -688,7 +713,7 @@ def _database_state(target_database_url: str) -> tuple[bool, str | None, bool]:
         raise OpsError("psycopg is required for restore run recovery") from exc
     target_name = _database_name(target_database_url)
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
@@ -698,16 +723,58 @@ def _database_state(target_database_url: str) -> tuple[bool, str | None, bool]:
                 if row is None:
                     return False, None, True
                 comment = row[0]
-        with psycopg.connect(_native_postgres_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(target_database_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT count(*) FROM pg_class c "
+                    "SELECT "
+                    "NOT EXISTS (SELECT 1 FROM pg_namespace "
+                    "WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'public') "
+                    "AND nspname NOT LIKE 'pg_toast%' "
+                    "AND nspname NOT LIKE 'pg_temp_%' "
+                    "AND nspname NOT LIKE 'pg_toast_temp_%'), "
+                    "NOT EXISTS (SELECT 1 FROM pg_class c "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
                     "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
                     "AND n.nspname NOT LIKE 'pg_toast%' "
-                    "AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')"
+                    "AND n.nspname NOT LIKE 'pg_temp_%' "
+                    "AND n.nspname NOT LIKE 'pg_toast_temp_%'), "
+                    "NOT EXISTS (SELECT 1 FROM pg_proc p "
+                    "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
+                    "AND n.nspname NOT LIKE 'pg_toast%' "
+                    "AND n.nspname NOT LIKE 'pg_temp_%' "
+                    "AND n.nspname NOT LIKE 'pg_toast_temp_%'), "
+                    "NOT EXISTS (SELECT 1 FROM pg_type t "
+                    "JOIN pg_namespace n ON n.oid = t.typnamespace "
+                    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
+                    "AND n.nspname NOT LIKE 'pg_toast%' "
+                    "AND n.nspname NOT LIKE 'pg_temp_%' "
+                    "AND n.nspname NOT LIKE 'pg_toast_temp_%'), "
+                    "NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname <> 'plpgsql'), "
+                    "NOT EXISTS (SELECT 1 FROM pg_language "
+                    "WHERE lanname NOT IN ('internal', 'c', 'sql', 'plpgsql')), "
+                    "NOT EXISTS (SELECT 1 FROM pg_foreign_data_wrapper), "
+                    "NOT EXISTS (SELECT 1 FROM pg_foreign_server), "
+                    "NOT EXISTS (SELECT 1 FROM pg_operator o "
+                    "JOIN pg_namespace n ON n.oid = o.oprnamespace "
+                    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')), "
+                    "NOT EXISTS (SELECT 1 FROM pg_event_trigger), "
+                    "NOT EXISTS (SELECT 1 FROM pg_publication), "
+                    "NOT EXISTS (SELECT 1 FROM pg_subscription), "
+                    "NOT EXISTS (SELECT 1 FROM pg_replication_origin), "
+                    "NOT EXISTS (SELECT 1 FROM pg_default_acl), "
+                    "NOT EXISTS (SELECT 1 FROM pg_collation "
+                    "WHERE collnamespace NOT IN (SELECT oid FROM pg_namespace "
+                    "WHERE nspname IN ('pg_catalog', 'information_schema'))), "
+                    "NOT EXISTS (SELECT 1 FROM pg_conversion "
+                    "WHERE connamespace NOT IN (SELECT oid FROM pg_namespace "
+                    "WHERE nspname IN ('pg_catalog', 'information_schema'))), "
+                    "NOT EXISTS (SELECT 1 FROM pg_largeobject_metadata)"
                 )
-                empty = (cursor.fetchone() or (None,))[0] == 0
+                pristine = tuple(cursor.fetchone() or ())
+                # Keep this count equal to the SELECT list: a missing check
+                # must never turn a non-pristine catalog into an empty one.
+                empty = len(pristine) == 17 and all(value is True for value in pristine)
     except OpsError:
         raise
     except Exception as exc:
@@ -715,14 +782,16 @@ def _database_state(target_database_url: str) -> tuple[bool, str | None, bool]:
     return True, comment, empty
 
 
-def _drop_registry_database(target_database_url: str, *, expected_comment: str | None) -> None:
+def _drop_registry_database(target_database_url: str, *, expected_comment: str) -> None:
+    if _OWNER_MARKER_RE.fullmatch(expected_comment) is None:
+        raise OpsError("restore database ownership comment is required; manual cleanup is required")
     try:
         import psycopg
     except ImportError as exc:
         raise OpsError("psycopg is required to recover the restore database") from exc
     target_name = _database_name(target_database_url)
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
@@ -738,15 +807,52 @@ def _drop_registry_database(target_database_url: str, *, expected_comment: str |
         raise OpsError("could not recover restore database; manual empty-DB cleanup is required") from exc
 
 
+def _adopt_recovered_media(parent: Path, target: Path, marker: str) -> None:
+    """Prove ownership before adopting a target left by this run."""
+    _assert_no_symlink_components(target)
+    try:
+        target.relative_to(parent)
+    except ValueError as exc:
+        raise OpsError("restore target must be inside the private restore parent") from exc
+    if target == parent:
+        raise OpsError("restore target must be inside the private restore parent")
+    if target.exists() or os.path.lexists(target):
+        _private_directory(target, create=False)
+        try:
+            mode = stat.S_IMODE(os.stat(target, follow_symlinks=False).st_mode)
+            with os.scandir(target) as entries:
+                if next(entries, None) is not None:
+                    raise OpsError(
+                        "restore MEDIA_ROOT is not empty; manual cleanup is required"
+                    )
+        except OpsError:
+            raise
+        except OSError as exc:
+            raise OpsError("could not inspect restore MEDIA_ROOT") from exc
+        if mode != 0o700:
+            raise OpsError("restore MEDIA_ROOT is not private")
+        if _read_owner_marker(parent, target) != marker:
+            raise OpsError("restore ownership marker does not match this run")
+        return
+    _ensure_owner_marker(parent, target, marker)
+
+
 def recover_provisioning(
     *,
     target_database_url: str,
     restore_parent: str | os.PathLike[str],
     target_media_root: str | os.PathLike[str],
-) -> None:
+) -> str | None:
     """Recover only a registry-proven target left across a provisioning crash."""
     parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
     target = _path(target_media_root, "restore MEDIA_ROOT")
+    _assert_no_symlink_components(target)
+    try:
+        target.relative_to(parent)
+    except ValueError as exc:
+        raise OpsError("restore target must be inside the private restore parent") from exc
+    if target == parent:
+        raise OpsError("restore target must be inside the private restore parent")
     target_name = _database_name(target_database_url)
     server: tuple[object, ...] | None = None
     with _restore_staging_lock(parent):
@@ -791,21 +897,45 @@ def recover_provisioning(
                 _fsync_directory(parent)
                 continue
             if comment == marker:
-                if target.exists() or os.path.lexists(target):
-                    raise OpsError("restore target media already exists during provisioning recovery")
-                _ensure_owner_marker(parent, target, marker)
+                if empty is not True:
+                    raise OpsError(
+                        "restore database is not pristine; manual empty-DB cleanup is required"
+                    )
+                _adopt_recovered_media(parent, target, marker)
                 value["state"] = "owned"
                 _write_json_atomic(entry, value)
-                continue
-            if state in {"planned", "created"} and comment is None and empty:
-                _drop_registry_database(target_database_url, expected_comment=None)
                 entry.unlink()
                 _fsync_directory(parent)
-                continue
+                return marker
+            if comment is None:
+                raise OpsError(
+                    "restore database ownership comment is absent; "
+                    "manual empty-DB cleanup is required"
+                )
             raise OpsError(
                 "restore provisioning ownership cannot be proven; "
                 "manual empty-DB cleanup is required"
             )
+        owner_path = _owner_marker_path(parent, target)
+        if target.exists() or os.path.lexists(target) or owner_path.exists() or os.path.lexists(owner_path):
+            if not owner_path.exists() and not os.path.lexists(owner_path):
+                raise OpsError(
+                    "restore MEDIA_ROOT ownership marker is missing; manual cleanup is required"
+                )
+            marker = _read_owner_marker(parent, target)
+            exists, comment, empty = _database_state(target_database_url)
+            if not exists or comment != marker:
+                raise OpsError(
+                    "restore provisioning ownership cannot be proven; "
+                    "manual empty-DB cleanup is required"
+                )
+            if empty is not True:
+                raise OpsError(
+                    "restore database is not pristine; manual empty-DB cleanup is required"
+                )
+            _adopt_recovered_media(parent, target, marker)
+            return marker
+    return None
 
 
 def _database_name(value: str) -> str:
@@ -888,7 +1018,7 @@ def _create_isolated_database(
     created = False
     commented = False
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_name,))
                 if cursor.fetchone() is not None:
@@ -907,11 +1037,13 @@ def _create_isolated_database(
         return marker
     except OpsError:
         if created:
-            try:
-                _drop_registry_database(
-                    target_database_url,
-                    expected_comment=marker if commented else None,
+            if not commented:
+                raise OpsError(
+                    "restore database ownership comment was not written; "
+                    "manual empty-DB cleanup is required"
                 )
+            try:
+                _drop_registry_database(target_database_url, expected_comment=marker)
             except Exception as rollback_exc:
                 raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
         try:
@@ -924,11 +1056,13 @@ def _create_isolated_database(
         raise
     except Exception as exc:
         if created:
+            if not commented:
+                raise OpsError(
+                    "restore database ownership comment was not written; "
+                    "manual empty-DB cleanup is required"
+                ) from exc
             try:
-                _drop_registry_database(
-                    target_database_url,
-                    expected_comment=marker if commented else None,
-                )
+                _drop_registry_database(target_database_url, expected_comment=marker)
             except Exception as rollback_exc:
                 raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
         try:
@@ -957,20 +1091,28 @@ def provision_isolated_target(
         backup_root=backup_root,
         production_media_roots=production_media_roots,
     )
-    recover_provisioning(
+    recovered_marker = recover_provisioning(
         target_database_url=target_database_url,
         restore_parent=parent,
         target_media_root=target,
     )
-    marker = create_isolated_database(
-        target_database_url,
-        production_database_urls,
-        restore_parent=parent,
-        target_media_root=target,
-    )
+    marker = recovered_marker
+    if marker is None:
+        if target.exists() or os.path.lexists(target):
+            raise OpsError(
+                "restore MEDIA_ROOT already exists without recovery ownership; "
+                "manual cleanup is required"
+            )
+        marker = create_isolated_database(
+            target_database_url,
+            production_database_urls,
+            restore_parent=parent,
+            target_media_root=target,
+        )
     try:
-        target.mkdir(mode=0o700)
-        os.chmod(target, 0o700)
+        if not target.exists() and not os.path.lexists(target):
+            target.mkdir(mode=0o700)
+            os.chmod(target, 0o700)
     except Exception as exc:
         try:
             _drop_owned_database(
@@ -1291,39 +1433,39 @@ def migration_check(
     config = alembic_ini or repo_root / "alembic.ini"
     if not config.is_file() or config.is_symlink():
         raise OpsError("Alembic configuration is unavailable")
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "DATABASE_URL": target_database_url,
-            "MEDIA_ROOT": str(target_media_root),
-            "APP_ENV": "test",
-        }
-    )
-    for action in ("upgrade", "current"):
-        command = [sys.executable, "-m", "alembic", "-c", str(config), action, "head"] if action == "upgrade" else [
-            sys.executable,
-            "-m",
-            "alembic",
-            "-c",
-            str(config),
-            action,
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=repo_root,
-                env=environment,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except (FileNotFoundError, OSError) as exc:
-            raise OpsError("Alembic migration check could not be started") from exc
-        if completed.returncode != 0:
-            raise OpsError("Alembic migration check failed")
-        if action == "current" and "head" not in (completed.stdout + completed.stderr).casefold():
-            raise OpsError("restored database is not at the current migration head")
+    with _postgres_environment(target_database_url, base=os.environ) as environment:
+        environment.update(
+            {
+                "DATABASE_URL": _native_postgres_url(target_database_url),
+                "MEDIA_ROOT": str(target_media_root),
+                "APP_ENV": "test",
+            }
+        )
+        for action in ("upgrade", "current"):
+            command = [sys.executable, "-m", "alembic", "-c", str(config), action, "head"] if action == "upgrade" else [
+                sys.executable,
+                "-m",
+                "alembic",
+                "-c",
+                str(config),
+                action,
+            ]
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=repo_root,
+                    env=environment,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                raise OpsError("Alembic migration check could not be started") from exc
+            if completed.returncode != 0:
+                raise OpsError("Alembic migration check failed")
+            if action == "current" and "head" not in (completed.stdout + completed.stderr).casefold():
+                raise OpsError("restored database is not at the current migration head")
 
 
 def _database_media_check(application, media_root: Path) -> None:
@@ -1377,58 +1519,59 @@ def smoke_check(
         from app.models import ComparisonSet, User
     except (ImportError, RuntimeError) as exc:
         raise OpsError("application dependencies are unavailable for restore smoke") from exc
-    application: Flask = create_app(
-        {
-            "TESTING": True,
-            "APP_ENV": "test",
-            "DATABASE_URL": target_database_url,
-            "MEDIA_ROOT": str(target_media_root),
-            "SECRET_KEY": secrets.token_urlsafe(32),
-            "SESSION_COOKIE_SECURE": False,
-            "BOARD_RENDER_DPI": 20,
-        }
-    )
-    client = application.test_client()
-    login_page = client.get("/login")
-    if login_page.status_code != 200:
-        raise OpsError("restore smoke login page failed")
-    token = _csrf_token(login_page)
-    login_response = client.post(
-        "/login",
-        data={"username": username, "password": password, "csrf_token": token},
-        follow_redirects=False,
-    )
-    if login_response.status_code != 302:
-        raise OpsError("restore smoke login failed")
-    with application.app_context():
-        user = db.session.scalar(select(User).where(User.username == username.casefold()))
-        if user is None or not user.active or not user.is_editor:
-            raise OpsError("restore smoke user must be an active Editor or Admin")
-        comparison_set = db.session.scalar(
-            select(ComparisonSet)
-            .where(ComparisonSet.archived_at.is_(None))
-            .order_by(ComparisonSet.id)
+    with scoped_postgres_environment(target_database_url):
+        application: Flask = create_app(
+            {
+                "TESTING": True,
+                "APP_ENV": "test",
+                "DATABASE_URL": target_database_url,
+                "MEDIA_ROOT": str(target_media_root),
+                "SECRET_KEY": secrets.token_urlsafe(32),
+                "SESSION_COOKIE_SECURE": False,
+                "BOARD_RENDER_DPI": 20,
+            }
         )
-        if comparison_set is None:
-            raise OpsError("restored database has no active Comparison Set for smoke")
-        set_id = comparison_set.id
-        version = comparison_set.version
-    patients = client.get("/patients")
-    if patients.status_code != 200:
-        raise OpsError("restore smoke read failed")
-    detail = client.get(f"/comparison-sets/{set_id}")
-    if detail.status_code != 200:
-        raise OpsError("restore smoke Comparison Set read failed")
-    preview = client.get(f"/comparison-sets/{set_id}/preview?version={version}")
-    if preview.status_code != 200:
-        raise OpsError("restore smoke preview failed")
-    export_token = _csrf_token(detail)
-    exported = client.post(
-        f"/comparison-sets/{set_id}/export",
-        data={"format": "png", "version": str(version), "csrf_token": export_token},
-    )
-    if exported.status_code != 200 or not exported.data.startswith(b"\x89PNG"):
-        raise OpsError("restore smoke export failed")
+        client = application.test_client()
+        login_page = client.get("/login")
+        if login_page.status_code != 200:
+            raise OpsError("restore smoke login page failed")
+        token = _csrf_token(login_page)
+        login_response = client.post(
+            "/login",
+            data={"username": username, "password": password, "csrf_token": token},
+            follow_redirects=False,
+        )
+        if login_response.status_code != 302:
+            raise OpsError("restore smoke login failed")
+        with application.app_context():
+            user = db.session.scalar(select(User).where(User.username == username.casefold()))
+            if user is None or not user.active or not user.is_editor:
+                raise OpsError("restore smoke user must be an active Editor or Admin")
+            comparison_set = db.session.scalar(
+                select(ComparisonSet)
+                .where(ComparisonSet.archived_at.is_(None))
+                .order_by(ComparisonSet.id)
+            )
+            if comparison_set is None:
+                raise OpsError("restored database has no active Comparison Set for smoke")
+            set_id = comparison_set.id
+            version = comparison_set.version
+        patients = client.get("/patients")
+        if patients.status_code != 200:
+            raise OpsError("restore smoke read failed")
+        detail = client.get(f"/comparison-sets/{set_id}")
+        if detail.status_code != 200:
+            raise OpsError("restore smoke Comparison Set read failed")
+        preview = client.get(f"/comparison-sets/{set_id}/preview?version={version}")
+        if preview.status_code != 200:
+            raise OpsError("restore smoke preview failed")
+        export_token = _csrf_token(detail)
+        exported = client.post(
+            f"/comparison-sets/{set_id}/export",
+            data={"format": "png", "version": str(version), "csrf_token": export_token},
+        )
+        if exported.status_code != 200 or not exported.data.startswith(b"\x89PNG"):
+            raise OpsError("restore smoke export failed")
 
 
 def assert_active_login(application) -> None:
@@ -1461,7 +1604,7 @@ def ensure_smoke_account(application, username: str, password: str) -> bool:
             create_user(
                 actor=None,
                 username=username,
-                display_name="Temporary restore smoke account",
+                display_name=_SMOKE_ACCOUNT_DISPLAY_NAME,
                 password=password,
                 role="editor",
                 active=True,
@@ -1473,7 +1616,7 @@ def ensure_smoke_account(application, username: str, password: str) -> bool:
 
 
 def remove_smoke_account(application, username: str) -> None:
-    """Remove only the account created explicitly for this restore smoke."""
+    """Disable the smoke account without breaking its audit-event foreign keys."""
     from sqlalchemy import select
 
     from app.db import db
@@ -1484,11 +1627,15 @@ def remove_smoke_account(application, username: str) -> None:
         if user is None:
             raise OpsError("temporary restore smoke account is missing during cleanup")
         try:
-            db.session.delete(user)
+            user.active = False
+            user.session_version += 1
+            user.set_password(secrets.token_urlsafe(48))
+            if user.display_name == _SMOKE_ACCOUNT_DISPLAY_NAME:
+                user.display_name = "Disabled restore smoke account"
             db.session.commit()
         except Exception as exc:
             db.session.rollback()
-            raise OpsError("could not remove temporary restore smoke account") from exc
+            raise OpsError("could not disable temporary restore smoke account") from exc
 
 
 def _remove_private_path(path: Path) -> None:
@@ -1526,6 +1673,9 @@ def _remove_private_path_strict(path: Path) -> None:
 
 def _maintenance_database_url(value: str) -> str:
     parsed = urlsplit(_native_postgres_url(value))
+    if not parsed.netloc:
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"postgresql:///postgres{query}"
     return urlunsplit(("postgresql", parsed.netloc, "/postgres", parsed.query, parsed.fragment))
 
 
@@ -1587,7 +1737,7 @@ def _drop_owned_database(
     except ImportError as exc:
         raise OpsError("psycopg is required to clean the restore database") from exc
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
@@ -1618,7 +1768,7 @@ def _assert_owned_database(target_database_url: str, ownership_marker: str) -> N
     except ImportError as exc:
         raise OpsError("psycopg is required to verify restore ownership") from exc
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
@@ -1638,7 +1788,7 @@ def _set_owned_database_comment(target_database_url: str, ownership_marker: str)
     target_name = _database_name(target_database_url)
     try:
         import psycopg
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+        with scoped_postgres_environment(target_database_url), _psycopg_connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
@@ -1718,7 +1868,7 @@ def _validate_isolated_media_target(
         if _path_overlap(target, production):
             raise OpsError("restore MEDIA_ROOT is a production media destination")
     if target.exists() or os.path.lexists(target):
-        raise OpsError("restore MEDIA_ROOT already exists; choose a new isolated target")
+        _private_directory(target, create=False)
     return parent, target
 
 
@@ -1890,26 +2040,27 @@ def run_restore_check(
             from app import create_app
         except ImportError as exc:
             raise OpsError("application dependencies are unavailable for restore check") from exc
-        application = create_app(
-            {
-                "TESTING": True,
-                "APP_ENV": "test",
-                "DATABASE_URL": target_database_url,
-                "MEDIA_ROOT": str(target),
-                "SECRET_KEY": secrets.token_urlsafe(32),
-                "SESSION_COOKIE_SECURE": False,
-            }
-        )
-        if create_smoke_account:
-            assert_active_login(application)
-            smoke_account_created = ensure_smoke_account(application, smoke_username, smoke_password)
-        _database_media_check(application, target)
-        smoke_check(
-            target_database_url=target_database_url,
-            target_media_root=target,
-            username=smoke_username,
-            password=smoke_password,
-        )
+        with scoped_postgres_environment(target_database_url):
+            application = create_app(
+                {
+                    "TESTING": True,
+                    "APP_ENV": "test",
+                    "DATABASE_URL": target_database_url,
+                    "MEDIA_ROOT": str(target),
+                    "SECRET_KEY": secrets.token_urlsafe(32),
+                    "SESSION_COOKIE_SECURE": False,
+                }
+            )
+            if create_smoke_account:
+                assert_active_login(application)
+                smoke_account_created = ensure_smoke_account(application, smoke_username, smoke_password)
+            _database_media_check(application, target)
+            smoke_check(
+                target_database_url=target_database_url,
+                target_media_root=target,
+                username=smoke_username,
+                password=smoke_password,
+            )
         completed = True
         return RestoreResult(
             generation=selected.name,
@@ -1926,7 +2077,8 @@ def run_restore_check(
         cleanup_errors: list[BaseException] = []
         if smoke_account_created:
             try:
-                remove_smoke_account(application, smoke_username)
+                with scoped_postgres_environment(target_database_url):
+                    remove_smoke_account(application, smoke_username)
             except OpsError as exc:
                 cleanup_errors.append(exc)
         if source_staging is not None:
@@ -2032,10 +2184,8 @@ def main(argv: list[str] | None = None) -> int:
             smoke_password = _read_secret_file(args.smoke_password_file)
         elif args.smoke_password_stdin:
             smoke_password = sys.stdin.readline().rstrip("\r\n")
-        elif "RESTORE_SMOKE_PASSWORD" in os.environ:
-            smoke_password = os.environ["RESTORE_SMOKE_PASSWORD"]
         else:
-            raise OpsError("restore smoke password file, stdin, or environment is required")
+            raise OpsError("restore smoke password file or stdin is required")
         if not args.target_database_url or not args.target_media_root or not args.restore_parent:
             raise OpsError("target database, media root, and restore parent are required to provision a restore target")
         ownership_marker = provision_isolated_target(

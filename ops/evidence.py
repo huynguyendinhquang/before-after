@@ -11,12 +11,14 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from collections.abc import Iterator
+import uuid
 
 
 REQUIRED_FIXED_GATE_TESTS = frozenset(
@@ -29,6 +31,7 @@ _FIXED_GATE_FIELDS = (
     "format",
     "completed_fixed_gate",
     "commit",
+    "tree",
     "output_artifact",
     "output_sha256",
     "dac_proof_artifact",
@@ -38,6 +41,7 @@ _FIXED_GATE_FIELDS = (
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_TREE_RE = _COMMIT_RE
 
 
 CHECK_COMMANDS = {
@@ -53,7 +57,7 @@ CHECK_COMMANDS = {
         "scripts/test-dac.sh",
         "scripts/test-postgres.sh",
     ],
-    "python_compile": [sys.executable, "-m", "compileall", "-q", "app", "migrations", "ops", "tests"],
+    "python_compile": [sys.executable, "-m", "compileall", "-q", "app", "deploy", "migrations", "ops", "tests"],
 }
 
 
@@ -68,9 +72,8 @@ def _run(command: list[str], repo_root: Path) -> dict[str, object]:
             text=True,
         )
     except OSError as exc:
-        return {"command": command, "passed": False, "error": type(exc).__name__}
+        return {"passed": False, "error": type(exc).__name__}
     return {
-        "command": command,
         "passed": result.returncode == 0,
         "returncode": result.returncode,
     }
@@ -98,6 +101,44 @@ def _repository_commit(repo_root: Path) -> str | None:
     return head
 
 
+def _repository_tree(repo_root: Path) -> str | None:
+    configured = os.environ.get("BUILD_TREE_SHA")
+    if configured is not None and _TREE_RE.fullmatch(configured) is None:
+        return None
+    try:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return configured
+    if _TREE_RE.fullmatch(tree) is None:
+        return None
+    if configured is not None and configured != tree:
+        return None
+    return tree
+
+
+def _repository_worktree_clean(repo_root: Path) -> bool:
+    """Require Git to prove there are no tracked or untracked changes."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return status.stdout == ""
+
+
 def _canonical_path(path: Path) -> Path:
     candidate = path.absolute()
     resolved = candidate.resolve(strict=False)
@@ -106,14 +147,39 @@ def _canonical_path(path: Path) -> Path:
     return resolved
 
 
-def _artifact_path(repo_root: Path) -> Path:
-    configured = os.environ.get("FIXED_GATE_ARTIFACT")
-    candidate = Path(configured) if configured else repo_root / "artifacts/slice8-fixed-gate.json"
-    if not candidate.is_absolute():
-        candidate = repo_root / candidate
-    artifact = _canonical_path(candidate)
-    artifact.relative_to(repo_root.resolve(strict=False))
-    return artifact
+def _external_private_directory(path: Path, repo_root: Path) -> Path:
+    if not path.is_absolute():
+        raise ValueError("fixed gate artifact directory must be absolute")
+    directory = _canonical_path(path)
+    repository = repo_root.resolve(strict=False)
+    if directory == repository or repository in directory.parents or directory in repository.parents:
+        raise ValueError("fixed gate artifact directory must be external to the repository")
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("fixed gate artifact directory is not a real directory")
+    try:
+        info = directory.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("fixed gate artifact directory is not usable") from exc
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("fixed gate artifact directory must be private to the invoking user")
+    return directory
+
+
+def _artifact_path(repo_root: Path) -> Path | None:
+    configured_directory = os.environ.get("FIXED_GATE_ARTIFACT_DIR")
+    configured_artifact = os.environ.get("FIXED_GATE_ARTIFACT")
+    if configured_directory and configured_artifact:
+        raise ValueError("configure only FIXED_GATE_ARTIFACT_DIR or FIXED_GATE_ARTIFACT")
+    if configured_directory:
+        return _external_private_directory(Path(configured_directory), repo_root) / "slice8-fixed-gate.json"
+    if configured_artifact:
+        candidate = Path(configured_artifact)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        artifact = _canonical_path(candidate)
+        _external_private_directory(artifact.parent, repo_root)
+        return artifact
+    return None
 
 
 def _contained_member(value: object, evidence_root: Path, label: str) -> Path:
@@ -252,6 +318,84 @@ def _verify_signature(payload: bytes, signature: Path, repo_root: Path) -> tuple
                 pass
 
 
+def _evidence_output_path(output: Path, repo_root: Path) -> Path:
+    """Validate parents without resolving the destination leaf."""
+    candidate = output if output.is_absolute() else repo_root / output
+    candidate = candidate.absolute()
+    if ".." in candidate.parts or not candidate.name or candidate.name in {".", ".."}:
+        raise ValueError("evidence output path is invalid")
+    parent = candidate.parent
+    current = Path(candidate.anchor)
+    for part in parent.parts[1:]:
+        current /= part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ValueError("evidence output parent is unusable") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("evidence output parent contains a symlink or non-directory")
+    try:
+        info = os.stat(parent, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("evidence output parent is unusable") from exc
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("evidence output parent must be a private 0700 directory")
+    return candidate
+
+
+def _write_evidence_atomically(output: Path, evidence: dict[str, object]) -> None:
+    """Write through an O_NOFOLLOW/O_EXCL private sibling and replace the leaf."""
+    parent_fd: int | None = None
+    temporary: Path | None = None
+    descriptor: int | None = None
+    payload = (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("ascii")
+    try:
+        parent_fd = os.open(
+            output.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        for _ in range(10):
+            temporary = output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+                break
+            except FileExistsError:
+                temporary = None
+        if descriptor is None or temporary is None:
+            raise OSError("could not allocate evidence temporary file")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        temporary = None
+        os.fsync(parent_fd)
+    except (OSError, UnicodeEncodeError) as exc:
+        raise ValueError("could not atomically write evidence output") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
 def _junit_summary(path: Path) -> tuple[set[str], int, int, int, int]:
     try:
         root = ET.parse(path).getroot()
@@ -283,6 +427,8 @@ def _junit_summary(path: Path) -> tuple[set[str], int, int, int, int]:
             slice8_names.add(name)
     suites = [root] if root.tag == "testsuite" else [root, *root.iter("testsuite")]
     for suite in suites:
+        if suite is root and root.tag == "testsuites" and suite.get("tests") is None:
+            continue
         descendants = list(suite.iter("testcase"))
         raw_tests = suite.get("tests")
         if raw_tests is None:
@@ -318,6 +464,14 @@ def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
         artifact = _artifact_path(repo_root)
     except (OSError, ValueError):
         return _unverified("fixed gate artifact path is invalid"), True
+    if artifact is None:
+        return (
+            {
+                "status": "not_run",
+                "reason": "fixed PostgreSQL/DAC gate artifact is absent; syntax-only checks do not prove runtime",
+            },
+            False,
+        )
     if not artifact.is_file() or artifact.is_symlink():
         return (
             {
@@ -333,6 +487,11 @@ def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
         expected_commit = _repository_commit(repo_root)
         if expected_commit is None or value.get("commit") != expected_commit:
             raise ValueError("fixed gate commit does not match HEAD/BUILD_SHA")
+        expected_tree = _repository_tree(repo_root)
+        if expected_tree is None or value.get("tree") != expected_tree:
+            raise ValueError("fixed gate tree does not match HEAD/BUILD_TREE_SHA")
+        if not _repository_worktree_clean(repo_root):
+            raise ValueError("fixed gate repository worktree is dirty or unavailable")
         output = _contained_member(value.get("output_artifact"), artifact.parent, "JUnit")
         dac_path = _contained_member(value.get("dac_proof_artifact"), artifact.parent, "DAC proof")
         output_sha256 = value.get("output_sha256")
@@ -372,15 +531,19 @@ def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
     return (
         {
             "status": "passed",
-            "artifact": str(artifact.relative_to(repo_root.resolve(strict=False))),
-            "signature": str(signature.relative_to(repo_root.resolve(strict=False)))
-            if signature.is_relative_to(repo_root.resolve(strict=False))
-            else str(signature),
-            "output_artifact": value["output_artifact"],
+            # Evidence is portable and safe to publish: only basenames and
+            # content hashes leave this function. Verification above retains
+            # the full paths internally.
+            "artifact": artifact.name,
+            "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "signature": signature.name,
+            "signature_sha256": hashlib.sha256(signature.read_bytes()).hexdigest(),
+            "output_artifact": Path(str(value["output_artifact"])).name,
             "output_sha256": value["output_sha256"],
             "commit": value["commit"],
+            "tree": value["tree"],
             "slice8_tests_executed": value["slice8_tests_executed"],
-            "dac_proof_artifact": value["dac_proof_artifact"],
+            "dac_proof_artifact": Path(str(value["dac_proof_artifact"])).name,
             "dac_proof_sha256": value["dac_proof_sha256"],
         },
         True,
@@ -415,9 +578,8 @@ def generate(output: Path, repo_root: Path, *, certification: bool = False) -> i
         "clinic_permission_proof": "run deploy/verify-permissions.sh on the clinic host",
         "clinical_data": "not_collected",
     }
-    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="ascii")
-    output.chmod(0o600)
+    output = _evidence_output_path(output, repo_root)
+    _write_evidence_atomically(output, evidence)
     checks_passed = all(item["passed"] for item in checks.values())
     return 0 if checks_passed and (not certification or runtime_passed) else 1
 

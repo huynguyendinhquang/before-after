@@ -15,26 +15,35 @@ Use these paths (change them together if the clinic layout differs):
   `before-after-backup`, mode `0700`;
 - app environment: `/etc/before-after/before-after.env`, `root:before-after`
   mode `0640`;
+- `/etc/before-after` itself is `root:before-after` mode `0750`; `www-data`
+  belongs only to `before-after-web` and cannot traverse this directory;
+- persistent coordination lock: `/var/lib/before-after/media/.backup.lock`,
+  `before-after:before-after-media` mode `0660`;
 - backup environment: `/etc/before-after/before-after-backup.env`,
   `root:before-after-backup` mode `0640`.
 
 `before-after` and `before-after-backup` are separate system users and groups.
-The dedicated `before-after-media` group is supplementary for both users. The
-app owns the media tree and can write it; the backup user has group `r-x` on
+The dedicated `before-after-media` group contains only those two approved
+identities (whether primary or supplementary); bootstrap and verification
+reject extra members and POSIX ACLs. The app owns the media tree and can write
+it; the backup user has group `r-x` on
 directories and group `r--` on files, so it can read every managed file but
 cannot create, modify, or delete media. The app user must not own or write the
 backup root.
 
 ## Fresh-host install
 
-Run these commands from the release checkout. The preparation helper creates
-both users and groups before any release or media ownership is changed.
+Run these commands from the release checkout. The preparation helper creates both users and groups before any release or
+media ownership is changed. It validates the canonical root-owned,
+non-writable parent chain and creates MEDIA_ROOT, its managed children, and
+`.backup.lock` through `mkdirat`/`openat` with `O_NOFOLLOW`; `/`, `/etc`,
+symlink overrides, and untrusted parents are refused.
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/before-after
 sudo cp -a --no-preserve=ownership . /opt/before-after/
 sudo /opt/before-after/deploy/bootstrap.sh --prepare-only
-# bootstrap also adds nginx's www-data to before-after when present.
+# bootstrap adds app and nginx's www-data to the separate before-after-web socket group.
 sudo chown -R root:root /opt/before-after
 sudo python3 -m venv /opt/before-after/.venv
 sudo apt-get update
@@ -89,6 +98,14 @@ sudo install -o root -g before-after-backup -m 0640 \
   /opt/before-after/deploy/before-after-backup.env.example \
   /etc/before-after/before-after-backup.env
 sudoedit /etc/before-after/before-after-backup.env
+# Create the dedicated read-only PostgreSQL role as an administrator. The
+# helper reads the password from a mode-0600 file, not from argv.
+export BACKUP_DB_PASSWORD_FILE=/var/lib/postgresql/before-after-backup.password
+sudo install -o postgres -g postgres -m 0600 /dev/null "$BACKUP_DB_PASSWORD_FILE"
+sudoedit "$BACKUP_DB_PASSWORD_FILE"
+sudo -u postgres env BACKUP_DB_PASSWORD_FILE="$BACKUP_DB_PASSWORD_FILE" \
+  /opt/before-after/deploy/bootstrap-postgres-backup-role.sh
+sudo rm -f "$BACKUP_DB_PASSWORD_FILE"
 
 sudo install -o root -g root -m 0644 \
   /opt/before-after/deploy/systemd/before-after-backup.service \
@@ -105,12 +122,20 @@ sudo systemctl enable --now before-after-backup.timer
 sudo systemctl start before-after-backup.service
 ```
 
-The backup service runs as `before-after-backup`. Only its
-`ExecStartPre`/`ExecStopPost` commands stop and start the app; the Python
-backup process never runs as root. `ops/backup.sh` fails closed unless
-`systemctl is-active` explicitly reports `inactive` (including systemd's
-normal inactive exit status). A stop failure prevents the backup command from
-running.
+The backup service runs as `before-after-backup` and connects with the
+`before_after_backup` PostgreSQL LOGIN role. That role inherits only
+`pg_read_all_data` plus required CONNECT/schema/sequence reads; it has no
+write, ownership, role-management, or database-creation privileges. Verify
+with `pg_dump` and explicitly test that DELETE and DDL fail before enabling
+production backups. Only its `ExecStartPre`/`ExecStopPost` commands stop and
+start the app; the Python backup process never runs as root. Gunicorn holds a shared flock on the
+persistent media lock for its whole lifetime. `ops/backup.sh` takes the same
+lock exclusively before checking `systemctl is-active`, and keeps it through
+`pg_dump` and media publication. An app restart during backup therefore waits;
+there is no `Conflicts=` relationship that can kill an active backup. The
+script fails closed unless `systemctl is-active` explicitly reports `inactive`
+(including systemd's normal inactive exit status). A stop failure prevents the
+backup command from running.
 
 The backup code also requires `BACKUP_ROOT` to resolve to a non-root mount,
 rejects symlink/unsafe ACLs, requires mode `0700` and ownership by the current
@@ -130,7 +155,11 @@ app environment loaded by root:
 
 ```bash
 sudo systemctl stop before-after.service
-sudo /bin/bash -c 'set -a; . /etc/before-after/before-after.env; set +a; cd /opt/before-after; exec runuser --user before-after -- env APP_ENV=production DATABASE_URL="$DATABASE_URL" MEDIA_ROOT="${MEDIA_ROOT:-/var/lib/before-after/media}" SECRET_KEY="$SECRET_KEY" /opt/before-after/.venv/bin/flask --app app:create_app reconcile-media'
+sudo runuser --user before-after -- env -i \
+  PATH=/opt/before-after/.venv/bin:/usr/local/bin:/usr/bin:/bin \
+  HOME=/opt/before-after \
+  /bin/bash -c 'set -a; source "$1"; set +a; cd "$2"; exec "$3" --app app:create_app reconcile-media' \
+  bash /etc/before-after/before-after.env /opt/before-after /opt/before-after/.venv/bin/flask
 sudo systemctl start before-after.service
 ```
 
@@ -308,16 +337,28 @@ POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts
 
 `test-postgres.sh` fails closed when a native client major or Docker DAC proof
 is unavailable; no mandatory PostgreSQL test is converted into a skip. The
-fixed gate rejects all extra pytest selector/filter arguments, clears
-`PYTEST_ADDOPTS`, runs the named native restore and DAC tests, and writes a
-hashed JUnit output, DAC proof marker, and completion metadata to
-`artifacts/slice8-fixed-gate.*`.
-
-Generate a redacted local evidence artifact for an issue without collecting
-clinical data:
+fixed gate rejects all extra pytest selector/filter arguments and runs pytest
+with plugin autoload, selector, `BUILD_SHA`, `FIXED_GATE_*`, `EVIDENCE_*`,
+`PYTEST_PLUGINS`, `PYTHONPATH`, and ambient `PG*` variables removed. It writes
+hashed JUnit output, a DAC proof marker, and commit/tree-bound completion
+metadata to a private external directory. Use either a temporary directory or
+a documented external artifact directory:
 
 ```bash
-python3 -m ops.evidence --output artifacts/slice8-local-evidence.json
+artifact_dir=$(mktemp -d)
+BUILD_SHA=$(git rev-parse HEAD) FIXED_GATE_ARTIFACT_DIR="$artifact_dir" \
+  POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python \
+  ./scripts/test-postgres.sh
+```
+
+Generate a redacted local evidence artifact for an issue without collecting
+clinical data. Keep both directories outside the repository and private:
+
+```bash
+evidence_dir=$(mktemp -d /tmp/before-after-evidence.XXXXXX)
+chmod 700 "$evidence_dir"
+FIXED_GATE_ARTIFACT_DIR="$artifact_dir" \
+  python3 -m ops.evidence --output "$evidence_dir/slice8-local-evidence.json"
 ```
 
 Use [`docs/issue-evidence-template.md`](issue-evidence-template.md) for the
@@ -326,25 +367,31 @@ ticket. The artifact explicitly records clinic hardware and TLS/LAN UAT as
 success is recorded only when the completed fixed-gate metadata matches the
 current build SHA, its JUnit/XML and DAC proof artifacts pass independent
 validation, and a detached signature verifies with the configured
-`EVIDENCE_PUBLIC_KEY`. A certification invocation is therefore:
+`EVIDENCE_PUBLIC_KEY`.
+
+CI or a maintainer signs the canonical metadata bytes (including the commit,
+tree, JUnit hash, and DAC proof hash) with a private key held in CI secret
+storage or an offline secret store:
 
 ```bash
-EVIDENCE_PUBLIC_KEY=/etc/before-after/evidence-public.pem \
-EVIDENCE_SIGNATURE=artifacts/slice8-fixed-gate.json.sig \
-python3 -m ops.evidence --certification \
-  --output artifacts/slice8-local-evidence.json
+: "${EVIDENCE_PRIVATE_KEY:?set EVIDENCE_PRIVATE_KEY to the signing key path}"
+python3 -c 'import json,sys; from ops.evidence import canonical_fixed_gate_metadata; sys.stdout.buffer.write(canonical_fixed_gate_metadata(json.load(open(sys.argv[1]))))' \
+  "$artifact_dir/slice8-fixed-gate.json" > "$artifact_dir/.slice8-fixed-gate.canonical"
+openssl dgst -sha256 -sign "$EVIDENCE_PRIVATE_KEY" \
+  -out "$artifact_dir/slice8-fixed-gate.json.sig" "$artifact_dir/.slice8-fixed-gate.canonical"
+rm -f "$artifact_dir/.slice8-fixed-gate.canonical"
 ```
 
-CI or a maintainer signs the canonical metadata bytes (which include the
-commit-bound JUnit and DAC hashes) with a private key held in CI secret storage
-or an offline secret store, for example:
+Use the exact external metadata and detached signature as certification inputs
+(configure either `FIXED_GATE_ARTIFACT_DIR` or `FIXED_GATE_ARTIFACT`, not both):
 
 ```bash
-python3 -c 'import json,sys; from ops.evidence import canonical_fixed_gate_metadata; sys.stdout.buffer.write(canonical_fixed_gate_metadata(json.load(open(sys.argv[1]))))' \
-  artifacts/slice8-fixed-gate.json > /tmp/slice8-fixed-gate.canonical
-openssl dgst -sha256 -sign "$EVIDENCE_PRIVATE_KEY" \
-  -out artifacts/slice8-fixed-gate.json.sig /tmp/slice8-fixed-gate.canonical
-rm -f /tmp/slice8-fixed-gate.canonical
+env -u FIXED_GATE_ARTIFACT_DIR \
+  FIXED_GATE_ARTIFACT="$artifact_dir/slice8-fixed-gate.json" \
+  EVIDENCE_PUBLIC_KEY=/etc/before-after/evidence-public.pem \
+  EVIDENCE_SIGNATURE="$artifact_dir/slice8-fixed-gate.json.sig" \
+  python3 -m ops.evidence --certification \
+    --output "$evidence_dir/slice8-local-evidence.json"
 ```
 
 The private key is never stored in this repository or in an evidence artifact;
