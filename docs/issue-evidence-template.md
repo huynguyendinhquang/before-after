@@ -9,7 +9,7 @@ passwords, media files, private keys, or clinic host identifiers.
 - Operator role:
 - Local command: `python3 -m ops.evidence --output artifacts/slice8-local-evidence.json`
 - Evidence file:
-- Fixed-gate artifact/hash (required for runtime pass):
+- Fixed-gate artifact/hash, JUnit XML, DAC proof, and matching build SHA (required for runtime pass):
 - Failure or observation:
 - Reproduction command (redacted):
 - Expected result:

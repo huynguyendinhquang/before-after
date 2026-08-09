@@ -54,3 +54,12 @@ su before-after -s /bin/sh -c 'rm /var/lib/before-after/media/originals/proof.bi
 su before-after -s /bin/sh -c 'rm -rf /var/lib/before-after/media/originals/nested'
 CONTAINER
 )"
+
+if [[ -n "${DAC_PROOF_MARKER:-}" ]]; then
+  marker_dir=$(dirname -- "$DAC_PROOF_MARKER")
+  mkdir -p -- "$marker_dir"
+  temporary="$DAC_PROOF_MARKER.$$.tmp"
+  printf 'before-after.dac-proof.v1\n' >"$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$DAC_PROOF_MARKER"
+fi

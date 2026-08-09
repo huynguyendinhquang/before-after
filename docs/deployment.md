@@ -147,11 +147,13 @@ Each generation is private and contains a custom PostgreSQL dump, all four
 managed media directories, and a checksum manifest. The dump is fsynced,
 checked for the `PGDMP` header, and validated by `pg_restore --list` before the
 manifest is published. Retention uses the same restorable-v2 verifier as
-restore and never removes the last verified v2 generation. Unsupported v1
-generations are ignored for selection and retention, but preserved until
-explicitly migrated or removed. Stale `.staging-*` entries are safely removed
-and are never restore candidates; a failed staging cleanup is reported as
-poisoned instead of being silently left behind.
+restore and keeps only the requested number of verified v2 generations.
+Unsupported v1 or corrupt generations never consume retention slots and are
+preserved. Selection only ignores `.staging-*`; it never deletes staging.
+Explicit stale-stage cleanup runs under the backup lock and removes only old
+stages with a valid owner marker. A failed cleanup is reported as poisoned
+instead of being silently left behind. Unknown content directly under
+`MEDIA_ROOT` fails backup before publication rather than being omitted.
 
 ## HTTPS reverse proxy
 
@@ -182,13 +184,17 @@ Unix socket), port, and database name; DNS, `localhost`, `hostaddr`, and socket
 aliases cannot bypass the guard. Media paths use realpath/inode/containment and
 reject symlink components.
 
-Choose a new target database name on the same PostgreSQL cluster (for example,
-`before_after_restore_20260809`) and create the private restore parent. Never
+Choose a new generated target database name on the same PostgreSQL cluster
+(for example, `before_after_restore_<32 lowercase hex characters>`) and create
+the private restore parent. Never
 run `CREATE DATABASE` or restore into an existing target yourself. The
 `--provision-target` flow uses a mandatory admin connection, refuses an existing
-name, records a per-run ownership marker in `pg_database`, then creates the
-empty `0700` media target. If media provisioning fails, the newly created DB is
-rolled back:
+name, writes a per-run registry marker before `CREATE DATABASE`, records the
+exact ownership marker in `pg_database`, then creates the empty `0700` media
+target. A crash before the comment is recoverable only when that registry
+proves the generated name, server, target, and empty database; otherwise the
+command fails closed for manual cleanup. If media provisioning fails, the
+newly created DB is rolled back:
 
 ```bash
 sudo install -d -o root -g root -m 0700 /var/lib/before-after/restore-drills
@@ -300,8 +306,9 @@ POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts
 `test-postgres.sh` fails closed when a native client major or Docker DAC proof
 is unavailable; no mandatory PostgreSQL test is converted into a skip. The
 fixed gate rejects all extra pytest selector/filter arguments, clears
-`PYTEST_ADDOPTS`, excludes only the optional host probe, and writes a hashed
-JUnit output plus completion metadata to `artifacts/slice8-fixed-gate.*`.
+`PYTEST_ADDOPTS`, runs the named native restore and DAC tests, and writes a
+hashed JUnit output, DAC proof marker, and completion metadata to
+`artifacts/slice8-fixed-gate.*`.
 
 Generate a redacted local evidence artifact for an issue without collecting
 clinical data:
@@ -313,8 +320,9 @@ python3 -m ops.evidence --output artifacts/slice8-local-evidence.json
 Use [`docs/issue-evidence-template.md`](issue-evidence-template.md) for the
 ticket. The artifact explicitly records clinic hardware and TLS/LAN UAT as
 `not_run`; local syntax/compile checks do not claim runtime success. Runtime
-success is recorded only when the completed fixed-gate metadata and its
-hash-matching JUnit output artifact are present.
+success is recorded only when the completed fixed-gate metadata matches the
+current build SHA and its JUnit/XML and DAC proof artifacts pass independent
+validation.
 
 The acceptance tests use an injected storage policy only for their same-device
 temporary test directory; production policy is never bypassed. Also run:

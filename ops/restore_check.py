@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
@@ -15,7 +17,8 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Callable, Iterable
+import time
+from typing import Callable, Iterable, Iterator
 from urllib.parse import unquote, urlsplit, urlunsplit
 import uuid
 
@@ -30,7 +33,6 @@ from ops.backup import (
     _assert_no_symlink_components,
     _fsync_directory,
     POSTGRES_DUMP_MAGIC,
-    _cleanup_staging,
     _native_postgres_url,
     _path,
     _path_overlap,
@@ -45,6 +47,13 @@ from ops.backup import (
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
 _OWNER_MARKER_RE = re.compile(r"^before-after-restore-[0-9a-f]{32}$")
+_RESTORE_STAGE_OWNER_NAME = ".restore-stage-owner.json"
+_RESTORE_STAGE_OWNER_FORMAT = "before-after.restore-stage.v1"
+_RESTORE_STAGE_RE = re.compile(r"^\.(?:restore-source|restore)-([0-9a-f]{32})$")
+_RESTORE_STAGING_LOCK_NAME = ".restore-staging.lock"
+_RESTORE_REGISTRY_FORMAT = "before-after.restore-run.v1"
+_RESTORE_REGISTRY_RE = re.compile(r"^\.restore-run-([0-9a-f]{32})\.json$")
+_GENERATED_DATABASE_RE = re.compile(r"^before_after_restore_[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -64,8 +73,19 @@ class RestoreResult:
     smoke_checked: bool
 
 
+def _target_identity(parent: Path, target: Path) -> str:
+    parent_real = parent.resolve(strict=False)
+    target_real = target.resolve(strict=False)
+    try:
+        return target_real.relative_to(parent_real).as_posix()
+    except ValueError:
+        return target_real.as_posix()
+
+
 def _owner_marker_path(parent: Path, target: Path) -> Path:
-    return parent / f".{target.name}.restore-owner"
+    identity = _target_identity(parent, target).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return parent / f".restore-owner-{digest}"
 
 
 def _write_owner_marker(parent: Path, target: Path, marker: str) -> None:
@@ -96,6 +116,218 @@ def _read_owner_marker(parent: Path, target: Path) -> str:
     if _OWNER_MARKER_RE.fullmatch(marker) is None:
         raise OpsError("restore ownership marker is invalid")
     return marker
+
+
+def _ensure_owner_marker(parent: Path, target: Path, marker: str) -> None:
+    path = _owner_marker_path(parent, target)
+    if path.exists() or os.path.lexists(path):
+        if _read_owner_marker(parent, target) != marker:
+            raise OpsError("restore ownership marker does not match this run")
+        return
+    _write_owner_marker(parent, target, marker)
+
+
+def _write_json_atomic(path: Path, value: dict[str, object], *, replace: bool = True) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="ascii") as stream:
+            json.dump(value, stream, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        if not replace and (path.exists() or os.path.lexists(path)):
+            raise OpsError("restore run registry marker already exists")
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        _fsync_directory(path.parent)
+    except OpsError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise OpsError("could not write restore run registry marker") from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+@contextmanager
+def _restore_staging_lock(parent: Path) -> Iterator[None]:
+    lock_path = parent / _RESTORE_STAGING_LOCK_NAME
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OpsError("restore staging lock is unsafe")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OpsError:
+        raise
+    except OSError as exc:
+        raise OpsError("could not acquire restore staging lock") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _write_restore_stage_owner(
+    staging: Path,
+    *,
+    parent: Path,
+    target: Path | None,
+    run_id: str,
+    kind: str,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise OpsError("restore staging run identifier is invalid")
+    payload = {
+        "format": _RESTORE_STAGE_OWNER_FORMAT,
+        "stage": staging.name,
+        "kind": kind,
+        "run_id": run_id,
+        "target": _target_identity(parent, target) if target is not None else None,
+        "pid": os.getpid(),
+        "created_at": time.time(),
+    }
+    temporary = staging / f".{_RESTORE_STAGE_OWNER_NAME}.{uuid.uuid4().hex}.tmp"
+    owner = staging / _RESTORE_STAGE_OWNER_NAME
+    try:
+        with temporary.open("x", encoding="ascii") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, owner)
+        os.chmod(owner, 0o600)
+        _fsync_directory(staging)
+    except (OSError, TypeError, ValueError) as exc:
+        raise OpsError("could not record restore staging ownership") from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _remove_restore_stage_owner(staging: Path) -> None:
+    try:
+        (staging / _RESTORE_STAGE_OWNER_NAME).unlink()
+    except FileNotFoundError:
+        raise OpsError("restore staging ownership metadata is missing")
+    except OSError as exc:
+        raise OpsError("could not remove restore staging ownership metadata") from exc
+    _fsync_directory(staging)
+
+
+def _restore_run_id(value: str) -> str:
+    if _OWNER_MARKER_RE.fullmatch(value):
+        return value.rsplit("-", 1)[1]
+    if re.fullmatch(r"[0-9a-f]{32}", value):
+        return value
+    raise OpsError("restore staging run identifier is invalid")
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _restore_stage_is_owned_stale(
+    entry: Path,
+    *,
+    parent: Path,
+    target: Path,
+    run_id: str,
+    now: float,
+    age_seconds: float,
+) -> bool:
+    match = _RESTORE_STAGE_RE.fullmatch(entry.name)
+    if match is None or entry.is_symlink() or not entry.is_dir():
+        return False
+    owner = entry / _RESTORE_STAGE_OWNER_NAME
+    try:
+        _private_file(owner, label="restore staging owner metadata")
+        metadata = json.loads(owner.read_text(encoding="ascii"))
+        age = now - entry.stat().st_mtime
+    except (OpsError, OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return (
+        age >= age_seconds
+        and isinstance(metadata, dict)
+        and metadata.get("format") == _RESTORE_STAGE_OWNER_FORMAT
+        and metadata.get("stage") == entry.name
+        and metadata.get("run_id") == run_id
+        and metadata.get("target") == _target_identity(parent, target)
+        and metadata.get("kind") in {"source", "media"}
+        and isinstance(metadata.get("created_at"), (int, float))
+        and not isinstance(metadata.get("created_at"), bool)
+        and metadata["created_at"] <= now
+        and isinstance(metadata.get("pid"), int)
+        and not isinstance(metadata.get("pid"), bool)
+        and not _process_is_alive(metadata["pid"])
+        and match.group(1)
+        and metadata.get("kind") == ("source" if entry.name.startswith(".restore-source-") else "media")
+    )
+
+
+def cleanup_stale_restore_staging(
+    *,
+    restore_parent: str | os.PathLike[str],
+    target_media_root: str | os.PathLike[str],
+    run_id: str,
+    age_seconds: float = 24 * 60 * 60,
+    now: float | None = None,
+) -> list[str]:
+    """Delete only old, metadata-owned restore stages while holding the lock."""
+    if isinstance(age_seconds, bool) or not isinstance(age_seconds, (int, float)) or age_seconds < 0:
+        raise OpsError("stale restore staging age must be non-negative")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    normalized_run_id = _restore_run_id(run_id)
+    current_time = time.time() if now is None else now
+    removed: list[str] = []
+    with _restore_staging_lock(parent):
+        try:
+            entries = list(parent.iterdir())
+        except OSError as exc:
+            raise OpsError("could not list restore staging") from exc
+        for entry in entries:
+            if not _restore_stage_is_owned_stale(
+                entry,
+                parent=parent,
+                target=target,
+                run_id=normalized_run_id,
+                now=current_time,
+                age_seconds=float(age_seconds),
+            ):
+                continue
+            _remove_private_path_strict(entry)
+            removed.append(entry.name)
+        if removed:
+            _fsync_directory(parent)
+    return removed
 
 
 def _safe_manifest_path(value: object) -> str:
@@ -252,7 +484,6 @@ def select_generation(
     generation: str | None = None,
 ) -> VerifiedGeneration:
     root = _private_directory(_path(backup_root, "BACKUP_ROOT"), create=False)
-    _cleanup_staging(root)
     if generation is not None:
         if not isinstance(generation, str) or "/" in generation or "\\" in generation or ".." in generation:
             raise OpsError("backup generation name is unsafe")
@@ -267,21 +498,14 @@ def select_generation(
         raise OpsError("could not list backup generations") from exc
     if not candidates:
         raise OpsError("no complete backup generations were found")
-    # A legacy v1 generation is retained for explicit migration/removal, but
-    # cannot make a valid v2 restore unavailable.  Published-looking v2
-    # generations remain fail-closed: corruption is not silently skipped.
+    # Unsupported or corrupt generations are preserved but never become a
+    # restore candidate.  The verifier is the same one used by retention.
     verified: list[VerifiedGeneration] = []
     for entry in candidates:
         try:
             verified.append(verify_generation(entry))
-        except OpsError:
-            try:
-                manifest = _load_json(entry / MANIFEST_NAME)
-            except OpsError:
-                raise
-            if manifest.get("format_version") == 1:
-                continue
-            raise
+        except (OpsError, OSError, UnicodeError, ValueError, TypeError):
+            continue
     if not verified:
         raise OpsError("no restorable v2 backup generations were found")
     return verified[-1]
@@ -398,6 +622,147 @@ def _connection_server_identity(value: str) -> tuple[object, ...]:
     raise OpsError("PostgreSQL socket server identity is unavailable")
 
 
+def _registry_path(parent: Path, run_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise OpsError("restore run identifier is invalid")
+    return parent / f".restore-run-{run_id}.json"
+
+
+def _registry_value(path: Path) -> dict[str, object]:
+    _private_file(path, label="restore run registry marker")
+    try:
+        value = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise OpsError("restore run registry marker is invalid") from exc
+    if not isinstance(value, dict) or value.get("format") != _RESTORE_REGISTRY_FORMAT:
+        raise OpsError("restore run registry marker is invalid")
+    return value
+
+
+def _database_state(target_database_url: str) -> tuple[bool, str | None, bool]:
+    """Return existence, exact comment, and whether the user database is empty."""
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required for restore run recovery") from exc
+    target_name = _database_name(target_database_url)
+    try:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+                    (target_name,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return False, None, True
+                comment = row[0]
+        with psycopg.connect(_native_postgres_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*) FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
+                    "AND n.nspname NOT LIKE 'pg_toast%' "
+                    "AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')"
+                )
+                empty = (cursor.fetchone() or (None,))[0] == 0
+    except OpsError:
+        raise
+    except Exception as exc:
+        raise OpsError("could not prove restore database state; manual empty-DB cleanup is required") from exc
+    return True, comment, empty
+
+
+def _drop_registry_database(target_database_url: str, *, expected_comment: str | None) -> None:
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to recover the restore database") from exc
+    target_name = _database_name(target_database_url)
+    try:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+                    (target_name,),
+                )
+                row = cursor.fetchone()
+                if row is None or row[0] != expected_comment:
+                    raise OpsError("restore database ownership proof changed; manual cleanup is required")
+                cursor.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+    except OpsError:
+        raise
+    except Exception as exc:
+        raise OpsError("could not recover restore database; manual empty-DB cleanup is required") from exc
+
+
+def recover_provisioning(
+    *,
+    target_database_url: str,
+    restore_parent: str | os.PathLike[str],
+    target_media_root: str | os.PathLike[str],
+) -> None:
+    """Recover only a registry-proven target left across a provisioning crash."""
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    target_name = _database_name(target_database_url)
+    server: tuple[object, ...] | None = None
+    with _restore_staging_lock(parent):
+        try:
+            entries = list(parent.iterdir())
+        except OSError as exc:
+            raise OpsError("could not list restore run registry") from exc
+        for entry in entries:
+            match = _RESTORE_REGISTRY_RE.fullmatch(entry.name)
+            if match is None or entry.is_symlink():
+                continue
+            value = _registry_value(entry)
+            if value.get("run_id") != match.group(1):
+                raise OpsError("restore run registry marker has inconsistent run identifier")
+            if value.get("database_name") != target_name:
+                continue
+            if server is None:
+                try:
+                    server = _connection_server_identity(target_database_url)
+                except OpsError as exc:
+                    raise OpsError(
+                        "could not prove restore provisioning ownership; "
+                        "manual empty-DB cleanup is required"
+                    ) from exc
+            if value.get("server_identity") != list(server):
+                raise OpsError("restore run registry server identity does not match")
+            if value.get("target_media_identity") != _target_identity(parent, target):
+                raise OpsError("restore run registry target identity does not match")
+            marker = value.get("ownership_marker")
+            if not isinstance(marker, str) or _OWNER_MARKER_RE.fullmatch(marker) is None:
+                raise OpsError("restore run registry ownership marker is invalid")
+            state = value.get("state")
+            if state not in {"planned", "created", "owned"}:
+                raise OpsError("restore run registry state is invalid")
+            exists, comment, empty = _database_state(target_database_url)
+            if not exists:
+                entry.unlink()
+                _fsync_directory(parent)
+                continue
+            if comment == marker:
+                if target.exists() or os.path.lexists(target):
+                    raise OpsError("restore target media already exists during provisioning recovery")
+                _ensure_owner_marker(parent, target, marker)
+                value["state"] = "owned"
+                _write_json_atomic(entry, value)
+                continue
+            if state in {"planned", "created"} and comment is None and empty:
+                _drop_registry_database(target_database_url, expected_comment=None)
+                entry.unlink()
+                _fsync_directory(parent)
+                continue
+            raise OpsError(
+                "restore provisioning ownership cannot be proven; "
+                "manual empty-DB cleanup is required"
+            )
+
+
 def _database_name(value: str) -> str:
     parsed = urlsplit(_native_postgres_url(value))
     name = unquote(parsed.path.lstrip("/"))
@@ -413,14 +778,46 @@ def create_isolated_database(
     restore_parent: str | os.PathLike[str] | None = None,
     target_media_root: str | os.PathLike[str] | None = None,
 ) -> str:
+    if restore_parent is None or target_media_root is None:
+        raise OpsError("restore parent and target media are required before target creation")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    with _restore_staging_lock(parent):
+        return _create_isolated_database(
+            target_database_url,
+            production_database_urls,
+            restore_parent=parent,
+            target_media_root=target_media_root,
+        )
+
+
+def _create_isolated_database(
+    target_database_url: str,
+    production_database_urls: Iterable[str],
+    *,
+    restore_parent: str | os.PathLike[str] | None = None,
+    target_media_root: str | os.PathLike[str] | None = None,
+) -> str:
     """Create and mark a new target DB through a mandatory admin connection."""
     production_urls = tuple(
         value for value in production_database_urls if isinstance(value, str) and value.strip()
     )
     if not production_urls:
         raise OpsError("a production database identifier is required before target creation")
+    if restore_parent is None or target_media_root is None:
+        raise OpsError("restore parent and target media are required before target creation")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    _assert_no_symlink_components(target)
+    try:
+        target.relative_to(parent)
+    except ValueError as exc:
+        raise OpsError("restore target must be inside the private restore parent") from exc
+    if target == parent or target.exists() or os.path.lexists(target):
+        raise OpsError("restore MEDIA_ROOT must be a new isolated target")
     target_server = _connection_server_identity(target_database_url)
     target_name = _database_name(target_database_url)
+    if _GENERATED_DATABASE_RE.fullmatch(target_name) is None:
+        raise OpsError("restore database name must be generated and collision-resistant")
     for production_url in production_urls:
         production_identity = _connection_database_identity(production_url)
         if target_server == production_identity[:3] and target_name == production_identity[3]:
@@ -430,7 +827,21 @@ def create_isolated_database(
     except ImportError as exc:
         raise OpsError("psycopg is required to create the restore database") from exc
     marker = f"before-after-restore-{uuid.uuid4().hex}"
+    run_id = marker.rsplit("-", 1)[1]
+    registry_path = _registry_path(parent, run_id)
+    registry: dict[str, object] = {
+        "format": _RESTORE_REGISTRY_FORMAT,
+        "run_id": run_id,
+        "database_name": target_name,
+        "server_identity": list(target_server),
+        "ownership_marker": marker,
+        "target_media_identity": _target_identity(parent, target),
+        "state": "planned",
+        "created_at": time.time(),
+    }
+    _write_json_atomic(registry_path, registry, replace=False)
     created = False
+    commented = False
     try:
         with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
@@ -439,30 +850,49 @@ def create_isolated_database(
                     raise OpsError("restore target database already exists; choose a new isolated name")
                 cursor.execute(f'CREATE DATABASE "{target_name}"')
                 created = True
+                registry["state"] = "created"
+                _write_json_atomic(registry_path, registry)
                 cursor.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{marker}'")
-        if restore_parent is not None:
-            parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
-            target = _path(
-                target_media_root if target_media_root is not None else parent / "media",
-                "restore MEDIA_ROOT",
-            )
-            _write_owner_marker(parent, target, marker)
+                commented = True
+        _write_owner_marker(parent, target, marker)
+        registry["state"] = "owned"
+        _write_json_atomic(registry_path, registry)
+        registry_path.unlink()
+        _fsync_directory(parent)
         return marker
     except OpsError:
         if created:
             try:
-                with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
-                    connection.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+                _drop_registry_database(
+                    target_database_url,
+                    expected_comment=marker if commented else None,
+                )
             except Exception as rollback_exc:
                 raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
+        try:
+            registry_path.unlink()
+            _fsync_directory(parent)
+        except FileNotFoundError:
+            pass
+        except OSError as registry_exc:
+            raise OpsError("restore database provisioning failed; run registry is poisoned") from registry_exc
         raise
     except Exception as exc:
         if created:
             try:
-                with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
-                    connection.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+                _drop_registry_database(
+                    target_database_url,
+                    expected_comment=marker if commented else None,
+                )
             except Exception as rollback_exc:
                 raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
+        try:
+            registry_path.unlink()
+            _fsync_directory(parent)
+        except FileNotFoundError:
+            pass
+        except OSError as registry_exc:
+            raise OpsError("restore database provisioning failed; run registry is poisoned") from registry_exc
         raise OpsError("could not create isolated restore database") from exc
 
 
@@ -481,6 +911,11 @@ def provision_isolated_target(
         restore_parent,
         backup_root=backup_root,
         production_media_roots=production_media_roots,
+    )
+    recover_provisioning(
+        target_database_url=target_database_url,
+        restore_parent=parent,
+        target_media_root=target,
     )
     marker = create_isolated_database(
         target_database_url,
@@ -641,15 +1076,25 @@ def stage_verified_generation(
     restore_parent: Path,
     *,
     pg_restore: str = "pg_restore",
+    target: Path | None = None,
+    run_id: str | None = None,
 ) -> tuple[VerifiedGeneration, Path]:
     """Copy a verified generation before restore, closing source TOCTOU."""
     parent = _private_directory(restore_parent, create=False)
     staging = parent / f".restore-source-{uuid.uuid4().hex}"
     _assert_no_symlink_components(staging)
+    stage_run_id = run_id or uuid.uuid4().hex
     old_umask = os.umask(0o077)
     completed = False
     try:
         staging.mkdir(mode=0o700)
+        _write_restore_stage_owner(
+            staging,
+            parent=parent,
+            target=target,
+            run_id=stage_run_id,
+            kind="source",
+        )
         staged_generation = staging / generation.name
         staged_generation.mkdir(mode=0o700)
         (staged_generation / "media").mkdir(mode=0o700)
@@ -676,6 +1121,7 @@ def stage_verified_generation(
             raise OpsError("could not inspect staged PostgreSQL dump") from exc
         _run_native([pg_restore, "--list", str(dump)], label="staged pg_restore validation")
         _make_immutable_tree(staged_generation)
+        _remove_restore_stage_owner(staging)
         os.chmod(staging, 0o500)
         completed = True
         return copied, staging
@@ -689,7 +1135,13 @@ def stage_verified_generation(
             _remove_private_path_strict(staging)
 
 
-def restore_media(generation: VerifiedGeneration, target: Path) -> None:
+def restore_media(
+    generation: VerifiedGeneration,
+    target: Path,
+    *,
+    run_id: str | None = None,
+    restore_parent: Path | None = None,
+) -> None:
     """Copy media through a private staging tree and atomically publish it."""
     _assert_no_symlink_components(target)
     if target.exists():
@@ -699,11 +1151,23 @@ def restore_media(generation: VerifiedGeneration, target: Path) -> None:
                 raise OpsError("restore MEDIA_ROOT must be empty")
         except OSError as exc:
             raise OpsError("restore MEDIA_ROOT is not usable") from exc
-    parent = _private_directory(target.parent, create=False)
+    parent = _private_directory(restore_parent or target.parent, create=False)
+    try:
+        target.relative_to(parent)
+    except ValueError as exc:
+        raise OpsError("restore target must be inside the private restore parent") from exc
     staging = parent / f".restore-{uuid.uuid4().hex}"
+    stage_run_id = run_id or uuid.uuid4().hex
     old_umask = os.umask(0o077)
     try:
         staging.mkdir(mode=0o700)
+        _write_restore_stage_owner(
+            staging,
+            parent=parent,
+            target=target,
+            run_id=stage_run_id,
+            kind="media",
+        )
         for directory_name in MEDIA_DIRS:
             (staging / directory_name).mkdir(mode=0o700)
         for entry in generation.files:
@@ -719,6 +1183,7 @@ def restore_media(generation: VerifiedGeneration, target: Path) -> None:
                 _private_directory(Path(current) / name, create=False)
             for name in files:
                 _private_file(Path(current) / name, label="restored media file")
+        _remove_restore_stage_owner(staging)
         _fsync_directory(staging)
         if target.exists():
             target.rmdir()
@@ -1117,14 +1582,24 @@ def _assert_owned_database(target_database_url: str, ownership_marker: str) -> N
 
 
 def _set_owned_database_comment(target_database_url: str, ownership_marker: str) -> None:
-    """Restore the ownership comment after pg_restore may replace it."""
+    """Restore the ownership comment only if no other owner claimed the DB."""
     if _OWNER_MARKER_RE.fullmatch(ownership_marker) is None:
         raise OpsError("restore ownership marker is invalid")
     target_name = _database_name(target_database_url)
     try:
         import psycopg
         with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
-            connection.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{ownership_marker}'")
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+                    (target_name,),
+                )
+                row = cursor.fetchone()
+                if row is None or row[0] not in {None, ownership_marker}:
+                    raise OpsError("restore database ownership marker changed during restore")
+                cursor.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{ownership_marker}'")
+    except OpsError:
+        raise
     except Exception as exc:
         raise OpsError("could not preserve restore database ownership marker") from exc
 
@@ -1243,6 +1718,11 @@ def cleanup_isolated_target(
             production_media_roots=production_media_roots,
             backup_root=backup_root,
         )
+        cleanup_stale_restore_staging(
+            restore_parent=parent,
+            target_media_root=target,
+            run_id=marker,
+        )
     except OpsError as exc:
         try:
             _mark_restore_failed(parent, target, poisoned=True)
@@ -1318,12 +1798,32 @@ def run_restore_check(
         if _read_owner_marker(parent, target) != ownership_marker:
             raise OpsError("restore ownership marker does not match this run")
         _assert_owned_database(target_database_url, ownership_marker)
+    stage_run_id = (
+        _restore_run_id(ownership_marker)
+        if isinstance(ownership_marker, str)
+        else uuid.uuid4().hex
+    )
+    if isinstance(ownership_marker, str):
+        cleanup_stale_restore_staging(
+            restore_parent=parent,
+            target_media_root=target,
+            run_id=stage_run_id,
+        )
     source_staging: Path | None = None
     completed = False
     smoke_account_created = False
     try:
-        staged, source_staging = stage_verified_generation(selected, parent, pg_restore=pg_restore)
-        restore_media(staged, target)
+        staged, source_staging = stage_verified_generation(
+            selected,
+            parent,
+            pg_restore=pg_restore,
+            target=target,
+            run_id=stage_run_id,
+        )
+        if test_only_target:
+            restore_media(staged, target)
+        else:
+            restore_media(staged, target, run_id=stage_run_id, restore_parent=parent)
         verify_restored_media(staged, target)
         restore_database(staged, target_database_url=target_database_url, pg_restore=pg_restore)
         if not test_only_target:

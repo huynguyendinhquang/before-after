@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
@@ -22,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
 import uuid
@@ -33,6 +35,10 @@ MANIFEST_NAME = "manifest.json"
 DATABASE_DUMP_NAME = "database.dump"
 MANIFEST_FORMAT_VERSION = 2
 POSTGRES_DUMP_MAGIC = b"PGDMP"
+_BACKUP_LOCK_NAME = ".backup.lock"
+_STAGING_OWNER_NAME = ".staging-owner.json"
+_STAGING_OWNER_FORMAT = "before-after.backup-staging.v1"
+_STAGING_RE = re.compile(r"^\.staging-([0-9a-f]{32})$")
 POSTGRES_CLIENTS = ("pg_dump", "pg_restore", "psql")
 _PG_ENV_QUERY_KEYS = {
     "application_name",
@@ -618,6 +624,8 @@ def _assert_media_snapshot_ready(source_root: Path) -> None:
                 raise OpsError("MEDIA_ROOT contains a symlink")
             if _is_recovery_marker(name):
                 _reject_recovery_marker(path)
+            if current_path == source_root and name not in MEDIA_DIRS:
+                raise OpsError("MEDIA_ROOT contains unmanaged content")
             _private_directory(path, create=False, media=True)
         for name in files:
             path = current_path / name
@@ -628,6 +636,8 @@ def _assert_media_snapshot_ready(source_root: Path) -> None:
                 continue
             if _is_recovery_marker(name):
                 _reject_recovery_marker(path)
+            if current_path == source_root:
+                raise OpsError("MEDIA_ROOT contains unmanaged content")
             _private_file(path, label="media source", media=True)
 
 
@@ -666,23 +676,104 @@ def _validate_generation_name(name: str) -> None:
         raise OpsError("backup generation name is invalid")
 
 
-def _cleanup_staging(root: Path) -> None:
-    """Remove unpublished staging trees; they are never restore candidates."""
+@contextmanager
+def _backup_operation_lock(root: Path) -> Iterator[None]:
+    """Serialize backup publication and explicitly requested stale cleanup."""
+    lock_path = root / _BACKUP_LOCK_NAME
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OpsError("backup operation lock is unsafe")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OpsError:
+        raise
+    except OSError as exc:
+        raise OpsError("could not acquire backup operation lock") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _staging_owner(staging: Path, run_id: str) -> None:
+    _write_json(
+        staging / _STAGING_OWNER_NAME,
+        {
+            "format": _STAGING_OWNER_FORMAT,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "created_ns": time.time_ns(),
+        },
+    )
+
+
+def _staging_is_stale(entry: Path, *, now: float, age_seconds: float) -> bool:
+    match = _STAGING_RE.fullmatch(entry.name)
+    if match is None or entry.is_symlink() or not entry.is_dir():
+        return False
+    try:
+        age = now - entry.stat().st_mtime
+        owner = entry / _STAGING_OWNER_NAME
+        _private_file(owner, label="backup staging owner marker")
+        value = json.loads(owner.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    return (
+        age >= age_seconds
+        and isinstance(value, dict)
+        and value.get("format") == _STAGING_OWNER_FORMAT
+        and value.get("run_id") == match.group(1)
+        and isinstance(value.get("pid"), int)
+        and not isinstance(value.get("pid"), bool)
+        and isinstance(value.get("created_ns"), int)
+        and not isinstance(value.get("created_ns"), bool)
+        and value["created_ns"] > 0
+        and value["created_ns"] / 1_000_000_000 <= now
+    )
+
+
+def _cleanup_staging_locked(root: Path, *, age_seconds: float, now: float | None = None) -> list[str]:
+    if isinstance(age_seconds, bool) or not isinstance(age_seconds, (int, float)) or age_seconds < 0:
+        raise OpsError("stale staging age must be non-negative")
     try:
         entries = list(root.iterdir())
     except OSError as exc:
         raise OpsError("could not list backup staging") from exc
+    removed: list[str] = []
+    current_time = time.time() if now is None else now
     for entry in entries:
-        if not entry.name.startswith(".staging-"):
+        if not _staging_is_stale(entry, now=current_time, age_seconds=float(age_seconds)):
             continue
         try:
-            if entry.is_symlink() or not entry.is_dir():
-                entry.unlink()
-            else:
-                shutil.rmtree(entry)
-        except OSError as exc:
+            _remove_private_path_strict(entry)
+        except OpsError as exc:
             raise OpsError("could not remove stale backup staging") from exc
-    _fsync_directory(root)
+        removed.append(entry.name)
+    if removed:
+        _fsync_directory(root)
+    return removed
+
+
+def cleanup_stale_staging(
+    backup_root: str | os.PathLike[str],
+    *,
+    age_seconds: float = 24 * 60 * 60,
+    now: float | None = None,
+) -> list[str]:
+    """Remove only old, owner-marked unpublished stages under the backup lock."""
+    root = _backup_root(_path(backup_root, "BACKUP_ROOT"))
+    with _backup_operation_lock(root):
+        return _cleanup_staging_locked(root, age_seconds=age_seconds, now=now)
 
 
 def _remove_private_path_strict(path: Path) -> None:
@@ -710,6 +801,14 @@ def _remove_private_path_strict(path: Path) -> None:
         os.chmod(path, 0o700)
         shutil.rmtree(path)
     except OSError as exc:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                diagnostic = path / ".cleanup-failed"
+                diagnostic.write_text("backup staging cleanup failed; manual removal required\n", encoding="ascii")
+                os.chmod(diagnostic, 0o600)
+                _fsync_directory(path)
+        except OSError:
+            pass
         raise OpsError("could not remove backup staging; staging is poisoned") from exc
 
 
@@ -745,14 +844,18 @@ def create_backup(
         if _storage_policy is None or (pg_dump, pg_restore, psql) == ("pg_dump", "pg_restore", "psql")
         else {"test_only": True}
     )
-    _cleanup_staging(destination_root)
-    generation = _generation_name()
-    _validate_generation_name(generation)
-    staging = destination_root / f".staging-{uuid.uuid4().hex}"
-    generation_path = destination_root / generation
+    operation_lock = _backup_operation_lock(destination_root)
+    operation_lock.__enter__()
+    staging: Path | None = None
     old_umask = os.umask(0o077)
     try:
+        _cleanup_staging_locked(destination_root, age_seconds=24 * 60 * 60)
+        generation = _generation_name()
+        _validate_generation_name(generation)
+        staging = destination_root / f".staging-{uuid.uuid4().hex}"
+        generation_path = destination_root / generation
         staging.mkdir(mode=0o700)
+        _staging_owner(staging, staging.name.removeprefix(".staging-"))
         _fsync_directory(destination_root)
         staging_media = staging / "media"
         media_entries = _copy_media(source, staging_media)
@@ -798,6 +901,10 @@ def create_backup(
         _write_json(staging / MANIFEST_NAME, manifest)
         _private_directory(staging, create=False)
         _private_file(staging / MANIFEST_NAME, label="backup manifest")
+        try:
+            (staging / _STAGING_OWNER_NAME).unlink()
+        except OSError as exc:
+            raise OpsError("could not finalize backup staging owner marker") from exc
         _fsync_directory(staging)
         if generation_path.exists() or os.path.lexists(generation_path):
             raise OpsError("backup generation collision")
@@ -813,13 +920,16 @@ def create_backup(
         raise OpsError("backup generation could not be published") from exc
     finally:
         os.umask(old_umask)
-        if staging.exists() or os.path.lexists(staging):
-            try:
-                _remove_private_path_strict(staging)
-            except OpsError as cleanup_exc:
-                raise OpsError(
-                    "backup failed and staging cleanup failed; clinical staging is poisoned"
-                ) from cleanup_exc
+        try:
+            if staging is not None and (staging.exists() or os.path.lexists(staging)):
+                try:
+                    _remove_private_path_strict(staging)
+                except OpsError as cleanup_exc:
+                    raise OpsError(
+                        "backup failed and staging cleanup failed; clinical staging is poisoned"
+                    ) from cleanup_exc
+        finally:
+            operation_lock.__exit__(None, None, None)
 
 
 def _generation_is_verified(generation: Path) -> bool:
@@ -835,7 +945,6 @@ def _generation_is_verified(generation: Path) -> bool:
 
 def generation_names(backup_root: str | os.PathLike[str]) -> list[str]:
     root = _backup_root(_path(backup_root, "BACKUP_ROOT"))
-    _cleanup_staging(root)
     result: list[str] = []
     try:
         entries = list(root.iterdir())
@@ -861,9 +970,14 @@ def prune_generations(
     verified = [name for name in names if _generation_is_verified(root / name)]
     newest_verified = verified[-1] if verified else None
     protected = _protected_generation if _protected_generation in verified else newest_verified
+    keep = set(verified[-retain:])
+    if protected is not None and protected not in keep:
+        if keep:
+            keep.remove(min(keep))
+        keep.add(protected)
     removed: list[str] = []
-    for name in names[:-retain]:
-        if name == protected or not _generation_is_verified(root / name):
+    for name in verified:
+        if name in keep:
             continue
         generation = root / name
         try:
