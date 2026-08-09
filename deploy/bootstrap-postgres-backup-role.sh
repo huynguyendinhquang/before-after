@@ -42,8 +42,8 @@ cleanup() {
     rm -f -- "$sql_file"
 }
 trap cleanup EXIT
-printf "ALTER ROLE before_after_backup PASSWORD '%s';\n" "$escaped_password" >"$sql_file"
-cat "$SQL_TEMPLATE" >>"$sql_file"
+cat "$SQL_TEMPLATE" >"$sql_file"
+printf "ALTER ROLE before_after_backup PASSWORD '%s';\n" "$escaped_password" >>"$sql_file"
 
 exec "$PSQL" --no-psqlrc --dbname "$DATABASE_NAME" \
     --set=ON_ERROR_STOP=1 --set=database_name="$DATABASE_NAME" --file "$sql_file"
