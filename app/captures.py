@@ -72,6 +72,10 @@ class ShotTypeError(ValueError):
     """Raised when an Admin Shot Type workflow cannot change state."""
 
 
+class ShotTypeConflict(ShotTypeError):
+    """Raised when a Shot Type changed before the requested transition."""
+
+
 @dataclass
 class PendingCapture:
     """A prepared Capture whose media still follows the caller's transaction."""
@@ -528,11 +532,12 @@ def promote_shot_type(
             select(ShotType)
             .where(ShotType.id == target_id)
             .with_for_update(of=ShotType)
+            .execution_options(populate_existing=True)
         )
         if promoted is None:
             raise ShotTypeError("Shot Type is unavailable")
         if promoted.state != "proposal" or promoted.canonical_target_id is not None:
-            raise ShotTypeError("only a Proposal can be promoted")
+            raise ShotTypeConflict("only a Proposal can be promoted")
         promoted.state = "canonical"
         append_audit(
             actor=actor,
@@ -1040,14 +1045,15 @@ def delete_route(capture_pk: int, patient_pk: int | None = None):
     capture = _lifecycle_capture(capture_pk)
     if patient_pk is not None and capture.patient_id != patient_pk:
         abort(404)
+    patient_id = capture.patient_id
     try:
         delete_capture(actor=current_user, capture=capture)
     except CaptureReferencedError as exc:
         flash(str(exc), "error")
         return _lifecycle_redirect(capture), 409
-    except (CaptureReconciliationError, CaptureDeleteReconciliationError) as exc:
+    except (CaptureReconciliationError, CaptureDeleteReconciliationError, StorageError) as exc:
         flash(str(exc), "error")
-        return _lifecycle_redirect(capture), 503
+        return redirect(url_for("captures.library", patient_pk=patient_id)), 503
     except CaptureError as exc:
         flash(str(exc), "error")
         return _lifecycle_redirect(capture), 400

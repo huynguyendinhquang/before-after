@@ -18,10 +18,12 @@ from app.audit import append_audit, bounded_audit_details
 from app.admin import FinalAdminError, list_audit_events, update_user
 from app.captures import (
     CaptureReferencedError,
+    ShotTypeConflict,
     archive_capture,
     create_capture,
     delete_capture,
     merge_shot_type,
+    promote_shot_type,
     ShotTypeError,
     unarchive_capture,
 )
@@ -40,7 +42,7 @@ from app.comparisons import (
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, ComparisonSet, Frame, Patient, ShotType, User
 from app.patients import search_patients
-from app.storage import ManagedStorage
+from app.storage import ManagedStorage, StorageError
 
 
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
@@ -219,7 +221,12 @@ def test_duplicate_copies_frame_configuration_and_capture_ids(app):
         source.version += 1
         db.session.commit()
 
-        duplicate = duplicate_comparison_set(actor=actor, comparison_set=source, name="Follow-up")
+        duplicate = duplicate_comparison_set(
+            actor=actor,
+            comparison_set=source,
+            name="Follow-up",
+            expected_version=source.version,
+        )
         assert duplicate.version == 1
         assert duplicate.lock_holder_id is None
         assert duplicate.lock_expires_at is None
@@ -246,6 +253,13 @@ def test_duplicate_requires_matching_expected_version(app):
         patient = db.session.get(Patient, patient_id)
         assert actor is not None and patient is not None
         source = create_comparison_set(actor=actor, patient=patient, name="History")
+        with pytest.raises(StaleVersionError):
+            duplicate_comparison_set(
+                actor=actor,
+                comparison_set=source,
+                name="Missing version copy",
+                expected_version=None,
+            )
         with pytest.raises(StaleVersionError):
             duplicate_comparison_set(
                 actor=actor,
@@ -289,6 +303,98 @@ def test_duplicate_refreshes_a_stale_set_before_locking(app):
                 expected_version=stale_version,
             )
         assert db.session.scalar(select(func.count(ComparisonSet.id))) == 1
+
+
+def test_duplicate_refreshes_preloaded_frame_rows_before_copying(app):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_ids = [
+        fixture_capture(app, editor_id, patient_id, shot_type_id, color)
+        for color in ("red", "blue")
+    ]
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        source = create_comparison_set(actor=actor, patient=patient, name="History")
+        db.session.add_all(
+            [
+                Frame(
+                    comparison_set_id=source.id,
+                    capture_id=capture_ids[0],
+                    position=0,
+                    visible=True,
+                    label="old first",
+                    zoom=1.0,
+                    pan_x=0.0,
+                    pan_y=0.0,
+                ),
+                Frame(
+                    comparison_set_id=source.id,
+                    capture_id=capture_ids[1],
+                    position=1,
+                    visible=True,
+                    label="old second",
+                    zoom=1.0,
+                    pan_x=0.0,
+                    pan_y=0.0,
+                ),
+            ]
+        )
+        source.version += 1
+        db.session.commit()
+        source = db.session.get(ComparisonSet, source.id)
+        assert source is not None
+        preloaded = list(source.frames)
+        assert [frame.label for frame in preloaded] == ["old first", "old second"]
+        stale_version = source.version
+        first_id, second_id = (frame.id for frame in preloaded)
+
+        other = db.session.session_factory()
+        try:
+            other.execute(
+                text("UPDATE frames SET position = position + 10 WHERE comparison_set_id = :set_id"),
+                {"set_id": source.id},
+            )
+            other.execute(
+                text(
+                    "UPDATE frames SET position = :position, label = :label, zoom = :zoom, "
+                    "pan_x = :pan_x, pan_y = :pan_y WHERE id = :id"
+                ),
+                {
+                    "id": first_id,
+                    "position": 1,
+                    "label": "new first",
+                    "zoom": 2.5,
+                    "pan_x": -0.5,
+                    "pan_y": 0.25,
+                },
+            )
+            other.execute(
+                text("UPDATE frames SET position = 0, label = 'new second' WHERE id = :id"),
+                {"id": second_id},
+            )
+            other.execute(
+                text("UPDATE comparison_sets SET version = version + 1 WHERE id = :id"),
+                {"id": source.id},
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        duplicate = duplicate_comparison_set(
+            actor=actor,
+            comparison_set=source,
+            name="Follow-up",
+            expected_version=stale_version + 1,
+        )
+        assert [frame.capture_id for frame in duplicate.frames] == [capture_ids[1], capture_ids[0]]
+        assert duplicate.frames[0].label == "new second"
+        assert duplicate.frames[1].label == "new first"
+        assert duplicate.frames[1].zoom == 2.5
+        assert duplicate.frames[1].pan_x == -0.5
+        assert duplicate.frames[1].pan_y == 0.25
 
 
 def test_archive_refreshes_stale_archive_state_before_auditing(app):
@@ -353,6 +459,44 @@ def test_merge_refreshes_stale_source_and_never_retargets_an_existing_merge(app)
 
         canonical = merge_shot_type(actor=actor, source_id=source_id, target_id=target_id)
         assert canonical.id == target_id
+
+
+def test_promote_refreshes_stale_proposal_and_route_returns_409(app):
+    admin_id = add_user(app, "admin", "admin")
+    proposal_id = fixture_shot_type(app, admin_id, "Proposal", state="proposal")
+    target_id = fixture_shot_type(app, admin_id, "Canonical")
+    with app.app_context():
+        actor = db.session.get(User, admin_id)
+        stale = db.session.get(ShotType, proposal_id)
+        assert actor is not None and stale is not None
+        other = db.session.session_factory()
+        try:
+            other.execute(
+                text(
+                    "UPDATE shot_types SET state = 'merged', canonical_target_id = :target "
+                    "WHERE id = :source"
+                ),
+                {"target": target_id, "source": proposal_id},
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        with pytest.raises(ShotTypeConflict, match="only a Proposal"):
+            promote_shot_type(actor=actor, shot_type=stale)
+        refreshed = db.session.get(ShotType, proposal_id)
+        assert refreshed is not None
+        assert refreshed.state == "merged"
+        assert refreshed.canonical_target_id == target_id
+
+    client = app.test_client()
+    login(client, "admin")
+    response = client.post(
+        f"/admin/shot-types/{proposal_id}/promote",
+        data={"csrf_token": csrf_token(client, "/admin/shot-types")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
 
 
 def test_duplicate_precheck_does_not_return_capture_deleted_concurrently(app, monkeypatch):
@@ -605,6 +749,101 @@ def test_capture_delete_commit_ambiguity_reconciles_media_safely(app, monkeypatc
     with pytest.raises(Exception):
         storage.resolve(original_key)
     assert not list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())
+
+
+def test_capture_delete_manifest_storage_failure_returns_503_and_preserves_state(app, monkeypatch):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, shot_type_id, "red")
+    with app.app_context():
+        capture = db.session.get(Capture, capture_id)
+        assert capture is not None
+        original_key = capture.storage_key
+        preview_key = ManagedStorage.preview_key(original_key)
+
+    def fail_manifest(_storage, _capture_id, _media_keys):
+        raise StorageError("manifest unavailable")
+
+    monkeypatch.setattr(ManagedStorage, "prepare_capture_quarantine", fail_manifest)
+    client = app.test_client()
+    login(client, "editor")
+    response = client.post(
+        f"/patients/{patient_id}/captures/{capture_id}/delete",
+        data={"csrf_token": csrf_token(client, f"/patients/{patient_id}/captures")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 503
+    with app.app_context():
+        assert db.session.get(Capture, capture_id) is not None
+    storage = ManagedStorage(app.config["MEDIA_ROOT"])
+    assert storage.resolve(original_key).is_file()
+    assert storage.resolve(preview_key).is_file()
+    assert not list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())
+
+
+def test_capture_delete_quarantine_failure_restores_media_and_row(app, monkeypatch):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, shot_type_id, "red")
+    with app.app_context():
+        capture = db.session.get(Capture, capture_id)
+        assert capture is not None
+        original_key = capture.storage_key
+        preview_key = ManagedStorage.preview_key(original_key)
+
+    original_quarantine = ManagedStorage.quarantine_capture
+
+    def fail_quarantine(storage, manifest):
+        original_quarantine(storage, manifest)
+        raise StorageError("quarantine unavailable")
+
+    monkeypatch.setattr(ManagedStorage, "quarantine_capture", fail_quarantine)
+    client = app.test_client()
+    login(client, "editor")
+    response = client.post(
+        f"/patients/{patient_id}/captures/{capture_id}/delete",
+        data={"csrf_token": csrf_token(client, f"/patients/{patient_id}/captures")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 503
+    with app.app_context():
+        assert db.session.get(Capture, capture_id) is not None
+    storage = ManagedStorage(app.config["MEDIA_ROOT"])
+    assert storage.resolve(original_key).is_file()
+    assert storage.resolve(preview_key).is_file()
+    assert not list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())
+
+
+def test_capture_delete_cleanup_failure_returns_503_with_reconciliation_truth(app, monkeypatch):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, shot_type_id, "red")
+    with app.app_context():
+        capture = db.session.get(Capture, capture_id)
+        assert capture is not None
+        original_key = capture.storage_key
+
+    def fail_finish(_storage, _manifest):
+        raise StorageError("quarantine cleanup unavailable")
+
+    monkeypatch.setattr(ManagedStorage, "finish_capture_quarantine", fail_finish)
+    client = app.test_client()
+    login(client, "editor")
+    response = client.post(
+        f"/patients/{patient_id}/captures/{capture_id}/delete",
+        data={"csrf_token": csrf_token(client, f"/patients/{patient_id}/captures")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 503
+    with app.app_context():
+        assert db.session.get(Capture, capture_id) is None
+    storage = ManagedStorage(app.config["MEDIA_ROOT"])
+    with pytest.raises(StorageError):
+        storage.resolve(original_key)
+    assert len(list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())) == 3
 
 
 def test_capture_delete_manifest_recovers_after_process_loss(app):

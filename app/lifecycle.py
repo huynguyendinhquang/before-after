@@ -57,7 +57,7 @@ def duplicate_comparison_set(
     comparison_set: ComparisonSet | int | None = None,
     set_id: int | None = None,
     name: str | None = None,
-    expected_version: object | None = None,
+    expected_version: object,
 ) -> ComparisonSet:
     """Duplicate a Set snapshot after checking its expected persisted version."""
     if actor is None or not actor.is_editor:
@@ -75,7 +75,7 @@ def duplicate_comparison_set(
         )
         if source is None or source.archived_at is not None:
             raise SetLifecycleError("Comparison Set is unavailable")
-        expected = source.version if expected_version is None else _version(expected_version)
+        expected = _version(expected_version)
         if source.version != expected:
             raise StaleVersionError("Set has changed; reload before duplicating")
         patient = _locked_patient(source.patient)
@@ -95,6 +95,7 @@ def duplicate_comparison_set(
                 .where(Frame.comparison_set_id == source.id)
                 .order_by(Frame.position, Frame.id)
                 .with_for_update(of=Frame)
+                .execution_options(populate_existing=True)
             )
         )
         duplicate = ComparisonSet(

@@ -22,7 +22,7 @@ from app.auth import (
     list_users,
     update_user,
 )
-from app.captures import ShotTypeError, merge_shot_type, promote_shot_type
+from app.captures import ShotTypeConflict, ShotTypeError, merge_shot_type, promote_shot_type
 from app.db import db
 from app.models import ShotType, User
 
@@ -176,6 +176,9 @@ def promote_shot_type_route(shot_type_pk: int):
         promote_shot_type(actor=current_user, shot_type_id=shot_type_pk)
     except PermissionError:
         abort(403)
+    except ShotTypeConflict as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("admin.shot_types")), 409
     except ShotTypeError as exc:
         flash(str(exc), "error")
         return redirect(url_for("admin.shot_types")), 400
