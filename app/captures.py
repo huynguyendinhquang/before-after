@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import unicodedata
 
-from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Blueprint, abort, current_app, flash, has_app_context, jsonify, redirect, render_template, request, send_file, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
 from sqlalchemy import func, inspect, select, update
@@ -17,12 +19,28 @@ from wtforms.validators import DataRequired, Length, ValidationError
 from app.audit import append_audit
 from app.auth import editor_required
 from app.db import db
-from app.image_policy import FORMAT_EXTENSIONS, mimetype_for_format, read_bounded
+from app.image_policy import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_PIXELS,
+    FORMAT_EXTENSIONS,
+    mimetype_for_format,
+    read_bounded,
+)
 from app.models import Capture, ComparisonSet, Frame, Patient, ShotType, User
 from app.storage import CaptureQuarantine, ImageInspection, ManagedStorage, StorageError, StoredMedia
 
 
 captures_bp = Blueprint("captures", __name__)
+
+
+# Batch upload is deliberately bounded to the existing single-upload byte
+# limit.  This keeps the stateless flow inside Flask's request budget while
+# still allowing multiple ordinary clinic images in one request.
+BATCH_MAX_ITEMS = 20
+BATCH_MAX_BYTES = DEFAULT_MAX_BYTES
+BATCH_MAX_PIXELS = DEFAULT_MAX_PIXELS * 4
+BATCH_MAX_REVIEW_BYTES = 64 * 1024
+BATCH_MAX_TEXT = 200
 
 
 def _strict_confirmation(form, field) -> None:
@@ -50,6 +68,26 @@ class CaptureForm(CaptureUploadForm):
 
 class CaptureError(ValueError):
     """Raised when a Capture cannot be accepted without changing state."""
+
+
+class BatchCaptureError(CaptureError):
+    """Raised when a reviewed batch cannot be committed as one unit."""
+
+
+class BatchValidationError(BatchCaptureError):
+    """Raised when one or more batch inputs fail validation."""
+
+    def __init__(self, message: str, *, items: list[dict[str, object]] | None = None) -> None:
+        super().__init__(message)
+        self.items = items or []
+
+
+class BatchLimitError(BatchValidationError):
+    """Raised when a batch exceeds an explicit request/resource budget."""
+
+
+class DuplicateCaptureError(BatchCaptureError):
+    """Raised when a batch contains content already in the Patient Library."""
 
 
 class ConsentRequired(CaptureError):
@@ -114,6 +152,179 @@ def _payload(upload: object) -> bytes:
         return read_bounded(stream)
     except ValueError as exc:
         raise CaptureError(str(exc)) from exc
+
+
+def _batch_limit(name: str, default: int) -> int:
+    config = current_app.config if has_app_context() else {}
+    value = config.get(name, default)
+    if isinstance(value, bool):
+        raise BatchCaptureError(f"{name} must be a positive integer")
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BatchCaptureError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise BatchCaptureError(f"{name} must be a positive integer")
+    return value
+
+
+def _batch_request_limit() -> int:
+    configured = current_app.config.get("CAPTURE_BATCH_MAX_REQUEST_BYTES")
+    if configured is None:
+        configured = current_app.config.get("MAX_CONTENT_LENGTH")
+    if configured is None:
+        configured = BATCH_MAX_BYTES + BATCH_MAX_REVIEW_BYTES
+    return _batch_limit("CAPTURE_BATCH_MAX_REQUEST_BYTES", int(configured))
+
+
+def _batch_inspect_uploads(
+    uploads: Sequence[object],
+    *,
+    patient_id: int | None = None,
+    storage: ManagedStorage | None = None,
+) -> tuple[list[tuple[bytes, ImageInspection]], list[dict[str, object]]]:
+    """Inspect every batch item without writing media or trusting client metadata."""
+    uploads = list(uploads)
+    max_items = _batch_limit("CAPTURE_BATCH_MAX_ITEMS", BATCH_MAX_ITEMS)
+    max_bytes = _batch_limit("CAPTURE_BATCH_MAX_BYTES", BATCH_MAX_BYTES)
+    max_pixels = _batch_limit("CAPTURE_BATCH_MAX_PIXELS", BATCH_MAX_PIXELS)
+    if not uploads:
+        raise BatchValidationError("at least one image is required")
+    if len(uploads) > max_items:
+        raise BatchLimitError(f"Batch contains too many images (maximum {max_items})")
+
+    managed = _storage(storage)
+    inspected: list[tuple[bytes, ImageInspection]] = []
+    items: list[dict[str, object]] = []
+    errors: list[int] = []
+    total_bytes = 0
+    total_pixels = 0
+    for index, upload in enumerate(uploads):
+        item: dict[str, object] = {"index": index, "ok": False}
+        try:
+            payload = _payload(upload)
+            inspection = managed.inspect(payload)
+            total_bytes += inspection.byte_count
+            total_pixels += inspection.width * inspection.height
+            inspected.append((payload, inspection))
+            item.update(
+                {
+                    "ok": True,
+                    "format": inspection.format,
+                    "width": inspection.width,
+                    "height": inspection.height,
+                    "suggested_capture_date": (
+                        inspection.suggested_capture_date.isoformat()
+                        if inspection.suggested_capture_date is not None
+                        else None
+                    ),
+                }
+            )
+        except (CaptureError, StorageError, ValueError) as exc:
+            item["error"] = str(exc)[:BATCH_MAX_TEXT]
+            errors.append(index)
+        items.append(item)
+
+    if errors:
+        raise BatchValidationError("One or more batch images failed inspection", items=items)
+    if total_bytes > max_bytes:
+        raise BatchLimitError("Batch images exceed the aggregate byte limit", items=items)
+    if total_pixels > max_pixels:
+        raise BatchLimitError("Batch images exceed the aggregate pixel limit", items=items)
+
+    hashes: dict[str, int] = {}
+    duplicate_indexes: set[int] = set()
+    for index, (_payload_value, inspection) in enumerate(inspected):
+        previous = hashes.get(inspection.sha256)
+        if previous is not None:
+            duplicate_indexes.update((previous, index))
+        else:
+            hashes[inspection.sha256] = index
+    if patient_id is not None and hashes:
+        existing = set(
+            db.session.scalars(
+                select(Capture.sha256).where(
+                    Capture.patient_id == patient_id,
+                    Capture.sha256.in_(hashes),
+                )
+            )
+        )
+        duplicate_indexes.update(hashes[digest] for digest in existing)
+    if duplicate_indexes:
+        for index in duplicate_indexes:
+            items[index]["ok"] = False
+            items[index]["error"] = "duplicate image content"
+        raise BatchValidationError("Batch contains duplicate image content", items=items)
+    return inspected, items
+
+
+def _batch_reviews(raw: object, item_count: int) -> list[dict[str, object]]:
+    """Validate reviewed fields and discard every non-authoritative client hint."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise BatchValidationError("reviewed batch fields are required")
+    try:
+        if len(raw.encode("utf-8")) > _batch_limit(
+            "CAPTURE_BATCH_MAX_REVIEW_BYTES", BATCH_MAX_REVIEW_BYTES
+        ):
+            raise BatchLimitError("reviewed batch fields exceed their size limit")
+        value = json.loads(raw)
+    except BatchLimitError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise BatchValidationError("reviewed batch fields are invalid") from exc
+    if not isinstance(value, list) or len(value) != item_count:
+        raise BatchValidationError("every batch image requires reviewed fields")
+
+    reviews: list[dict[str, object]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise BatchValidationError(f"Batch item {index + 1} review is invalid")
+        if item.get("capture_date_confirmed") is not True:
+            raise BatchValidationError(
+                f"Batch item {index + 1} Capture Date must be explicitly confirmed"
+            )
+        capture_date = item.get("capture_date")
+        try:
+            authoritative_date = _capture_date(capture_date)
+        except CaptureError as exc:
+            raise BatchValidationError(f"Batch item {index + 1}: {exc}") from exc
+
+        shot_type_id = item.get("shot_type_id")
+        if isinstance(shot_type_id, str) and shot_type_id.strip():
+            try:
+                shot_type_id = int(shot_type_id.strip())
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise BatchValidationError(f"Batch item {index + 1} Shot Type is invalid") from exc
+        if isinstance(shot_type_id, bool) or (
+            shot_type_id is not None
+            and (not isinstance(shot_type_id, int) or shot_type_id <= 0)
+        ):
+            raise BatchValidationError(f"Batch item {index + 1} Shot Type is invalid")
+
+        shot_type_name = item.get("shot_type_name")
+        if shot_type_name is not None:
+            if not isinstance(shot_type_name, str) or len(shot_type_name) > BATCH_MAX_TEXT:
+                raise BatchValidationError(f"Batch item {index + 1} Shot Type is invalid")
+            shot_type_name = shot_type_name.strip()
+        if shot_type_id is None and not shot_type_name:
+            raise BatchValidationError(f"Batch item {index + 1} Shot Type review is required")
+
+        reviewed = item.get("shot_type_reviewed", item.get("shot_type_confirmed", True))
+        if reviewed is not True:
+            raise BatchValidationError(f"Batch item {index + 1} Shot Type review is required")
+        create_proposal = item.get("create_proposal", False)
+        if not isinstance(create_proposal, bool):
+            raise BatchValidationError(f"Batch item {index + 1} Proposal flag is invalid")
+        reviews.append(
+            {
+                "capture_date": authoritative_date,
+                "capture_date_confirmed": True,
+                "shot_type_id": shot_type_id,
+                "shot_type_name": shot_type_name,
+                "create_proposal": create_proposal,
+            }
+        )
+    return reviews
 
 
 def _capture_date(value: date | str | None) -> date:
@@ -338,6 +549,7 @@ def prepare_capture(
     original_filename: str | None = None,
     storage: ManagedStorage | None = None,
     inspection: ImageInspection | None = None,
+    reject_duplicate: bool = False,
 ) -> PendingCapture:
     """Prepare one Capture while leaving commit ownership with the caller."""
     if not actor.is_editor:
@@ -356,6 +568,8 @@ def prepare_capture(
         inspection = managed.inspect(payload)
     duplicate = _existing_capture(patient_id, inspection.sha256)
     if duplicate is not None:
+        if reject_duplicate:
+            raise DuplicateCaptureError("duplicate image content")
         return PendingCapture(duplicate, managed, None)
 
     stored = None
@@ -397,6 +611,8 @@ def prepare_capture(
                 ) from exc
             if committed is not None:
                 _settle_committed_attempt(managed, stored, committed)
+                if reject_duplicate:
+                    raise DuplicateCaptureError("duplicate image content")
                 return PendingCapture(committed, managed, None)
             raise
         append_audit(
@@ -473,6 +689,160 @@ def create_capture(
         raise
     pending.finalize()
     return pending.capture
+
+
+def _coerce_batch_reviews(reviews: object, item_count: int) -> list[dict[str, object]]:
+    if isinstance(reviews, str):
+        return _batch_reviews(reviews, item_count)
+    if not isinstance(reviews, Sequence) or isinstance(reviews, (bytes, bytearray)):
+        raise BatchValidationError("reviewed batch fields are required")
+    serializable: list[dict[str, object]] = []
+    for item in reviews:
+        if not isinstance(item, Mapping):
+            raise BatchValidationError("reviewed batch fields are invalid")
+        copied = dict(item)
+        capture_date = copied.get("capture_date")
+        if isinstance(capture_date, datetime):
+            copied["capture_date"] = capture_date.date().isoformat()
+        elif isinstance(capture_date, date):
+            copied["capture_date"] = capture_date.isoformat()
+        serializable.append(copied)
+    try:
+        encoded = json.dumps(serializable, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise BatchValidationError("reviewed batch fields are invalid") from exc
+    return _batch_reviews(encoded, item_count)
+
+
+def _reconcile_batch(
+    patient_id: int,
+    pending: Sequence[PendingCapture],
+) -> list[Capture]:
+    """Find the outcome of one ambiguous batch commit in a fresh session."""
+    db.session.rollback()
+    session = db.session.session_factory()
+    try:
+        committed: list[Capture] = []
+        for attempt in pending:
+            capture_id = attempt.capture.id
+            if isinstance(capture_id, bool) or not isinstance(capture_id, int):
+                continue
+            candidate = session.scalar(select(Capture).where(Capture.id == capture_id))
+            if (
+                candidate is not None
+                and candidate.patient_id == patient_id
+                and candidate.sha256 == attempt.capture.sha256
+                and candidate.storage_key == attempt.capture.storage_key
+            ):
+                committed.append(candidate)
+        if not committed:
+            return []
+        if len(committed) != len(pending):
+            raise CaptureReconciliationError(
+                "Batch save status could not be confirmed; pending media was preserved for reconciliation"
+            )
+        for capture in committed:
+            session.expunge(capture)
+        return committed
+    except CaptureReconciliationError:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def create_batch_captures(
+    *,
+    actor: User,
+    patient: Patient,
+    uploads: Sequence[object],
+    reviews: object,
+    original_filenames: Sequence[str | None] | None = None,
+    storage: ManagedStorage | None = None,
+) -> list[Capture]:
+    """Revalidate and commit a reviewed batch in one DB transaction."""
+    if not actor.is_editor:
+        raise PermissionError("only an Editor or Admin can create Captures")
+    uploads = list(uploads)
+    reviewed = _coerce_batch_reviews(reviews, len(uploads))
+    patient = _current_patient(patient)
+    managed = _storage(storage)
+    if original_filenames is None:
+        original_filenames = [getattr(upload, "filename", None) for upload in uploads]
+    else:
+        original_filenames = list(original_filenames)
+    if len(original_filenames) != len(uploads):
+        raise BatchValidationError("batch filenames are invalid")
+
+    pending: list[PendingCapture] = []
+    commit_attempted = False
+    try:
+        # This is the commit-time inspection.  Nothing from the earlier
+        # inspection request is accepted as authoritative or reused.
+        inspected, _items = _batch_inspect_uploads(
+            uploads,
+            patient_id=patient.id,
+            storage=managed,
+        )
+        for index, ((payload, inspection), review) in enumerate(zip(inspected, reviewed)):
+            pending.append(
+                prepare_capture(
+                    actor=actor,
+                    patient=patient,
+                    upload=payload,
+                    capture_date=review["capture_date"],
+                    capture_date_confirmed=review["capture_date_confirmed"],
+                    shot_type_id=review["shot_type_id"],
+                    shot_type_name=review["shot_type_name"],
+                    create_proposal=review["create_proposal"],
+                    original_filename=original_filenames[index],
+                    storage=managed,
+                    inspection=inspection,
+                    reject_duplicate=True,
+                )
+            )
+        commit_attempted = True
+        db.session.commit()
+    except CaptureReconciliationError:
+        db.session.rollback()
+        for attempt in pending:
+            attempt.preserve()
+        raise
+    except Exception as exc:
+        db.session.rollback()
+        if not commit_attempted:
+            for attempt in pending:
+                attempt.discard()
+            raise
+        try:
+            committed = _reconcile_batch(patient.id, pending)
+        except Exception as reconciliation_exc:
+            for attempt in pending:
+                attempt.preserve()
+            if isinstance(reconciliation_exc, CaptureReconciliationError):
+                raise
+            raise CaptureReconciliationError(
+                "Batch save status could not be confirmed; pending media was preserved for reconciliation"
+            ) from reconciliation_exc
+        if committed:
+            for attempt, capture in zip(pending, committed):
+                attempt.settle(capture)
+            return committed
+        for attempt in pending:
+            attempt.discard()
+        raise exc
+
+    for attempt in pending:
+        try:
+            attempt.finalize()
+        except StorageError:
+            # The committed row is authoritative; the pending marker keeps
+            # cleanup recoverable if finalization itself is interrupted.
+            attempt.preserve()
+    return [attempt.capture for attempt in pending]
 
 
 def _database_now() -> datetime:
@@ -897,6 +1267,99 @@ def new(patient_pk: int):
         form=form,
         suggested_date=suggested_date,
     ), status
+
+
+def _batch_files() -> list[object]:
+    files = list(request.files.getlist("images"))
+    if not files:
+        files = list(request.files.getlist("image"))
+    return files
+
+
+def _batch_request_is_too_large() -> bool:
+    length = request.content_length
+    return (
+        isinstance(length, int)
+        and length >= 0
+        and length > _batch_request_limit()
+    )
+
+
+@captures_bp.get("/patients/<int:patient_pk>/captures/batch")
+@editor_required
+def batch_form(patient_pk: int):
+    patient = _active_patient(patient_pk)
+    return render_template(
+        "captures/batch.html",
+        patient=patient,
+        batch_max_items=_batch_limit("CAPTURE_BATCH_MAX_ITEMS", BATCH_MAX_ITEMS),
+        batch_max_bytes=_batch_limit("CAPTURE_BATCH_MAX_BYTES", BATCH_MAX_BYTES),
+    )
+
+
+@captures_bp.post("/patients/<int:patient_pk>/captures/batch/inspect")
+@editor_required
+def inspect_batch_upload(patient_pk: int):
+    patient = _active_patient(patient_pk)
+    if patient.consent_confirmed_at is None:
+        return jsonify(error="Consent Confirmation is required before storing images"), 400
+    try:
+        if _batch_request_is_too_large():
+            return jsonify(error="Batch request exceeds its byte limit"), 413
+        _inspected, items = _batch_inspect_uploads(
+            _batch_files(),
+            patient_id=patient.id,
+        )
+    except BatchLimitError as exc:
+        return jsonify(error=str(exc), items=exc.items), 413
+    except BatchValidationError as exc:
+        db.session.rollback()
+        return jsonify(error=str(exc), items=exc.items), 400
+    except (CaptureError, StorageError, ValueError) as exc:
+        db.session.rollback()
+        return jsonify(error=str(exc)), 400
+    return jsonify(items=items, max_items=_batch_limit("CAPTURE_BATCH_MAX_ITEMS", BATCH_MAX_ITEMS))
+
+
+@captures_bp.post("/patients/<int:patient_pk>/captures/batch/commit")
+@captures_bp.post("/patients/<int:patient_pk>/captures/batch")
+@editor_required
+def commit_batch_upload(patient_pk: int):
+    patient = _active_patient(patient_pk)
+    try:
+        if _batch_request_is_too_large():
+            return jsonify(error="Batch request exceeds its byte limit"), 413
+        files = _batch_files()
+        review = request.form.get("review_json")
+        if review is None:
+            review = request.form.get("review", request.form.get("reviews"))
+        captures = create_batch_captures(
+            actor=current_user,
+            patient=patient,
+            uploads=files,
+            reviews=review,
+            original_filenames=[getattr(upload, "filename", None) for upload in files],
+        )
+    except CaptureReconciliationError as exc:
+        return jsonify(error=str(exc)), 503
+    except BatchLimitError as exc:
+        return jsonify(error=str(exc), items=exc.items), 413
+    except DuplicateCaptureError as exc:
+        return jsonify(error=str(exc)), 409
+    except BatchValidationError as exc:
+        return jsonify(error=str(exc), items=exc.items), 400
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify(error="Batch could not be committed"), 409
+    except (ConsentRequired, CaptureError, StorageError, ValueError) as exc:
+        db.session.rollback()
+        return jsonify(error=str(exc)), 400
+    except Exception:
+        # Keep database/storage failure details out of the response and logs;
+        # create_batch_captures has already cleaned or preserved pending media.
+        db.session.rollback()
+        return jsonify(error="Batch could not be committed"), 503
+    return jsonify(capture_ids=[capture.id for capture in captures], count=len(captures))
 
 
 @captures_bp.post("/patients/<int:patient_pk>/captures/inspect")

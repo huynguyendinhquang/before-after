@@ -6,6 +6,7 @@
     <h1>Capture Library — {{ patient.patient_id }}</h1>
     {% if current_user.is_editor %}
       <span><a class="button" href="{{ url_for('captures.new', patient_pk=patient.id) }}">Add Capture</a>
+      <a class="button" href="{{ url_for('captures.batch_form', patient_pk=patient.id) }}">Batch upload</a>
       {% if include_archived %}<a class="button" href="{{ url_for('captures.library', patient_pk=patient.id) }}">Active only</a>
       {% else %}<a class="button" href="{{ url_for('captures.library', patient_pk=patient.id, archived=1) }}">Show archived</a>{% endif %}</span>
     {% endif %}
