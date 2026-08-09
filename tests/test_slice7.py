@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,11 +15,12 @@ import pytest
 from PIL import Image
 from sqlalchemy import create_engine, func, select, text
 
+from app import captures as captures_module
 from app import create_app
-from app.captures import ConsentRequired, create_batch_captures, create_capture
+from app.captures import BatchLimitError, ConsentRequired, create_batch_captures, create_capture
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, Patient, ShotType, User
-from app.storage import ManagedStorage
+from app.storage import ImageInspection, ManagedStorage
 
 
 CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
@@ -165,13 +167,30 @@ def animated_webp() -> bytes:
     return stream.getvalue()
 
 
-def batch_data(payloads: list[bytes], reviews: list[dict[str, object]], token: str):
-    data: dict[str, object] = {
+def complete_reviews(payloads: list[bytes], reviews: list[dict[str, object]]) -> list[dict[str, object]]:
+    assert len(payloads) == len(reviews)
+    completed: list[dict[str, object]] = []
+    for payload, review in zip(payloads, reviews):
+        item = dict(review)
+        item.setdefault("shot_type_reviewed", True)
+        item.setdefault("sha256", hashlib.sha256(payload).hexdigest())
+        completed.append(item)
+    return completed
+
+
+def raw_batch_data(payloads: list[bytes], reviews: list[dict[str, object]], token: str):
+    return {
         "review_json": json.dumps(reviews),
         "csrf_token": token,
-        "images": [(io.BytesIO(payload), f"client-last-modified-2099-{index}.jpg") for index, payload in enumerate(payloads)],
+        "images": [
+            (io.BytesIO(payload), f"client-last-modified-2099-{index}.jpg")
+            for index, payload in enumerate(payloads)
+        ],
     }
-    return data
+
+
+def batch_data(payloads: list[bytes], reviews: list[dict[str, object]], token: str):
+    return raw_batch_data(payloads, complete_reviews(payloads, reviews), token)
 
 
 def test_batch_inspection_is_server_side_and_picker_drop_share_review_flow(app):
@@ -195,6 +214,7 @@ def test_batch_inspection_is_server_side_and_picker_drop_share_review_flow(app):
     )
     assert response.status_code == 200
     assert response.json["items"][0]["suggested_capture_date"] == "2024-03-04"
+    assert response.json["items"][0]["sha256"] == hashlib.sha256(payload).hexdigest()
     media = Path(app.config["MEDIA_ROOT"])
     assert list((media / "originals").iterdir()) == []
     assert list((media / "previews").iterdir()) == []
@@ -291,6 +311,137 @@ def test_fully_reviewed_batch_creates_one_capture_and_audit_per_image(app):
         hashlib.sha256(payload).hexdigest() for payload in payloads
     ]
     assert list((Path(app.config["MEDIA_ROOT"]) / "quarantine").glob(".pending-*")) == []
+
+
+@pytest.mark.parametrize("reviewed_value", [None, False, "true"])
+def test_shot_type_review_flag_is_explicit_boolean_true(app, reviewed_value):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    fixture_shot_type(app, editor_id)
+    payload = jpeg("red")
+    review = {
+        "capture_date": "2025-01-01",
+        "capture_date_confirmed": True,
+        "shot_type_name": "Anterior",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    if reviewed_value is not None:
+        review["shot_type_reviewed"] = reviewed_value
+    client = app.test_client()
+    login(client, "editor")
+    token = csrf_token(client, f"/patients/{patient_id}/captures/batch")
+    response = client.post(
+        f"/patients/{patient_id}/captures/batch/commit",
+        data=raw_batch_data([payload], [review], token),
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 400
+    with app.app_context():
+        assert db.session.scalar(select(func.count(Capture.id))) == 0
+
+
+def test_batch_content_hash_binding_rejects_tampered_extra_and_duplicate_reviews(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    fixture_shot_type(app, editor_id)
+    payloads = [jpeg("red"), png("blue")]
+    reviews = complete_reviews(
+        payloads,
+        [
+            {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+            {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+        ],
+    )
+    missing_hash = dict(reviews[0])
+    missing_hash.pop("sha256")
+    cases = [
+        ([jpeg("green"), payloads[1]], reviews),
+        (payloads, [missing_hash, reviews[1]]),
+        (payloads, [{**reviews[0], "sha256": "0" * 64}, reviews[1]]),
+        (payloads, [reviews[0], {**reviews[1], "sha256": reviews[0]["sha256"]}]),
+    ]
+    client = app.test_client()
+    login(client, "editor")
+    token = csrf_token(client, f"/patients/{patient_id}/captures/batch")
+    for case_payloads, case_reviews in cases:
+        response = client.post(
+            f"/patients/{patient_id}/captures/batch/commit",
+            data=raw_batch_data(case_payloads, case_reviews, token),
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 400, response.get_data(as_text=True)
+    with app.app_context():
+        assert db.session.scalar(select(func.count(Capture.id))) == 0
+
+
+def test_batch_hash_binding_allows_reversed_file_order_without_swapping_review_metadata(app):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    fixture_shot_type(app, editor_id)
+    payloads = [jpeg("red"), png("blue")]
+    reviews = complete_reviews(
+        payloads,
+        [
+            {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+            {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+        ],
+    )
+    client = app.test_client()
+    login(client, "editor")
+    token = csrf_token(client, f"/patients/{patient_id}/captures/batch")
+    response = client.post(
+        f"/patients/{patient_id}/captures/batch/commit",
+        data=raw_batch_data([payloads[1], payloads[0]], reviews, token),
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    expected_dates = {
+        hashlib.sha256(payloads[0]).hexdigest(): "2025-01-01",
+        hashlib.sha256(payloads[1]).hexdigest(): "2025-01-02",
+    }
+    with app.app_context():
+        captures = list(db.session.scalars(select(Capture)))
+        assert {capture.sha256: capture.capture_date.isoformat() for capture in captures} == expected_dates
+
+
+def test_batch_aggregate_limits_stop_reading_and_decoding_after_failing_item(app, monkeypatch):
+    reads: list[bytes] = []
+    inspections: list[bytes] = []
+
+    def payload(upload: object) -> bytes:
+        reads.append(upload)
+        return upload  # type: ignore[return-value]
+
+    class FakeStorage:
+        def inspect(self, value: bytes) -> ImageInspection:
+            inspections.append(value)
+            return ImageInspection(
+                format="JPEG",
+                width=2,
+                height=2,
+                byte_count=len(value),
+                sha256=hashlib.sha256(value).hexdigest(),
+                suggested_capture_date=None,
+                preview_bytes=b"preview",
+            )
+
+    monkeypatch.setattr(captures_module, "_payload", payload)
+    with app.app_context():
+        app.config["CAPTURE_BATCH_MAX_BYTES"] = 3
+        with pytest.raises(BatchLimitError):
+            captures_module._batch_inspect_uploads([b"aa", b"bb", b"cc"], storage=FakeStorage())
+    assert reads == [b"aa", b"bb"]
+    assert inspections == [b"aa"]
+
+    reads.clear()
+    inspections.clear()
+    with app.app_context():
+        app.config["CAPTURE_BATCH_MAX_BYTES"] = 100
+        app.config["CAPTURE_BATCH_MAX_PIXELS"] = 4
+        with pytest.raises(BatchLimitError):
+            captures_module._batch_inspect_uploads([b"aa", b"bb", b"cc"], storage=FakeStorage())
+    assert reads == [b"aa", b"bb"]
+    assert inspections == [b"aa", b"bb"]
 
 
 @pytest.mark.parametrize("bad_payload", [b"not an image", animated_webp()])
@@ -416,13 +567,16 @@ def test_batch_requires_consent_and_both_mutations_are_csrf_protected(app):
                 actor=actor,
                 patient=no_consent,
                 uploads=[payload],
-                reviews=[
-                    {
-                        "capture_date": "2025-01-01",
-                        "capture_date_confirmed": True,
-                        "shot_type_name": "Anterior",
-                    }
-                ],
+                reviews=complete_reviews(
+                    [payload],
+                    [
+                        {
+                            "capture_date": "2025-01-01",
+                            "capture_date_confirmed": True,
+                            "shot_type_name": "Anterior",
+                        }
+                    ],
+                ),
             )
 
     viewer = app.test_client()
@@ -451,10 +605,13 @@ def test_transaction_failure_cleans_every_new_media_and_row(app, monkeypatch: py
                 actor=actor,
                 patient=patient,
                 uploads=payloads,
-                reviews=[
-                    {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
-                    {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
-                ],
+                reviews=complete_reviews(
+                    payloads,
+                    [
+                        {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+                        {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+                    ],
+                ),
             )
         assert db.session.scalar(select(func.count(Capture.id))) == 0
     media = Path(app.config["MEDIA_ROOT"])
@@ -483,10 +640,13 @@ def test_commit_acknowledgement_ambiguity_reconciles_all_batch_media(app, monkey
             actor=actor,
             patient=patient,
             uploads=payloads,
-            reviews=[
-                {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
-                {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
-            ],
+            reviews=complete_reviews(
+                payloads,
+                [
+                    {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+                    {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_name": "Anterior"},
+                ],
+            ),
         )
         assert len(captures) == 2
         assert db.session.scalar(select(func.count(Capture.id))) == 2
@@ -494,3 +654,69 @@ def test_commit_acknowledgement_ambiguity_reconciles_all_batch_media(app, monkey
     assert len(list((media / "originals").iterdir())) == 2
     assert len(list((media / "previews").iterdir())) == 2
     assert list((media / "quarantine").glob(".pending-*")) == []
+
+
+def test_batch_shot_type_locks_are_deterministic_under_postgresql_concurrency(app, monkeypatch):
+    editor_id = add_user(app, "editor")
+    patient_id = fixture_patient(app, editor_id)
+    low_id = fixture_shot_type(app, editor_id, "Anterior")
+    high_id = fixture_shot_type(app, editor_id, "Lateral")
+    first_payloads = [jpeg("red"), png("blue")]
+    second_payloads = [jpeg("green"), png("yellow")]
+    first_reviews = complete_reviews(
+        first_payloads,
+        [
+            {"capture_date": "2025-01-01", "capture_date_confirmed": True, "shot_type_id": low_id},
+            {"capture_date": "2025-01-02", "capture_date_confirmed": True, "shot_type_id": high_id},
+        ],
+    )
+    second_reviews = complete_reviews(
+        second_payloads,
+        [
+            {"capture_date": "2025-02-01", "capture_date_confirmed": True, "shot_type_id": high_id},
+            {"capture_date": "2025-02-02", "capture_date_confirmed": True, "shot_type_id": low_id},
+        ],
+    )
+    barrier = threading.Barrier(2)
+    original_resolve = captures_module._batch_shot_type_resolutions
+
+    def synchronized_resolve(**kwargs):
+        barrier.wait(timeout=10)
+        return original_resolve(**kwargs)
+
+    monkeypatch.setattr(captures_module, "_batch_shot_type_resolutions", synchronized_resolve)
+    errors: list[BaseException] = []
+    counts: list[int] = []
+
+    def worker(payloads, reviews):
+        with app.app_context():
+            try:
+                actor = db.session.get(User, editor_id)
+                patient = db.session.get(Patient, patient_id)
+                assert actor is not None and patient is not None
+                counts.append(
+                    len(
+                        create_batch_captures(
+                            actor=actor,
+                            patient=patient,
+                            uploads=payloads,
+                            reviews=reviews,
+                        )
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(first_payloads, first_reviews)),
+        threading.Thread(target=worker, args=(second_payloads, second_reviews)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "batch Shot Type lock ordering deadlocked"
+    assert errors == []
+    assert counts == [2, 2]
+    with app.app_context():
+        assert db.session.scalar(select(func.count(Capture.id))) == 4

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-import unicodedata
 
 from flask import Blueprint, abort, current_app, flash, has_app_context, jsonify, redirect, render_template, request, send_file, url_for
 from flask_login import current_user, login_required
@@ -41,6 +43,7 @@ BATCH_MAX_BYTES = DEFAULT_MAX_BYTES
 BATCH_MAX_PIXELS = DEFAULT_MAX_PIXELS * 4
 BATCH_MAX_REVIEW_BYTES = 64 * 1024
 BATCH_MAX_TEXT = 200
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _strict_confirmation(form, field) -> None:
@@ -203,16 +206,31 @@ def _batch_inspect_uploads(
         item: dict[str, object] = {"index": index, "ok": False}
         try:
             payload = _payload(upload)
+        except (CaptureError, StorageError, ValueError) as exc:
+            item["error"] = str(exc)[:BATCH_MAX_TEXT]
+            errors.append(index)
+            items.append(item)
+            continue
+
+        total_bytes += len(payload)
+        if total_bytes > max_bytes:
+            item["error"] = "Batch images exceed the aggregate byte limit"
+            items.append(item)
+            raise BatchLimitError(item["error"], items=items)
+
+        try:
             inspection = managed.inspect(payload)
-            total_bytes += inspection.byte_count
+            payload_sha256 = hashlib.sha256(payload).hexdigest()
+            if inspection.sha256 != payload_sha256:
+                raise StorageError("image inspection does not match payload")
             total_pixels += inspection.width * inspection.height
-            inspected.append((payload, inspection))
             item.update(
                 {
                     "ok": True,
                     "format": inspection.format,
                     "width": inspection.width,
                     "height": inspection.height,
+                    "sha256": payload_sha256,
                     "suggested_capture_date": (
                         inspection.suggested_capture_date.isoformat()
                         if inspection.suggested_capture_date is not None
@@ -223,14 +241,17 @@ def _batch_inspect_uploads(
         except (CaptureError, StorageError, ValueError) as exc:
             item["error"] = str(exc)[:BATCH_MAX_TEXT]
             errors.append(index)
+            items.append(item)
+            continue
+
         items.append(item)
+        inspected.append((payload, inspection))
+        if total_pixels > max_pixels:
+            item["error"] = "Batch images exceed the aggregate pixel limit"
+            raise BatchLimitError(item["error"], items=items)
 
     if errors:
         raise BatchValidationError("One or more batch images failed inspection", items=items)
-    if total_bytes > max_bytes:
-        raise BatchLimitError("Batch images exceed the aggregate byte limit", items=items)
-    if total_pixels > max_pixels:
-        raise BatchLimitError("Batch images exceed the aggregate pixel limit", items=items)
 
     hashes: dict[str, int] = {}
     duplicate_indexes: set[int] = set()
@@ -309,9 +330,11 @@ def _batch_reviews(raw: object, item_count: int) -> list[dict[str, object]]:
         if shot_type_id is None and not shot_type_name:
             raise BatchValidationError(f"Batch item {index + 1} Shot Type review is required")
 
-        reviewed = item.get("shot_type_reviewed", item.get("shot_type_confirmed", True))
-        if reviewed is not True:
+        if "shot_type_reviewed" not in item or item["shot_type_reviewed"] is not True:
             raise BatchValidationError(f"Batch item {index + 1} Shot Type review is required")
+        content_sha256 = item.get("sha256")
+        if not isinstance(content_sha256, str) or _SHA256_RE.fullmatch(content_sha256) is None:
+            raise BatchValidationError(f"Batch item {index + 1} content hash is invalid")
         create_proposal = item.get("create_proposal", False)
         if not isinstance(create_proposal, bool):
             raise BatchValidationError(f"Batch item {index + 1} Proposal flag is invalid")
@@ -322,6 +345,7 @@ def _batch_reviews(raw: object, item_count: int) -> list[dict[str, object]]:
                 "shot_type_id": shot_type_id,
                 "shot_type_name": shot_type_name,
                 "create_proposal": create_proposal,
+                "sha256": content_sha256,
             }
         )
     return reviews
@@ -550,6 +574,7 @@ def prepare_capture(
     storage: ManagedStorage | None = None,
     inspection: ImageInspection | None = None,
     reject_duplicate: bool = False,
+    resolved_shot_type: ShotType | None = None,
 ) -> PendingCapture:
     """Prepare one Capture while leaving commit ownership with the caller."""
     if not actor.is_editor:
@@ -574,15 +599,19 @@ def prepare_capture(
 
     stored = None
     try:
-        selected_shot_type = _shot_type(
-            actor=actor,
-            shot_type=shot_type,
-            shot_type_id=shot_type_id,
-            shot_type_name=shot_type_name,
-            create_proposal=create_proposal,
-        )
+        if resolved_shot_type is None:
+            selected_shot_type = _shot_type(
+                actor=actor,
+                shot_type=shot_type,
+                shot_type_id=shot_type_id,
+                shot_type_name=shot_type_name,
+                create_proposal=create_proposal,
+            )
+        else:
+            selected_shot_type = resolved_shot_type
         stored = managed.store(payload, inspection)
-        selected_shot_type = _locked_shot_type(selected_shot_type)
+        if resolved_shot_type is None:
+            selected_shot_type = _locked_shot_type(selected_shot_type)
         capture = Capture(
             patient_id=patient_id,
             capture_date=authoritative_date,
@@ -714,6 +743,79 @@ def _coerce_batch_reviews(reviews: object, item_count: int) -> list[dict[str, ob
     return _batch_reviews(encoded, item_count)
 
 
+class _BatchShotTypeRetry(Exception):
+    """The vocabulary changed before all batch Shot Type rows were locked."""
+
+
+def _batch_review_bindings(
+    inspected: Sequence[tuple[bytes, ImageInspection]],
+    reviewed: Sequence[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    actual_hashes = {inspection.sha256 for _payload_value, inspection in inspected}
+    bindings: dict[str, dict[str, object]] = {}
+    for review in reviewed:
+        content_sha256 = review["sha256"]
+        if content_sha256 in bindings:
+            raise BatchValidationError("reviewed batch fields contain duplicate content bindings")
+        bindings[content_sha256] = review
+    if set(bindings) != actual_hashes:
+        raise BatchValidationError("reviewed batch fields do not match inspected image content")
+    return bindings
+
+
+def _batch_shot_type_resolutions(
+    *,
+    actor: User,
+    reviewed: Sequence[dict[str, object]],
+) -> dict[str, ShotType]:
+    """Resolve and lock every batch Shot Type before storing any Capture media."""
+    selections: list[tuple[int | None, int, str]] = []
+    lock_ids: set[int] = set()
+    for review in reviewed:
+        requested_id = review["shot_type_id"]
+        selected = _shot_type(
+            actor=actor,
+            shot_type=None,
+            shot_type_id=requested_id,
+            shot_type_name=review["shot_type_name"],
+            create_proposal=review["create_proposal"],
+        )
+        if requested_id is not None:
+            lock_ids.add(requested_id)
+        lock_ids.add(selected.id)
+        if selected.canonical_target_id is not None:
+            lock_ids.add(selected.canonical_target_id)
+        selections.append((requested_id, selected.id, review["sha256"]))
+
+    locked: dict[int, ShotType] = {}
+    for shot_type_id in sorted(lock_ids):
+        row = db.session.scalar(
+            select(ShotType)
+            .where(ShotType.id == shot_type_id)
+            .with_for_update(of=ShotType)
+            .execution_options(populate_existing=True)
+        )
+        if row is None:
+            raise BatchValidationError("Shot Type is unavailable")
+        locked[row.id] = row
+
+    resolved: dict[str, ShotType] = {}
+    for requested_id, selected_id, content_sha256 in selections:
+        row = locked.get(requested_id if requested_id is not None else selected_id)
+        if row is None:
+            raise BatchValidationError("Shot Type is unavailable")
+        while row.state == "merged":
+            if row.canonical_target_id is None:
+                raise BatchValidationError("Shot Type is unavailable")
+            row = locked.get(row.canonical_target_id)
+            if row is None:
+                raise _BatchShotTypeRetry
+        if row.state not in {"canonical", "proposal"} or row.canonical_target_id is not None:
+            raise BatchValidationError("Shot Type is unavailable")
+        resolved[content_sha256] = row
+    return resolved
+
+
 def _reconcile_batch(
     patient_id: int,
     pending: Sequence[PendingCapture],
@@ -787,7 +889,25 @@ def create_batch_captures(
             patient_id=patient.id,
             storage=managed,
         )
-        for index, ((payload, inspection), review) in enumerate(zip(inspected, reviewed)):
+        review_by_hash = _batch_review_bindings(inspected, reviewed)
+        resolved_shot_types: dict[str, ShotType] | None = None
+        for retry in range(3):
+            try:
+                resolved_shot_types = _batch_shot_type_resolutions(
+                    actor=actor,
+                    reviewed=reviewed,
+                )
+            except _BatchShotTypeRetry:
+                db.session.rollback()
+                if retry == 2:
+                    raise BatchValidationError("Shot Type changed during batch review")
+                continue
+            break
+        if resolved_shot_types is None:
+            raise BatchValidationError("Shot Type could not be resolved")
+        patient = _current_patient(patient)
+        for index, (payload, inspection) in enumerate(inspected):
+            review = review_by_hash[inspection.sha256]
             pending.append(
                 prepare_capture(
                     actor=actor,
@@ -802,6 +922,7 @@ def create_batch_captures(
                     storage=managed,
                     inspection=inspection,
                     reject_duplicate=True,
+                    resolved_shot_type=resolved_shot_types[inspection.sha256],
                 )
             )
         commit_attempted = True
@@ -1378,6 +1499,7 @@ def inspect_upload(patient_pk: int):
             "format": inspection.format,
             "width": inspection.width,
             "height": inspection.height,
+            "sha256": inspection.sha256,
             "suggested_capture_date": (
                 inspection.suggested_capture_date.isoformat()
                 if inspection.suggested_capture_date is not None

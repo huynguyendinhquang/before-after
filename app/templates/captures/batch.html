@@ -84,6 +84,7 @@
     inspectedItems.forEach(item => {
       const wrapper = document.createElement('fieldset');
       wrapper.dataset.batchItem = String(item.index);
+      wrapper.dataset.sha256 = item.sha256 || '';
       const heading = document.createElement('legend');
       heading.textContent = `Image ${Number(item.index) + 1}`;
       wrapper.append(heading);
@@ -206,7 +207,8 @@
       capture_date_confirmed: row.querySelector('[data-date-confirmed]').checked,
       shot_type_name: row.querySelector('[data-shot-type]').value.trim(),
       shot_type_reviewed: row.querySelector('[data-shot-reviewed]').checked,
-      create_proposal: row.querySelector('[data-proposal]').checked
+      create_proposal: row.querySelector('[data-proposal]').checked,
+      sha256: row.dataset.sha256
     }));
     data.append('review_json', JSON.stringify(fields));
     data.append('csrf_token', csrf);
