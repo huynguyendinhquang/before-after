@@ -74,12 +74,8 @@ class RestoreResult:
 
 
 def _target_identity(parent: Path, target: Path) -> str:
-    parent_real = parent.resolve(strict=False)
-    target_real = target.resolve(strict=False)
-    try:
-        return target_real.relative_to(parent_real).as_posix()
-    except ValueError:
-        return target_real.as_posix()
+    del parent
+    return target.resolve(strict=False).as_posix()
 
 
 def _owner_marker_path(parent: Path, target: Path) -> Path:
@@ -552,8 +548,42 @@ def postgres_restore_preflight(
     return target
 
 
+def _normalize_server_address(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        import ipaddress
+
+        return str(ipaddress.ip_address(str(value).split("/", 1)[0]))
+    except ValueError as exc:
+        raise OpsError("PostgreSQL server address is invalid") from exc
+
+
+def _normalize_server_port(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OpsError("PostgreSQL server port is invalid") from exc
+    if not 1 <= port <= 65535:
+        raise OpsError("PostgreSQL server port is invalid")
+    return port
+
+
+def _system_identifier(cursor) -> str:
+    try:
+        cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
+        row = cursor.fetchone()
+    except Exception as exc:
+        raise OpsError("PostgreSQL cluster system identifier is unavailable") from exc
+    if not row or not row[0]:
+        raise OpsError("PostgreSQL cluster system identifier is unavailable")
+    return str(row[0])
+
+
 def _connection_database_identity(value: str) -> tuple[object, ...]:
-    """Resolve a PostgreSQL URL to server identity, not URL spelling."""
+    """Resolve a PostgreSQL URL to cluster/database identity, not URL spelling."""
     try:
         import psycopg
     except ImportError as exc:
@@ -562,35 +592,41 @@ def _connection_database_identity(value: str) -> tuple[object, ...]:
         with psycopg.connect(_native_postgres_url(value), connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT inet_server_addr()::text, inet_server_port(), current_database()"
+                    "SELECT inet_server_addr()::text, inet_server_port(), current_database(), "
+                    "(SELECT oid FROM pg_database WHERE datname = current_database())"
                 )
-                address, port, database = cursor.fetchone() or (None, None, None)
-                try:
-                    cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
-                    system_identifier = cursor.fetchone()[0]
-                except Exception:
-                    system_identifier = None
+                row = tuple(cursor.fetchone() or ())
+                address, port, database, database_oid = (row + (None, None, None, None))[:4]
+                system_identifier = _system_identifier(cursor)
+    except OpsError:
+        raise
     except Exception as exc:
         raise OpsError("could not establish PostgreSQL connection identity") from exc
-    if not database or port is None:
-        raise OpsError("PostgreSQL connection identity is unavailable")
-    if system_identifier:
-        # The cluster identifier bridges TCP, DNS, localhost, hostaddr, and
-        # Unix-socket spellings while retaining the actual server port/database.
-        return ("cluster", str(system_identifier), int(port), str(database))
-    if address:
-        try:
-            import ipaddress
-
-            server = str(ipaddress.ip_address(str(address).split("/", 1)[0]))
-        except ValueError as exc:
-            raise OpsError("PostgreSQL server address is invalid") from exc
-        return ("address", server, int(port), str(database))
-    raise OpsError("PostgreSQL socket connection identity is unavailable")
+    if not isinstance(database, str) or not database:
+        raise OpsError("PostgreSQL connection database name is unavailable")
+    if isinstance(database_oid, bool) or database_oid is None:
+        raise OpsError("PostgreSQL connection database OID is unavailable")
+    try:
+        database_oid = int(database_oid)
+    except (TypeError, ValueError) as exc:
+        raise OpsError("PostgreSQL connection database OID is invalid") from exc
+    if database_oid <= 0:
+        raise OpsError("PostgreSQL connection database OID is invalid")
+    # inet_server_addr()/inet_server_port() are NULL for Unix sockets. They
+    # are useful diagnostics, but the cluster identifier plus database OID is
+    # the verified identity used for safety decisions.
+    return (
+        "cluster",
+        system_identifier,
+        database_oid,
+        database,
+        _normalize_server_address(address),
+        _normalize_server_port(port),
+    )
 
 
 def _connection_server_identity(value: str) -> tuple[object, ...]:
-    """Resolve a PostgreSQL URL to its server identity without opening its DB."""
+    """Resolve a PostgreSQL URL to cluster identity without opening its DB."""
     try:
         import psycopg
     except ImportError as exc:
@@ -599,27 +635,32 @@ def _connection_server_identity(value: str) -> tuple[object, ...]:
         with psycopg.connect(_maintenance_database_url(value), connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT inet_server_addr()::text, inet_server_port()")
-                address, port = cursor.fetchone() or (None, None)
-                try:
-                    cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
-                    system_identifier = cursor.fetchone()[0]
-                except Exception:
-                    system_identifier = None
+                address, port = (cursor.fetchone() or (None, None))[:2]
+                system_identifier = _system_identifier(cursor)
+    except OpsError:
+        raise
     except Exception as exc:
         raise OpsError("could not establish PostgreSQL server identity") from exc
-    if port is None:
-        raise OpsError("PostgreSQL server identity is unavailable")
-    if system_identifier:
-        return ("cluster", str(system_identifier), int(port))
-    if address:
-        try:
-            import ipaddress
+    return (
+        "cluster",
+        system_identifier,
+        _normalize_server_address(address),
+        _normalize_server_port(port),
+    )
 
-            server = str(ipaddress.ip_address(str(address).split("/", 1)[0]))
-        except ValueError as exc:
-            raise OpsError("PostgreSQL server address is invalid") from exc
-        return ("address", server, int(port))
-    raise OpsError("PostgreSQL socket server identity is unavailable")
+
+def _same_cluster(server_identity: tuple[object, ...], database_identity: tuple[object, ...]) -> bool:
+    return (
+        len(server_identity) >= 2
+        and len(database_identity) >= 2
+        and server_identity[:2] == database_identity[:2]
+    )
+
+
+def _same_database(
+    first: tuple[object, ...], second: tuple[object, ...]
+) -> bool:
+    return len(first) >= 3 and len(second) >= 3 and first[:3] == second[:3]
 
 
 def _registry_path(parent: Path, run_id: str) -> Path:
@@ -730,7 +771,11 @@ def recover_provisioning(
                         "could not prove restore provisioning ownership; "
                         "manual empty-DB cleanup is required"
                     ) from exc
-            if value.get("server_identity") != list(server):
+            stored_server = value.get("server_identity")
+            if (
+                not isinstance(stored_server, list)
+                or not _same_cluster(tuple(stored_server), server)
+            ):
                 raise OpsError("restore run registry server identity does not match")
             if value.get("target_media_identity") != _target_identity(parent, target):
                 raise OpsError("restore run registry target identity does not match")
@@ -820,7 +865,7 @@ def _create_isolated_database(
         raise OpsError("restore database name must be generated and collision-resistant")
     for production_url in production_urls:
         production_identity = _connection_database_identity(production_url)
-        if target_server == production_identity[:3] and target_name == production_identity[3]:
+        if _same_cluster(target_server, production_identity) and target_name == production_identity[3]:
             raise OpsError("restore target database is a production database")
     try:
         import psycopg
@@ -1010,7 +1055,7 @@ def assert_isolated_targets(
     resolver = _identity_resolver or _connection_database_identity
     target_identity = resolver(target_database_url)
     for candidate in database_candidates:
-        if target_identity == resolver(candidate):
+        if _same_database(target_identity, resolver(candidate)):
             raise OpsError("restore target database is a production database")
     return target
 
@@ -1527,10 +1572,15 @@ def _drop_owned_database(
         raise OpsError("restore ownership marker does not match this run")
 
     target_server = _connection_server_identity(target_database_url)
+    target_identity = (
+        _connection_database_identity(target_database_url)
+        if target_server[:1] == ("cluster",)
+        else None
+    )
     target_name = _database_name(target_database_url)
     for production_url in production_urls:
         production_identity = _connection_database_identity(production_url)
-        if target_server == production_identity[:3] and target_name == production_identity[3]:
+        if target_identity is not None and _same_database(target_identity, production_identity):
             raise OpsError("refusing to clean a production database")
     try:
         import psycopg

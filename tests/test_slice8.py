@@ -1082,3 +1082,218 @@ def test_runbook_uses_bootstrap_and_secret_files_not_password_arguments() -> Non
     assert "--smoke-password '" not in runbook
     assert "--target-database-url" not in runbook
     assert "/var/tmp" not in runbook
+
+
+def test_permission_helpers_are_executable_and_normalizer_runs_directly(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    normalizer = root / "deploy/normalize-media-permissions.sh"
+    verifier = root / "deploy/verify-permissions.sh"
+    assert stat.S_IMODE(normalizer.stat().st_mode) == 0o755
+    assert stat.S_IMODE(verifier.stat().st_mode) == 0o755
+    media = private_media_root(tmp_path / "media")
+    environment = {
+        **os.environ,
+        "MEDIA_ROOT": str(media),
+        "MEDIA_OWNER": pwd.getpwuid(os.geteuid()).pw_name,
+        "MEDIA_GROUP": grp.getgrgid(os.getegid()).gr_name,
+    }
+    if os.geteuid() != 0:
+        result = subprocess.run(
+            [str(normalizer)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert result.returncode == 1, result.stderr
+        return
+    result = subprocess.run(
+        [str(normalizer)],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_postgres_socket_identity_uses_cluster_and_database_oid(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+    import ops.restore_check as restore_module
+
+    class Cursor:
+        def __init__(self) -> None:
+            self.statement = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            self.statement = statement
+
+        def fetchone(self):
+            if "pg_control_system" in self.statement:
+                return ("cluster-1",)
+            if "current_database" in self.statement:
+                return (None, None, "clinic", 16384)
+            return (None, None)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=lambda *_args, **_kwargs: Connection()))
+    identity = restore_module._connection_database_identity("postgresql://socket/clinic")
+    assert identity[:4] == ("cluster", "cluster-1", 16384, "clinic")
+    assert identity[4:] == (None, None)
+
+
+def test_postgres_identity_fails_closed_without_cluster_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+    import ops.restore_check as restore_module
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            self.statement = statement
+
+        def fetchone(self):
+            if "pg_control_system" in self.statement:
+                return (None,)
+            return ("127.0.0.1", 5432, "clinic", 16384)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=lambda *_args, **_kwargs: Connection()))
+    with pytest.raises(OpsError, match="system identifier"):
+        restore_module._connection_database_identity("postgresql://tcp/clinic")
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl is required for signature regression")
+def test_runtime_evidence_requires_trusted_detached_signature(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.evidence as evidence
+
+    repo = tmp_path
+    artifact_dir = repo / "artifacts"
+    artifact_dir.mkdir(mode=0o700)
+    junit = artifact_dir / "slice8-fixed-gate.junit.xml"
+    junit.write_text(
+        '<testsuites tests="2" failures="0" errors="0" skipped="0">'
+        '<testsuite name="slice8" tests="2" failures="0" errors="0" skipped="0">'
+        '<testcase classname="tests.test_slice8" name="test_actual_postgresql_backup_restore_and_authenticated_smoke"/>'
+        '<testcase classname="tests.test_slice8" name="test_backup_user_can_read_media_but_cannot_modify_or_delete"/>'
+        "</testsuite></testsuites>",
+        encoding="ascii",
+    )
+    dac = artifact_dir / "slice8-fixed-gate.dac-proof"
+    dac.write_text("before-after.dac-proof.v1\n", encoding="ascii")
+    metadata = {
+        "format": "before-after.fixed-gate.v1",
+        "completed_fixed_gate": True,
+        "commit": "a" * 40,
+        "output_artifact": junit.name,
+        "output_sha256": hashlib.sha256(junit.read_bytes()).hexdigest(),
+        "dac_proof_artifact": dac.name,
+        "dac_proof_sha256": hashlib.sha256(dac.read_bytes()).hexdigest(),
+        "slice8_tests_executed": 2,
+        "mandatory_skips": 0,
+    }
+    artifact = artifact_dir / "slice8-fixed-gate.json"
+    artifact.write_text(json.dumps(metadata), encoding="ascii")
+    private = tmp_path / "evidence-private.pem"
+    public = tmp_path / "evidence-public.pem"
+    signature = artifact_dir / "slice8-fixed-gate.json.sig"
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(private)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    canonical = evidence.canonical_fixed_gate_metadata(metadata)
+    canonical_path = tmp_path / "canonical"
+    canonical_path.write_bytes(canonical)
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(private), "-out", str(signature), str(canonical_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    monkeypatch.setenv("FIXED_GATE_ARTIFACT", str(artifact))
+    monkeypatch.setenv("BUILD_SHA", "a" * 40)
+    monkeypatch.setenv("EVIDENCE_PUBLIC_KEY", str(public))
+    monkeypatch.setenv("EVIDENCE_SIGNATURE", str(signature))
+    monkeypatch.setattr(evidence, "CHECK_COMMANDS", {"check": ["true"]})
+    output = tmp_path / "local-evidence.json"
+    assert evidence.generate(output, repo, certification=True) == 0
+    assert json.loads(output.read_text())["runtime_checks"] == "passed"
+
+    metadata["slice8_tests_executed"] = 3
+    artifact.write_text(json.dumps(metadata), encoding="ascii")
+    assert evidence.generate(output, repo, certification=True) != 0
+    assert json.loads(output.read_text())["runtime_checks"] == "not_run"
+
+    artifact.write_text(json.dumps({**metadata, "slice8_tests_executed": 2}), encoding="ascii")
+    other_private = tmp_path / "other-private.pem"
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(other_private)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(other_private), "-out", str(signature), str(canonical_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert evidence._fixed_gate_evidence(repo)[0]["status"] == "unverified"
+
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(private), "-out", str(signature), str(canonical_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    monkeypatch.delenv("EVIDENCE_PUBLIC_KEY")
+    forged = json.loads(artifact.read_text())
+    forged["public_key"] = str(public)
+    artifact.write_text(json.dumps(forged), encoding="ascii")
+    assert evidence._fixed_gate_evidence(repo)[0]["status"] == "unverified"
+
+
+def test_owner_marker_hashes_canonical_target_path(tmp_path: Path) -> None:
+    from ops.restore_check import _owner_marker_path
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "nested" / "media"
+    expected = parent / (".restore-owner-" + hashlib.sha256(str(target.resolve()).encode()).hexdigest())
+    assert _owner_marker_path(parent, target) == expected

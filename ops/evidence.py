@@ -13,7 +13,10 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from collections.abc import Iterator
 
 
 REQUIRED_FIXED_GATE_TESTS = frozenset(
@@ -22,13 +25,26 @@ REQUIRED_FIXED_GATE_TESTS = frozenset(
         "test_backup_user_can_read_media_but_cannot_modify_or_delete",
     }
 )
+_FIXED_GATE_FIELDS = (
+    "format",
+    "completed_fixed_gate",
+    "commit",
+    "output_artifact",
+    "output_sha256",
+    "dac_proof_artifact",
+    "dac_proof_sha256",
+    "slice8_tests_executed",
+    "mandatory_skips",
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 CHECK_COMMANDS = {
     "shell_syntax": [
         "bash",
         "-c",
-        "for script in \"$@\"; do bash -n \"$script\" || exit; done",
+        'for script in "$@"; do bash -n "$script" || exit; done',
         "bash",
         "deploy/bootstrap.sh",
         "ops/backup.sh",
@@ -62,10 +78,10 @@ def _run(command: list[str], repo_root: Path) -> dict[str, object]:
 
 def _repository_commit(repo_root: Path) -> str | None:
     configured = os.environ.get("BUILD_SHA")
-    if configured is not None:
-        return configured if re.fullmatch(r"[0-9a-f]{40}", configured) else None
+    if configured is not None and _COMMIT_RE.fullmatch(configured) is None:
+        return None
     try:
-        return subprocess.run(
+        head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             check=True,
@@ -74,7 +90,166 @@ def _repository_commit(repo_root: Path) -> str | None:
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
+        return configured
+    if _COMMIT_RE.fullmatch(head) is None:
         return None
+    if configured is not None and configured != head:
+        return None
+    return head
+
+
+def _canonical_path(path: Path) -> Path:
+    candidate = path.absolute()
+    resolved = candidate.resolve(strict=False)
+    if candidate != resolved:
+        raise ValueError("evidence path contains a symlink component")
+    return resolved
+
+
+def _artifact_path(repo_root: Path) -> Path:
+    configured = os.environ.get("FIXED_GATE_ARTIFACT")
+    candidate = Path(configured) if configured else repo_root / "artifacts/slice8-fixed-gate.json"
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    artifact = _canonical_path(candidate)
+    artifact.relative_to(repo_root.resolve(strict=False))
+    return artifact
+
+
+def _contained_member(value: object, evidence_root: Path, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"fixed gate {label} path is invalid")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"fixed gate {label} path escapes evidence directory")
+    candidate = evidence_root / relative
+    resolved = _canonical_path(candidate)
+    resolved.relative_to(evidence_root.resolve(strict=False))
+    return resolved
+
+
+def _signature_path(artifact: Path, repo_root: Path) -> Path:
+    configured = os.environ.get("EVIDENCE_SIGNATURE")
+    candidate = Path(configured) if configured else artifact.with_suffix(artifact.suffix + ".sig")
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return _canonical_path(candidate)
+
+
+@contextmanager
+def _trusted_public_key(repo_root: Path) -> Iterator[Path | None]:
+    """Yield only the configured key; artifact contents are never consulted."""
+    configured = os.environ.get("EVIDENCE_PUBLIC_KEY")
+    if not configured:
+        yield None
+        return
+    if "-----BEGIN" in configured:
+        temporary = tempfile.NamedTemporaryFile(mode="w", encoding="ascii", delete=False)
+        try:
+            temporary.write(configured)
+            temporary.flush()
+            os.fchmod(temporary.fileno(), 0o600)
+            temporary.close()
+            yield Path(temporary.name)
+        finally:
+            try:
+                Path(temporary.name).unlink()
+            except OSError:
+                pass
+        return
+    candidate = Path(configured)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    try:
+        key = _canonical_path(candidate)
+        if not key.is_file():
+            raise ValueError("configured evidence public key is not a file")
+    except (OSError, ValueError):
+        yield None
+        return
+    yield key
+
+
+def canonical_fixed_gate_metadata(metadata: dict[str, object]) -> bytes:
+    """Return the exact ASCII bytes covered by a fixed-gate signature."""
+    if not isinstance(metadata, dict):
+        raise ValueError("fixed gate metadata is invalid")
+    try:
+        signed = {field: metadata[field] for field in _FIXED_GATE_FIELDS}
+    except KeyError as exc:
+        raise ValueError("fixed gate metadata is incomplete") from exc
+    return json.dumps(signed, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def _verify_signature(payload: bytes, signature: Path, repo_root: Path) -> tuple[bool, str]:
+    if not signature.is_file() or signature.is_symlink():
+        return False, "detached evidence signature is absent"
+    try:
+        if not signature.read_bytes():
+            return False, "detached evidence signature is empty"
+    except OSError:
+        return False, "detached evidence signature is unreadable"
+    with _trusted_public_key(repo_root) as public_key:
+        if public_key is None:
+            return False, "EVIDENCE_PUBLIC_KEY is not configured"
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            canonical_path = Path(stream.name)
+        try:
+            command = [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-verify",
+                str(public_key),
+                "-signature",
+                str(signature),
+                str(canonical_path),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError:
+                return False, "openssl is unavailable"
+            if result.returncode == 0:
+                return True, ""
+            # OpenSSL's dgst command handles RSA/EC keys. Ed25519 uses the
+            # raw-message pkeyutl interface instead.
+            try:
+                result = subprocess.run(
+                    [
+                        "openssl",
+                        "pkeyutl",
+                        "-verify",
+                        "-pubin",
+                        "-inkey",
+                        str(public_key),
+                        "-sigfile",
+                        str(signature),
+                        "-in",
+                        str(canonical_path),
+                        "-rawin",
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError:
+                return False, "openssl is unavailable"
+            return (result.returncode == 0, "detached evidence signature is invalid")
+        finally:
+            try:
+                canonical_path.unlink()
+            except OSError:
+                pass
 
 
 def _junit_summary(path: Path) -> tuple[set[str], int, int, int, int]:
@@ -82,57 +257,68 @@ def _junit_summary(path: Path) -> tuple[set[str], int, int, int, int]:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise ValueError("fixed gate JUnit output is invalid") from exc
+    if root.tag not in {"testsuite", "testsuites"}:
+        raise ValueError("fixed gate JUnit root is invalid")
     cases = list(root.iter("testcase"))
     if not cases:
         raise ValueError("fixed gate JUnit output contains no test cases")
+    identities: set[tuple[str, str]] = set()
     failures = errors = skipped = 0
-    for element in root.iter():
-        if element.tag not in {"testsuite", "testsuites"}:
-            continue
-        for field, label in (("failures", "failures"), ("errors", "errors"), ("skipped", "skips")):
-            raw = element.get(field, "0")
-            try:
-                count = int(raw)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"fixed gate JUnit {label} count is invalid") from exc
-            if count < 0:
-                raise ValueError(f"fixed gate JUnit {label} count is invalid")
-            if field == "failures":
-                failures = max(failures, count)
-            elif field == "errors":
-                errors = max(errors, count)
-            else:
-                skipped = max(skipped, count)
     slice8_names: set[str] = set()
     slice8_count = 0
     for case in cases:
+        classname = case.get("classname")
         name = case.get("name")
-        if case.get("classname", "").endswith("test_slice8"):
+        if not isinstance(classname, str) or not classname or not isinstance(name, str) or not name:
+            raise ValueError("fixed gate JUnit testcase identity is invalid")
+        identity = (classname, name)
+        if identity in identities:
+            raise ValueError("fixed gate JUnit contains duplicate test cases")
+        identities.add(identity)
+        failures += case.find("failure") is not None
+        errors += case.find("error") is not None
+        skipped += case.find("skipped") is not None
+        if classname.endswith("test_slice8"):
             slice8_count += 1
-            if isinstance(name, str):
-                slice8_names.add(name)
-        if case.find("failure") is not None:
-            failures += 1
-        if case.find("error") is not None:
-            errors += 1
-        if case.find("skipped") is not None:
-            skipped += 1
+            slice8_names.add(name)
+    suites = [root] if root.tag == "testsuite" else [root, *root.iter("testsuite")]
+    for suite in suites:
+        descendants = list(suite.iter("testcase"))
+        raw_tests = suite.get("tests")
+        if raw_tests is None:
+            raise ValueError("fixed gate JUnit test count is missing")
+        try:
+            test_count = int(raw_tests)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed gate JUnit test count is invalid") from exc
+        if test_count != len(descendants):
+            raise ValueError("fixed gate JUnit test count is invalid")
+        expected = {
+            "failures": sum(case.find("failure") is not None for case in descendants),
+            "errors": sum(case.find("error") is not None for case in descendants),
+            "skipped": sum(case.find("skipped") is not None for case in descendants),
+        }
+        for field, count in expected.items():
+            try:
+                declared = int(suite.get(field, "0"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"fixed gate JUnit {field} count is invalid") from exc
+            if declared != count:
+                raise ValueError(f"fixed gate JUnit {field} count is invalid")
     return slice8_names, slice8_count, failures, errors, skipped
 
 
+def _unverified(reason: str) -> dict[str, object]:
+    return {"status": "unverified", "reason": reason}
+
+
 def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
-    """Accept runtime success only with a commit-bound, parsed fixed gate."""
-    configured = os.environ.get("FIXED_GATE_ARTIFACT")
-    artifact = Path(configured) if configured else repo_root / "artifacts/slice8-fixed-gate.json"
-    if not artifact.is_absolute():
-        artifact = repo_root / artifact
-    artifact = artifact.absolute()
+    """Accept runtime success only with signed, commit-bound fixed-gate data."""
     try:
-        readable = artifact.is_file() and not artifact.is_symlink()
-        artifact.relative_to(repo_root.absolute())
+        artifact = _artifact_path(repo_root)
     except (OSError, ValueError):
-        readable = False
-    if not readable:
+        return _unverified("fixed gate artifact path is invalid"), True
+    if not artifact.is_file() or artifact.is_symlink():
         return (
             {
                 "status": "not_run",
@@ -142,72 +328,56 @@ def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
         )
     try:
         value = json.loads(artifact.read_text(encoding="ascii"))
-        output_name = value["output_artifact"]
-        output_sha256 = value["output_sha256"]
-        if not isinstance(output_name, str):
-            raise ValueError
-        output_relative = Path(output_name)
-        if output_relative.is_absolute() or ".." in output_relative.parts:
-            raise ValueError
-        output_candidate = repo_root / output_relative
-        if output_candidate.is_symlink():
-            raise ValueError
-        output = output_candidate.resolve(strict=False)
-        output.relative_to(repo_root.resolve())
+        if not isinstance(value, dict):
+            raise ValueError("fixed gate metadata is invalid")
         expected_commit = _repository_commit(repo_root)
         if expected_commit is None or value.get("commit") != expected_commit:
-            raise ValueError("fixed gate commit does not match this build")
-        slice8_names, slice8_count, failures, errors, xml_skips = _junit_summary(output)
-        valid = (
-            value.get("format") == "before-after.fixed-gate.v1"
-            and value.get("completed_fixed_gate") is True
-            and isinstance(value.get("mandatory_skips"), int)
-            and not isinstance(value.get("mandatory_skips"), bool)
-            and value["mandatory_skips"] == 0
-            and isinstance(value.get("slice8_tests_executed"), int)
-            and not isinstance(value.get("slice8_tests_executed"), bool)
-            and value["slice8_tests_executed"] == slice8_count
-            and REQUIRED_FIXED_GATE_TESTS <= slice8_names
-            and failures == 0
-            and errors == 0
-            and xml_skips == 0
-            and not output.is_symlink()
-            and output.is_file()
-            and isinstance(output_sha256, str)
-            and re.fullmatch(r"[0-9a-f]{64}", output_sha256) is not None
-            and hashlib.sha256(output.read_bytes()).hexdigest() == output_sha256
-        )
-        dac_name = value["dac_proof_artifact"]
-        dac_sha256 = value["dac_proof_sha256"]
-        if not isinstance(dac_name, str) or not isinstance(dac_sha256, str):
-            raise ValueError
-        dac_relative = Path(dac_name)
-        if dac_relative.is_absolute() or ".." in dac_relative.parts:
-            raise ValueError
-        dac_candidate = repo_root / dac_relative
-        if dac_candidate.is_symlink():
-            raise ValueError
-        dac_path = dac_candidate.resolve(strict=False)
-        dac_path.relative_to(repo_root.resolve())
-        valid = valid and (
-            dac_path.is_file()
-            and dac_path.read_text(encoding="ascii") == "before-after.dac-proof.v1\n"
-            and re.fullmatch(r"[0-9a-f]{64}", dac_sha256) is not None
-            and hashlib.sha256(dac_path.read_bytes()).hexdigest() == dac_sha256
-        )
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
-        valid = False
-    if not valid:
-        return (
-            {"status": "failed", "reason": "fixed gate metadata, commit, or JUnit output is invalid"},
-            True,
-        )
+            raise ValueError("fixed gate commit does not match HEAD/BUILD_SHA")
+        output = _contained_member(value.get("output_artifact"), artifact.parent, "JUnit")
+        dac_path = _contained_member(value.get("dac_proof_artifact"), artifact.parent, "DAC proof")
+        output_sha256 = value.get("output_sha256")
+        dac_sha256 = value.get("dac_proof_sha256")
+        if not isinstance(output_sha256, str) or _SHA256_RE.fullmatch(output_sha256) is None:
+            raise ValueError("fixed gate JUnit hash is invalid")
+        if not isinstance(dac_sha256, str) or _SHA256_RE.fullmatch(dac_sha256) is None:
+            raise ValueError("fixed gate DAC hash is invalid")
+        output_bytes = output.read_bytes()
+        dac_bytes = dac_path.read_bytes()
+        if hashlib.sha256(output_bytes).hexdigest() != output_sha256:
+            raise ValueError("fixed gate JUnit hash does not match")
+        if dac_bytes != b"before-after.dac-proof.v1\n" or hashlib.sha256(dac_bytes).hexdigest() != dac_sha256:
+            raise ValueError("fixed gate DAC proof is invalid")
+        slice8_names, slice8_count, failures, errors, skips = _junit_summary(output)
+        if (
+            value.get("format") != "before-after.fixed-gate.v1"
+            or value.get("completed_fixed_gate") is not True
+            or isinstance(value.get("mandatory_skips"), bool)
+            or value.get("mandatory_skips") != 0
+            or not isinstance(value.get("slice8_tests_executed"), int)
+            or isinstance(value.get("slice8_tests_executed"), bool)
+            or value["slice8_tests_executed"] != slice8_count
+            or not REQUIRED_FIXED_GATE_TESTS <= slice8_names
+            or failures != 0
+            or errors != 0
+            or skips != 0
+        ):
+            raise ValueError("fixed gate metadata or JUnit requirements are invalid")
+        payload = canonical_fixed_gate_metadata(value)
+        signature = _signature_path(artifact, repo_root)
+        verified, reason = _verify_signature(payload, signature, repo_root)
+        if not verified:
+            return _unverified(reason), True
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        return _unverified(str(exc)), True
     return (
         {
             "status": "passed",
-            "artifact": str(artifact.relative_to(repo_root.absolute())),
-            "output_artifact": output_name,
-            "output_sha256": output_sha256,
+            "artifact": str(artifact.relative_to(repo_root.resolve(strict=False))),
+            "signature": str(signature.relative_to(repo_root.resolve(strict=False)))
+            if signature.is_relative_to(repo_root.resolve(strict=False))
+            else str(signature),
+            "output_artifact": value["output_artifact"],
+            "output_sha256": value["output_sha256"],
             "commit": value["commit"],
             "slice8_tests_executed": value["slice8_tests_executed"],
             "dac_proof_artifact": value["dac_proof_artifact"],
@@ -217,9 +387,9 @@ def _fixed_gate_evidence(repo_root: Path) -> tuple[dict[str, object], bool]:
     )
 
 
-def generate(output: Path, repo_root: Path) -> int:
+def generate(output: Path, repo_root: Path, *, certification: bool = False) -> int:
     checks = {name: _run(command, repo_root) for name, command in CHECK_COMMANDS.items()}
-    fixed_gate, artifact_present = _fixed_gate_evidence(repo_root)
+    fixed_gate, _ = _fixed_gate_evidence(repo_root)
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -230,7 +400,8 @@ def generate(output: Path, repo_root: Path) -> int:
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        commit = "unavailable"
+        commit = os.environ.get("BUILD_SHA", "unavailable")
+    runtime_passed = fixed_gate.get("status") == "passed"
     evidence = {
         "format": "before-after.local-evidence.v1",
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -238,7 +409,7 @@ def generate(output: Path, repo_root: Path) -> int:
         "python": platform.python_version(),
         "checks": checks,
         "fixed_gate": fixed_gate,
-        "runtime_checks": "not_run" if fixed_gate["status"] != "passed" else "passed",
+        "runtime_checks": "passed" if runtime_passed else "not_run",
         "clinic_hardware_uat": "not_run",
         "clinic_tls_uat": "not_run",
         "clinic_permission_proof": "run deploy/verify-permissions.sh on the clinic host",
@@ -247,16 +418,24 @@ def generate(output: Path, repo_root: Path) -> int:
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="ascii")
     output.chmod(0o600)
-    return 0 if all(item["passed"] for item in checks.values()) and (
-        not artifact_present or fixed_gate["status"] == "passed"
-    ) else 1
+    checks_passed = all(item["passed"] for item in checks.values())
+    return 0 if checks_passed and (not certification or runtime_passed) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("artifacts/slice8-local-evidence.json"))
+    parser.add_argument(
+        "--certification",
+        action="store_true",
+        help="require a valid trusted signature before claiming runtime success",
+    )
     args = parser.parse_args(argv)
-    return generate(args.output, Path(__file__).resolve().parents[1])
+    return generate(
+        args.output,
+        Path(__file__).resolve().parents[1],
+        certification=args.certification or os.environ.get("EVIDENCE_CERTIFICATION") == "1",
+    )
 
 
 if __name__ == "__main__":

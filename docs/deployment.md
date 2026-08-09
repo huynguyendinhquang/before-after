@@ -179,10 +179,13 @@ prefix.
 
 Never target production. Production database and media identifiers are
 mandatory. Database identity is checked by connecting to both target and
-production and comparing the actual server address (or cluster identity for a
-Unix socket), port, and database name; DNS, `localhost`, `hostaddr`, and socket
-aliases cannot bypass the guard. Media paths use realpath/inode/containment and
-reject symlink components.
+production and comparing the PostgreSQL cluster system identifier plus
+database OID; TCP address/port are supplemental diagnostics, and may be NULL
+for Unix sockets. DNS, `localhost`, `hostaddr`, and socket aliases cannot
+bypass the guard. The guard fails closed when `pg_control_system()` or the
+database OID is unavailable. Media paths use canonical-path/inode/containment
+checks and reject symlink components; restore ownership markers hash the
+canonical target path.
 
 Choose a new generated target database name on the same PostgreSQL cluster
 (for example, `before_after_restore_<32 lowercase hex characters>`) and create
@@ -321,8 +324,32 @@ Use [`docs/issue-evidence-template.md`](issue-evidence-template.md) for the
 ticket. The artifact explicitly records clinic hardware and TLS/LAN UAT as
 `not_run`; local syntax/compile checks do not claim runtime success. Runtime
 success is recorded only when the completed fixed-gate metadata matches the
-current build SHA and its JUnit/XML and DAC proof artifacts pass independent
-validation.
+current build SHA, its JUnit/XML and DAC proof artifacts pass independent
+validation, and a detached signature verifies with the configured
+`EVIDENCE_PUBLIC_KEY`. A certification invocation is therefore:
+
+```bash
+EVIDENCE_PUBLIC_KEY=/etc/before-after/evidence-public.pem \
+EVIDENCE_SIGNATURE=artifacts/slice8-fixed-gate.json.sig \
+python3 -m ops.evidence --certification \
+  --output artifacts/slice8-local-evidence.json
+```
+
+CI or a maintainer signs the canonical metadata bytes (which include the
+commit-bound JUnit and DAC hashes) with a private key held in CI secret storage
+or an offline secret store, for example:
+
+```bash
+python3 -c 'import json,sys; from ops.evidence import canonical_fixed_gate_metadata; sys.stdout.buffer.write(canonical_fixed_gate_metadata(json.load(open(sys.argv[1]))))' \
+  artifacts/slice8-fixed-gate.json > /tmp/slice8-fixed-gate.canonical
+openssl dgst -sha256 -sign "$EVIDENCE_PRIVATE_KEY" \
+  -out artifacts/slice8-fixed-gate.json.sig /tmp/slice8-fixed-gate.canonical
+rm -f /tmp/slice8-fixed-gate.canonical
+```
+
+The private key is never stored in this repository or in an evidence artifact;
+without the configured trusted public key and detached signature, runtime
+evidence remains unverified/not-run and certification exits nonzero.
 
 The acceptance tests use an injected storage policy only for their same-device
 temporary test directory; production policy is never bypassed. Also run:
