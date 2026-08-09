@@ -19,6 +19,7 @@ from app.admin import FinalAdminError, list_audit_events, update_user
 from app.captures import (
     CaptureReferencedError,
     archive_capture,
+    create_capture,
     delete_capture,
     merge_shot_type,
     ShotTypeError,
@@ -32,6 +33,7 @@ from app.comparisons import (
     duplicate_comparison_set,
     EditLeaseError,
     remove_frame,
+    save_comparison_set,
     StaleVersionError,
     unarchive_comparison_set,
 )
@@ -258,6 +260,198 @@ def test_duplicate_requires_matching_expected_version(app):
             expected_version=source.version,
         )
         assert copied.name == "Current copy"
+
+
+def test_duplicate_refreshes_a_stale_set_before_locking(app):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        source = create_comparison_set(actor=actor, patient=patient, name="History")
+        stale_version = source.version
+        other = db.session.session_factory()
+        try:
+            other.execute(
+                text("UPDATE comparison_sets SET version = version + 1 WHERE id = :id"),
+                {"id": source.id},
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        with pytest.raises(StaleVersionError):
+            duplicate_comparison_set(
+                actor=actor,
+                comparison_set=source,
+                name="Stale copy",
+                expected_version=stale_version,
+            )
+        assert db.session.scalar(select(func.count(ComparisonSet.id))) == 1
+
+
+def test_archive_refreshes_stale_archive_state_before_auditing(app):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        source = create_comparison_set(actor=actor, patient=patient, name="History")
+        stale_version = source.version
+        other = db.session.session_factory()
+        try:
+            other.execute(
+                text(
+                    "UPDATE comparison_sets "
+                    "SET archived_at = clock_timestamp(), archived_by_id = :actor, version = version + 1 "
+                    "WHERE id = :id"
+                ),
+                {"actor": actor.id, "id": source.id},
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        archived = archive_comparison_set(actor=actor, comparison_set=source)
+        assert archived.version == stale_version + 1
+        assert db.session.scalar(
+            select(func.count(AuditEvent.id)).where(AuditEvent.action == "comparison_set.archive")
+        ) == 0
+
+
+def test_merge_refreshes_stale_source_and_never_retargets_an_existing_merge(app):
+    admin_id = add_user(app, "admin", "admin")
+    source_id = fixture_shot_type(app, admin_id, "Proposal", state="proposal")
+    target_id = fixture_shot_type(app, admin_id, "Canonical")
+    other_target_id = fixture_shot_type(app, admin_id, "Other Canonical")
+    with app.app_context():
+        actor = db.session.get(User, admin_id)
+        stale_source = db.session.get(ShotType, source_id)
+        stale_other_target = db.session.get(ShotType, other_target_id)
+        assert actor is not None and stale_source is not None and stale_other_target is not None
+        other = db.session.session_factory()
+        try:
+            other.execute(
+                text(
+                    "UPDATE shot_types SET state = 'merged', canonical_target_id = :target "
+                    "WHERE id = :source"
+                ),
+                {"target": target_id, "source": source_id},
+            )
+            other.commit()
+        finally:
+            other.close()
+
+        with pytest.raises(ShotTypeError, match="already merged"):
+            merge_shot_type(actor=actor, source=stale_source, target=stale_other_target)
+        refreshed = db.session.get(ShotType, source_id)
+        assert refreshed is not None
+        assert refreshed.state == "merged"
+        assert refreshed.canonical_target_id == target_id
+
+        canonical = merge_shot_type(actor=actor, source_id=source_id, target_id=target_id)
+        assert canonical.id == target_id
+
+
+def test_duplicate_precheck_does_not_return_capture_deleted_concurrently(app, monkeypatch):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    payload = fixture_image("red")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        shot_type = db.session.get(ShotType, shot_type_id)
+        assert actor is not None and patient is not None and shot_type is not None
+        original = create_capture(
+            actor=actor,
+            patient=patient,
+            upload=payload,
+            capture_date="2024-01-01",
+            capture_date_confirmed=True,
+            shot_type=shot_type,
+            original_filename="original.jpg",
+        )
+        original_id = original.id
+
+    candidate_seen = threading.Event()
+    allow_delete = threading.Event()
+    delete_ready = threading.Event()
+    delete_now = threading.Event()
+    outcomes: list[int] = []
+    errors: list[BaseException] = []
+
+    from app import captures as captures_module
+
+    original_candidate = captures_module._existing_capture_candidate
+
+    def blocking_candidate(patient_pk: int, sha256: str) -> int | None:
+        candidate = original_candidate(patient_pk, sha256)
+        if candidate is not None:
+            candidate_seen.set()
+            if not allow_delete.wait(10):
+                raise AssertionError("duplicate precheck did not resume")
+        return candidate
+
+    monkeypatch.setattr(captures_module, "_existing_capture_candidate", blocking_candidate)
+
+    def delete_row() -> None:
+        with app.app_context():
+            session = db.session.session_factory()
+            try:
+                session.scalar(
+                    select(Capture.id)
+                    .where(Capture.id == original_id)
+                    .with_for_update()
+                )
+                delete_ready.set()
+                if not delete_now.wait(10):
+                    raise AssertionError("delete worker did not resume")
+                session.execute(text("DELETE FROM captures WHERE id = :id"), {"id": original_id})
+                session.commit()
+            except BaseException as exc:
+                errors.append(exc)
+                session.rollback()
+            finally:
+                session.close()
+
+    def create_after_delete() -> None:
+        with app.app_context():
+            try:
+                actor = db.session.get(User, editor_id)
+                patient = db.session.get(Patient, patient_id)
+                assert actor is not None and patient is not None
+                replacement = create_capture(
+                    actor=actor,
+                    patient=patient,
+                    upload=payload,
+                    capture_date="2024-01-01",
+                    capture_date_confirmed=True,
+                    shot_type_id=shot_type_id,
+                    original_filename="replacement.jpg",
+                )
+                outcomes.append(replacement.id)
+            except BaseException as exc:
+                errors.append(exc)
+
+    deleter = threading.Thread(target=delete_row)
+    creator = threading.Thread(target=create_after_delete)
+    deleter.start()
+    assert delete_ready.wait(10)
+    creator.start()
+    assert candidate_seen.wait(10)
+    delete_now.set()
+    allow_delete.set()
+    creator.join(timeout=10)
+    deleter.join(timeout=10)
+    assert not creator.is_alive() and not deleter.is_alive()
+    assert errors == []
+    assert outcomes and outcomes[0] != original_id
+
+    with app.app_context():
+        assert db.session.scalar(select(func.count(Capture.id))) == 1
 
 
 def test_remove_frame_requires_lease_version_csrf_and_audits(app):
@@ -600,7 +794,25 @@ def test_admin_last_account_guard_and_bounded_audit_omit_pii(app):
             entity_id=1,
             details={"original_filename": "secret-original.jpg", "patient_name": "Sensitive Patient"},
         )
+        append_audit(
+            actor=actor,
+            action="capture.update",
+            entity_type="capture",
+            entity_id=1,
+            details={
+                "frame_ids": list(range(1000)),
+                "long": "x" * 1000,
+                "nested": {"a": {"b": {"c": {"d": "too deep"}}}},
+            },
+        )
         db.session.commit()
+        stored = db.session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "capture.update")
+        )
+        assert stored is not None
+        assert len(stored.details["frame_ids"]) == 20
+        assert len(stored.details["long"]) == 64
+        assert stored.details["nested"]["a"]["b"]["c"] == "[truncated]"
         events = list_audit_events(limit=10000)
         assert len(events) <= 100
 

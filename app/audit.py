@@ -18,6 +18,7 @@ SYSTEM_ACTOR = "system/bootstrap"
 _MAX_DETAIL_KEYS = 20
 _MAX_DETAIL_ITEMS = 20
 _MAX_DETAIL_TEXT = 64
+_MAX_DETAIL_DEPTH = 3
 _VIEWABLE_DETAIL_KEYS = frozenset(
     {
         "active",
@@ -50,7 +51,7 @@ def append_audit(
     entity_id: int | str,
     details: Mapping[str, object] | None = None,
 ) -> AuditEvent:
-    event_details = dict(details or {})
+    event_details = _bounded_detail_mapping(details, reserve_keys=1 if actor is None else 0)
     if actor is None:
         event_details["actor"] = SYSTEM_ACTOR
     event = AuditEvent(
@@ -64,7 +65,54 @@ def append_audit(
     return event
 
 
+def _bounded_detail_value(value: object, *, depth: int) -> object | None:
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:_MAX_DETAIL_TEXT]
+    if depth >= _MAX_DETAIL_DEPTH:
+        return "[truncated]" if isinstance(value, (Mapping, list, tuple)) else None
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if len(result) >= _MAX_DETAIL_ITEMS or not isinstance(key, str):
+                break
+            safe = _bounded_detail_value(item, depth=depth + 1)
+            if safe is not None:
+                result[key[:_MAX_DETAIL_TEXT]] = safe
+        return result
+    if isinstance(value, (list, tuple)):
+        result: list[object] = []
+        for item in value[:_MAX_DETAIL_ITEMS]:
+            safe = _bounded_detail_value(item, depth=depth + 1)
+            if safe is not None:
+                result.append(safe)
+        return result
+    return None
+
+
+def _bounded_detail_mapping(
+    details: Mapping[str, object] | None,
+    *,
+    reserve_keys: int = 0,
+) -> dict[str, object]:
+    if not isinstance(details, Mapping):
+        return {}
+    result: dict[str, object] = {}
+    limit = max(0, _MAX_DETAIL_KEYS - reserve_keys)
+    for key, value in details.items():
+        if len(result) >= limit or not isinstance(key, str):
+            break
+        safe = _bounded_detail_value(value, depth=0)
+        if safe is not None:
+            result[key[:_MAX_DETAIL_TEXT]] = safe
+    return result
+
+
 def _safe_detail_value(value: object) -> object | None:
+    """Keep the admin projection flat enough to avoid leaking nested PII."""
     if isinstance(value, bool) or isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -75,7 +123,7 @@ def _safe_detail_value(value: object) -> object | None:
         result: list[object] = []
         for item in value[:_MAX_DETAIL_ITEMS]:
             safe = _safe_detail_value(item)
-            if safe is not None and not isinstance(safe, list):
+            if safe is not None and not isinstance(safe, (list, dict)):
                 result.append(safe)
         return result
     return None
