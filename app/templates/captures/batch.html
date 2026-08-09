@@ -1,0 +1,227 @@
+{% extends "base.html" %}
+{% block title %}Batch Capture upload — {{ patient.patient_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Batch Capture upload — {{ patient.patient_id }}</h1>
+  <p class="muted">Choose or drop up to {{ batch_max_items }} images. Each image is inspected by the server, then its Capture Date and Shot Type must be reviewed before the batch can be committed. EXIF dates are suggestions only.</p>
+  {% if not patient.consent_confirmed_at %}<p class="error">Consent Confirmation is required before clinical images are stored.</p>{% endif %}
+
+  <form id="batch-form" method="post" action="{{ url_for('captures.commit_batch_upload', patient_pk=patient.id) }}" enctype="multipart/form-data" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div id="batch-drop-zone" role="group" aria-label="Batch image upload" style="border:2px dashed #9aa;padding:1.25rem;text-align:center">
+      Choose multiple images or drag and drop them here.
+      <input id="batch-images" name="images" type="file" multiple accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,.webp,image/*">
+    </div>
+    <p id="batch-status" class="muted" role="status"></p>
+    <div id="batch-review"></div>
+    <button id="batch-commit" type="submit" disabled>Commit reviewed batch</button>
+  </form>
+  <p><a href="{{ url_for('captures.library', patient_pk=patient.id) }}">Back to Capture Library</a></p>
+</section>
+<datalist id="batch-shot-type-options"></datalist>
+<script>
+(() => {
+  const form = document.getElementById('batch-form');
+  const input = document.getElementById('batch-images');
+  const dropZone = document.getElementById('batch-drop-zone');
+  const status = document.getElementById('batch-status');
+  const review = document.getElementById('batch-review');
+  const commit = document.getElementById('batch-commit');
+  const csrf = form.querySelector('input[name="csrf_token"]').value;
+  const inspectUrl = {{ url_for('captures.inspect_batch_upload', patient_pk=patient.id)|tojson }};
+  const shotTypesUrl = {{ url_for('captures.shot_types')|tojson }};
+  const libraryUrl = {{ url_for('captures.library', patient_pk=patient.id)|tojson }};
+  let selectedFiles = [];
+  let inspectedItems = [];
+  let inspectionAccepted = false;
+
+  const syncInput = (files) => {
+    selectedFiles = [...files];
+    try {
+      const transfer = new DataTransfer();
+      selectedFiles.forEach(file => transfer.items.add(file));
+      input.files = transfer.files;
+    } catch (_) {
+      // The final request uses selectedFiles, so older browsers need no
+      // writable FileList implementation for drag/drop.
+    }
+  };
+
+  const updateCommitState = () => {
+    const rows = [...review.querySelectorAll('[data-batch-item]')];
+    commit.disabled = !inspectionAccepted || rows.length !== selectedFiles.length || !rows.length || rows.some(row => {
+      const date = row.querySelector('[data-capture-date]');
+      const dateConfirmed = row.querySelector('[data-date-confirmed]');
+      const shotType = row.querySelector('[data-shot-type]');
+      const shotReviewed = row.querySelector('[data-shot-reviewed]');
+      if (!date || !dateConfirmed || !shotType || !shotReviewed) return true;
+      return !date.value || !dateConfirmed.checked || !shotType.value.trim() || !shotReviewed.checked;
+    });
+  };
+
+  const loadShotTypes = async (inputElement) => {
+    const response = await fetch(`${shotTypesUrl}?q=${encodeURIComponent(inputElement.value)}`);
+    if (!response.ok) return;
+    const options = document.getElementById('batch-shot-type-options');
+    options.replaceChildren(...(await response.json()).map(item => {
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.label = item.state === 'proposal' ? `${item.name} (Proposal)` : item.name;
+      return option;
+    }));
+  };
+
+  const renderReview = (items, errorMessage, accepted = false) => {
+    inspectedItems = items || [];
+    inspectionAccepted = accepted;
+    review.replaceChildren();
+    if (errorMessage && !inspectedItems.length) {
+      const error = document.createElement('p');
+      error.className = 'error';
+      error.textContent = errorMessage;
+      review.append(error);
+    }
+    inspectedItems.forEach(item => {
+      const wrapper = document.createElement('fieldset');
+      wrapper.dataset.batchItem = String(item.index);
+      wrapper.dataset.sha256 = item.sha256 || '';
+      const heading = document.createElement('legend');
+      heading.textContent = `Image ${Number(item.index) + 1}`;
+      wrapper.append(heading);
+      if (!item.ok) {
+        const error = document.createElement('p');
+        error.className = 'error';
+        error.textContent = item.error || 'Image inspection failed.';
+        wrapper.append(error);
+        review.append(wrapper);
+        return;
+      }
+
+      const metadata = document.createElement('p');
+      metadata.className = 'muted';
+      metadata.textContent = `${item.format} · ${item.width} × ${item.height}` +
+        (item.suggested_capture_date ? ` · EXIF suggestion: ${item.suggested_capture_date}` : '');
+      wrapper.append(metadata);
+
+      const dateLabel = document.createElement('label');
+      dateLabel.textContent = 'Authoritative Capture Date';
+      const date = document.createElement('input');
+      date.type = 'date';
+      date.required = true;
+      date.dataset.captureDate = 'true';
+      if (item.suggested_capture_date) date.value = item.suggested_capture_date;
+      dateLabel.append(date);
+      wrapper.append(dateLabel);
+
+      const dateConfirmLabel = document.createElement('label');
+      const dateConfirmed = document.createElement('input');
+      dateConfirmed.type = 'checkbox';
+      dateConfirmed.dataset.dateConfirmed = 'true';
+      dateConfirmLabel.append(dateConfirmed, ' I confirm this date (or have overridden the EXIF suggestion).');
+      wrapper.append(dateConfirmLabel);
+
+      const shotLabel = document.createElement('label');
+      shotLabel.textContent = 'Shot Type';
+      const shotType = document.createElement('input');
+      shotType.type = 'text';
+      shotType.required = true;
+      shotType.maxLength = 200;
+      shotType.setAttribute('list', 'batch-shot-type-options');
+      shotType.autocomplete = 'off';
+      shotType.dataset.shotType = 'true';
+      shotLabel.append(shotType);
+      wrapper.append(shotLabel);
+
+      const shotReviewedLabel = document.createElement('label');
+      const shotReviewed = document.createElement('input');
+      shotReviewed.type = 'checkbox';
+      shotReviewed.dataset.shotReviewed = 'true';
+      shotReviewedLabel.append(shotReviewed, ' I reviewed this Shot Type.');
+      wrapper.append(shotReviewedLabel);
+
+      const proposalLabel = document.createElement('label');
+      const proposal = document.createElement('input');
+      proposal.type = 'checkbox';
+      proposal.dataset.proposal = 'true';
+      proposalLabel.append(proposal, ' Create a Shot Type Proposal when no existing type fits.');
+      wrapper.append(proposalLabel);
+
+      [date, dateConfirmed, shotType, shotReviewed, proposal].forEach(element => {
+        element.addEventListener('input', updateCommitState);
+        element.addEventListener('change', updateCommitState);
+      });
+      shotType.addEventListener('input', () => loadShotTypes(shotType));
+      review.append(wrapper);
+    });
+    updateCommitState();
+    if (errorMessage) status.textContent = errorMessage;
+  };
+
+  const inspect = async (files) => {
+    if (!files.length) return;
+    status.textContent = 'Inspecting images on the server…';
+    commit.disabled = true;
+    const data = new FormData();
+    [...files].forEach(file => data.append('images', file, file.name));
+    data.append('csrf_token', csrf);
+    try {
+      const response = await fetch(inspectUrl, { method: 'POST', body: data });
+      const result = await response.json();
+      renderReview(result.items || [], response.ok ? `Reviewed ${files.length} image(s).` : (result.error || 'Inspection failed.'), response.ok);
+    } catch (_) {
+      renderReview([], 'Could not inspect the selected images.', false);
+    }
+  };
+
+  const chooseFiles = (files) => {
+    syncInput(files);
+    review.replaceChildren();
+    inspectedItems = [];
+    inspectionAccepted = false;
+    updateCommitState();
+    inspect(selectedFiles);
+  };
+
+  input.addEventListener('change', () => chooseFiles(input.files));
+  ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => {
+    event.preventDefault();
+    dropZone.style.background = '#e4edf5';
+  }));
+  ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => {
+    event.preventDefault();
+    dropZone.style.background = '';
+  }));
+  dropZone.addEventListener('drop', event => {
+    if (event.dataTransfer.files.length) chooseFiles(event.dataTransfer.files);
+  });
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (commit.disabled) return;
+    status.textContent = 'Revalidating and committing the batch…';
+    commit.disabled = true;
+    const data = new FormData();
+    selectedFiles.forEach(file => data.append('images', file, file.name));
+    const fields = [...review.querySelectorAll('[data-batch-item]')].map(row => ({
+      capture_date: row.querySelector('[data-capture-date]').value,
+      capture_date_confirmed: row.querySelector('[data-date-confirmed]').checked,
+      shot_type_name: row.querySelector('[data-shot-type]').value.trim(),
+      shot_type_reviewed: row.querySelector('[data-shot-reviewed]').checked,
+      create_proposal: row.querySelector('[data-proposal]').checked,
+      sha256: row.dataset.sha256
+    }));
+    data.append('review_json', JSON.stringify(fields));
+    data.append('csrf_token', csrf);
+    try {
+      const response = await fetch(form.action, { method: 'POST', body: data, headers: {'X-Requested-With': 'XMLHttpRequest'} });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Batch could not be committed.');
+      window.location = libraryUrl;
+    } catch (error) {
+      status.textContent = error.message;
+      updateCommitState();
+    }
+  });
+})();
+</script>
+{% endblock %}
