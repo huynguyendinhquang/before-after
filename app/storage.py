@@ -28,6 +28,7 @@ PREVIEW_MAX_DIMENSION = 1600
 DEFAULT_ORPHAN_GRACE_SECONDS = 300
 MEDIA_DIRECTORY_MODE = 0o2750
 MEDIA_FILE_MODE = 0o640
+PRIVATE_FILE_MODE = 0o600
 _ALLOWED_ROOTS = frozenset({"originals", "previews", "derivatives", "quarantine"})
 _HEX_KEY = re.compile(r"^[0-9a-f]{32}$")
 _PENDING_PREFIX = ".pending-"
@@ -44,6 +45,48 @@ _POSIX_DIRFD = (
     and os.unlink in os.supports_dir_fd
     and os.link in os.supports_dir_fd
 )
+
+
+def _managed_file_mode(name: str) -> int:
+    """Return the mode for one entry in the managed media tree."""
+    if (
+        name == ".reconcile.lock"
+        or _PENDING_MARKER_NAME.fullmatch(name)
+        or _CAPTURE_DELETE_MARKER_NAME.fullmatch(name)
+        or name.endswith(".tmp")
+    ):
+        return PRIVATE_FILE_MODE
+    return MEDIA_FILE_MODE
+
+
+def apply_media_permissions(root: str | os.PathLike[str]) -> None:
+    """Normalize deployment modes without broad-chmodding private markers.
+
+    This is intentionally a small, explicit permission helper for bootstrap
+    and clinic-host verification.  It never follows symlinks and keeps the
+    reconciliation lock and durable operation markers at 0600.
+    """
+    path = Path(root).expanduser().absolute()
+    if not path.is_dir() or path.is_symlink():
+        raise StorageError("MEDIA_ROOT must be a regular directory")
+    try:
+        os.chmod(path, MEDIA_DIRECTORY_MODE, follow_symlinks=False)
+        for current, directories, files in os.walk(path, topdown=True, followlinks=False):
+            current_path = Path(current)
+            for name in directories:
+                entry = current_path / name
+                if entry.is_symlink():
+                    raise StorageError("symlinks are not allowed in MEDIA_ROOT")
+                os.chmod(entry, MEDIA_DIRECTORY_MODE, follow_symlinks=False)
+            for name in files:
+                entry = current_path / name
+                if entry.is_symlink():
+                    raise StorageError("symlinks are not allowed in MEDIA_ROOT")
+                os.chmod(entry, _managed_file_mode(name), follow_symlinks=False)
+    except StorageError:
+        raise
+    except OSError as exc:
+        raise StorageError("could not apply MEDIA_ROOT permissions") from exc
 
 
 class StorageError(ValueError):
@@ -218,8 +261,9 @@ class ManagedStorage:
                 dir_fd=self._root_fd,
             )
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            if not stat.S_ISREG(info.st_mode):
                 raise StorageError("reconciliation lock is unsafe")
+            os.fchmod(fd, PRIVATE_FILE_MODE)
             fcntl.flock(fd, fcntl.LOCK_EX)
             return fd
         except StorageError:
@@ -291,7 +335,7 @@ class ManagedStorage:
                 if written <= 0:
                     raise OSError("could not write pending marker")
                 view = view[written:]
-            os.fchmod(fd, MEDIA_FILE_MODE)
+            os.fchmod(fd, PRIVATE_FILE_MODE)
             os.fsync(fd)
             os.replace(
                 temporary_name,

@@ -60,6 +60,7 @@ install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT_DEFAULT"
 for media_dir in originals previews derivatives quarantine; do
     install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT_DEFAULT/$media_dir"
 done
+MEDIA_ROOT="$MEDIA_ROOT_DEFAULT" "$RELEASE_DIR/deploy/normalize-media-permissions.sh"
 install -d -o root -g root -m 0750 /etc/before-after
 
 if (( prepare_only )); then
@@ -101,6 +102,12 @@ set +a
 MEDIA_ROOT="${MEDIA_ROOT:-$MEDIA_ROOT_DEFAULT}"
 APP_ENV="${APP_ENV:-production}"
 TRUSTED_PROXY_COUNT="${TRUSTED_PROXY_COUNT:-1}"
+
+install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT"
+for media_dir in originals previews derivatives quarantine; do
+    install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT/$media_dir"
+done
+MEDIA_ROOT="$MEDIA_ROOT" "$RELEASE_DIR/deploy/normalize-media-permissions.sh"
 
 cd "$RELEASE_DIR"
 run_as_app() {

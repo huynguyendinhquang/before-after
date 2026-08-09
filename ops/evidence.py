@@ -15,9 +15,14 @@ import sys
 CHECK_COMMANDS = {
     "shell_syntax": [
         "bash",
-        "-n",
+        "-c",
+        "for script in \"$@\"; do bash -n \"$script\" || exit; done",
+        "bash",
         "deploy/bootstrap.sh",
         "ops/backup.sh",
+        "deploy/normalize-media-permissions.sh",
+        "deploy/verify-permissions.sh",
+        "scripts/test-dac.sh",
         "scripts/test-postgres.sh",
     ],
     "python_compile": [sys.executable, "-m", "compileall", "-q", "app", "migrations", "ops", "tests"],
@@ -64,6 +69,7 @@ def generate(output: Path, repo_root: Path) -> int:
         "checks": checks,
         "clinic_hardware_uat": "not_run",
         "clinic_tls_uat": "not_run",
+        "clinic_permission_proof": "run deploy/verify-permissions.sh on the clinic host",
         "clinical_data": "not_collected",
     }
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

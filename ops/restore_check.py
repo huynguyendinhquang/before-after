@@ -25,6 +25,7 @@ from ops.backup import (
     MANIFEST_FORMAT_VERSION,
     MANIFEST_NAME,
     MEDIA_DIRS,
+    POSTGRES_CLIENTS,
     OpsError,
     _assert_no_symlink_components,
     _fsync_directory,
@@ -34,6 +35,7 @@ from ops.backup import (
     _path,
     _path_overlap,
     _postgres_environment,
+    postgres_preflight,
     _private_directory,
     _private_file,
     _run_native,
@@ -42,6 +44,7 @@ from ops.backup import (
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CSRF_RE = re.compile(r'name="csrf_token"[^>]*value="([^"]+)"')
+_OWNER_MARKER_RE = re.compile(r"^before-after-restore-[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,40 @@ class RestoreResult:
     migration_checked: bool
     database_media_checked: bool
     smoke_checked: bool
+
+
+def _owner_marker_path(parent: Path, target: Path) -> Path:
+    return parent / f".{target.name}.restore-owner"
+
+
+def _write_owner_marker(parent: Path, target: Path, marker: str) -> None:
+    if _OWNER_MARKER_RE.fullmatch(marker) is None:
+        raise OpsError("restore ownership marker is invalid")
+    path = _owner_marker_path(parent, target)
+    _assert_no_symlink_components(path)
+    try:
+        with path.open("x", encoding="ascii") as stream:
+            stream.write(marker + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, 0o600)
+        _fsync_directory(parent)
+    except FileExistsError as exc:
+        raise OpsError("restore ownership marker already exists") from exc
+    except OSError as exc:
+        raise OpsError("could not record restore ownership marker") from exc
+
+
+def _read_owner_marker(parent: Path, target: Path) -> str:
+    path = _owner_marker_path(parent, target)
+    _private_file(path, label="restore ownership marker")
+    try:
+        marker = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise OpsError("could not read restore ownership marker") from exc
+    if _OWNER_MARKER_RE.fullmatch(marker) is None:
+        raise OpsError("restore ownership marker is invalid")
+    return marker
 
 
 def _safe_manifest_path(value: object) -> str:
@@ -135,11 +172,31 @@ def verify_generation(path: str | os.PathLike[str]) -> VerifiedGeneration:
         raise OpsError("backup generation is incomplete")
     database = manifest.get("database")
     media = manifest.get("media")
+    postgres = manifest.get("postgresql")
     raw_files = manifest.get("files")
     if not isinstance(database, dict) or database.get("path") != DATABASE_DUMP_NAME or database.get("format") != "custom":
         raise OpsError("backup database entry is invalid")
     if not isinstance(media, dict) or media.get("path") != "media":
         raise OpsError("backup media entry is invalid")
+    if not isinstance(postgres, dict):
+        raise OpsError("backup PostgreSQL preflight entry is missing")
+    if postgres.get("test_only") is not True:
+        server_major = postgres.get("server_major")
+        client_majors = postgres.get("client_majors")
+        if (
+            isinstance(server_major, bool)
+            or not isinstance(server_major, int)
+            or not 9 <= server_major <= 99
+            or not isinstance(client_majors, dict)
+            or set(client_majors) != set(POSTGRES_CLIENTS)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != server_major
+                for value in client_majors.values()
+            )
+        ):
+            raise OpsError("backup PostgreSQL preflight entry is invalid")
     if media.get("directories") != list(MEDIA_DIRS):
         raise OpsError("backup media directories are invalid")
     if not isinstance(raw_files, list) or not raw_files:
@@ -214,6 +271,47 @@ def select_generation(
     # never silently skipped in favour of an older good copy.
     verified = [verify_generation(entry) for entry in candidates]
     return verified[-1]
+
+
+def postgres_restore_preflight(
+    generation: VerifiedGeneration,
+    target_database_url: str,
+    *,
+    pg_dump: str = "pg_dump",
+    pg_restore: str = "pg_restore",
+    psql: str = "psql",
+    source_database_url: str | None = None,
+) -> dict[str, object] | None:
+    """Reject a restore when its native clients or target major differ."""
+    metadata = generation.manifest.get("postgresql")
+    if not isinstance(metadata, dict):
+        raise OpsError("backup PostgreSQL preflight entry is missing")
+    if metadata.get("test_only") is True:
+        return None
+    expected = metadata.get("server_major")
+    if isinstance(expected, bool) or not isinstance(expected, int):
+        raise OpsError("backup PostgreSQL server major is invalid")
+    target = postgres_preflight(
+        target_database_url,
+        pg_dump=pg_dump,
+        pg_restore=pg_restore,
+        psql=psql,
+    )
+    if target.get("server_major") != expected:
+        raise OpsError(
+            f"PostgreSQL restore target major {target.get('server_major')} "
+            f"does not match backup major {expected}"
+        )
+    if source_database_url is not None:
+        source = postgres_preflight(
+            source_database_url,
+            pg_dump=pg_dump,
+            pg_restore=pg_restore,
+            psql=psql,
+        )
+        if source.get("server_major") != expected:
+            raise OpsError("PostgreSQL source major does not match backup manifest")
+    return target
 
 
 def _connection_database_identity(value: str) -> tuple[object, ...]:
@@ -297,8 +395,11 @@ def _database_name(value: str) -> str:
 def create_isolated_database(
     target_database_url: str,
     production_database_urls: Iterable[str],
-) -> None:
-    """Create a new target DB only after server/database identity guards."""
+    *,
+    restore_parent: str | os.PathLike[str] | None = None,
+    target_media_root: str | os.PathLike[str] | None = None,
+) -> str:
+    """Create and mark a new target DB through a mandatory admin connection."""
     production_urls = tuple(
         value for value in production_database_urls if isinstance(value, str) and value.strip()
     )
@@ -314,6 +415,8 @@ def create_isolated_database(
         import psycopg
     except ImportError as exc:
         raise OpsError("psycopg is required to create the restore database") from exc
+    marker = f"before-after-restore-{uuid.uuid4().hex}"
+    created = False
     try:
         with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
@@ -321,10 +424,78 @@ def create_isolated_database(
                 if cursor.fetchone() is not None:
                     raise OpsError("restore target database already exists; choose a new isolated name")
                 cursor.execute(f'CREATE DATABASE "{target_name}"')
+                created = True
+                cursor.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{marker}'")
+        if restore_parent is not None:
+            parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+            target = _path(
+                target_media_root if target_media_root is not None else parent / "media",
+                "restore MEDIA_ROOT",
+            )
+            _write_owner_marker(parent, target, marker)
+        return marker
     except OpsError:
+        if created:
+            try:
+                with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+                    connection.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+            except Exception as rollback_exc:
+                raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
         raise
     except Exception as exc:
+        if created:
+            try:
+                with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+                    connection.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+            except Exception as rollback_exc:
+                raise OpsError("restore database provisioning failed; target is poisoned") from rollback_exc
         raise OpsError("could not create isolated restore database") from exc
+
+
+def provision_isolated_target(
+    *,
+    target_database_url: str,
+    target_media_root: str | os.PathLike[str],
+    restore_parent: str | os.PathLike[str],
+    production_database_urls: Iterable[str],
+    production_media_roots: Iterable[str | os.PathLike[str]] = (),
+    backup_root: str | os.PathLike[str] | None = None,
+) -> str:
+    """Create the owned database first, then its empty media destination."""
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    marker = create_isolated_database(
+        target_database_url,
+        production_database_urls,
+        restore_parent=parent,
+        target_media_root=target_media_root,
+    )
+    try:
+        prepare_isolated_media_target(
+            target_media_root,
+            parent,
+            backup_root=backup_root,
+            production_media_roots=production_media_roots,
+        )
+    except Exception as exc:
+        try:
+            _drop_owned_database(
+                target_database_url=target_database_url,
+                ownership_marker=marker,
+                restore_parent=parent,
+                target_media_root=target_media_root,
+                production_database_urls=production_database_urls,
+                production_media_roots=production_media_roots,
+                backup_root=backup_root,
+                remove_media=False,
+            )
+        except OpsError as rollback_exc:
+            try:
+                _mark_restore_failed(parent, _path(target_media_root, "restore MEDIA_ROOT"), poisoned=True)
+            except OpsError:
+                pass
+            raise OpsError("restore target provisioning failed; target is poisoned") from rollback_exc
+        raise OpsError("could not provision isolated restore target") from exc
+    return marker
 
 
 def assert_isolated_targets(
@@ -500,7 +671,7 @@ def stage_verified_generation(
     finally:
         os.umask(old_umask)
         if not completed and (staging.exists() or os.path.lexists(staging)):
-            _remove_private_path(staging)
+            _remove_private_path_strict(staging)
 
 
 def restore_media(generation: VerifiedGeneration, target: Path) -> None:
@@ -546,7 +717,7 @@ def restore_media(generation: VerifiedGeneration, target: Path) -> None:
     finally:
         os.umask(old_umask)
         if staging.exists() or os.path.lexists(staging):
-            _remove_private_path(staging)
+            _remove_private_path_strict(staging)
 
 
 def verify_restored_media(generation: VerifiedGeneration, target: Path) -> None:
@@ -735,6 +906,18 @@ def smoke_check(
         raise OpsError("restore smoke export failed")
 
 
+def assert_active_login(application) -> None:
+    """Require an active account from the restored backup before provisioning smoke credentials."""
+    from sqlalchemy import select
+
+    from app.db import db
+    from app.models import User
+
+    with application.app_context():
+        if db.session.scalar(select(User.id).where(User.active.is_(True)).limit(1)) is None:
+            raise OpsError("restored database has no active login")
+
+
 def ensure_smoke_account(application, username: str, password: str) -> bool:
     """Create a disposable Editor in the restored DB only when it is absent."""
     from sqlalchemy import select
@@ -764,32 +947,28 @@ def ensure_smoke_account(application, username: str, password: str) -> bool:
     return True
 
 
+def remove_smoke_account(application, username: str) -> None:
+    """Remove only the account created explicitly for this restore smoke."""
+    from sqlalchemy import select
+
+    from app.db import db
+    from app.models import User
+
+    with application.app_context():
+        user = db.session.scalar(select(User).where(User.username == username.casefold()))
+        if user is None:
+            raise OpsError("temporary restore smoke account is missing during cleanup")
+        try:
+            db.session.delete(user)
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            raise OpsError("could not remove temporary restore smoke account") from exc
+
+
 def _remove_private_path(path: Path) -> None:
-    """Remove only the named restore artifact; never follow a symlink."""
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    try:
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            path.unlink()
-        else:
-            for current, directories, files in os.walk(path, topdown=False, followlinks=False):
-                current_path = Path(current)
-                for name in files:
-                    file_path = current_path / name
-                    if not file_path.is_symlink():
-                        os.chmod(file_path, 0o600)
-                for name in directories:
-                    directory = current_path / name
-                    if not directory.is_symlink():
-                        os.chmod(directory, 0o700)
-            os.chmod(path, 0o700)
-            shutil.rmtree(path)
-    except OSError:
-        pass
+    """Remove only the named restore artifact and report deletion failures."""
+    _remove_private_path_strict(path)
 
 
 def _remove_private_path_strict(path: Path) -> None:
@@ -825,19 +1004,121 @@ def _maintenance_database_url(value: str) -> str:
     return urlunsplit(("postgresql", parsed.netloc, "/postgres", parsed.query, parsed.fragment))
 
 
-def _cleanup_restore_database(target_database_url: str) -> None:
-    """Empty an isolated target database after a failed restore drill."""
+def _drop_owned_database(
+    *,
+    target_database_url: str,
+    ownership_marker: str,
+    restore_parent: str | os.PathLike[str],
+    target_media_root: str | os.PathLike[str],
+    production_database_urls: Iterable[str],
+    production_media_roots: Iterable[str | os.PathLike[str]] = (),
+    backup_root: str | os.PathLike[str] | None = None,
+    remove_media: bool = True,
+) -> None:
+    """Drop only a database carrying this run's ownership marker."""
+    if _OWNER_MARKER_RE.fullmatch(ownership_marker) is None:
+        raise OpsError("restore ownership marker is invalid")
+    production_urls = tuple(
+        value for value in production_database_urls if isinstance(value, str) and value.strip()
+    )
+    if not production_urls:
+        raise OpsError("a production database identifier is required before cleanup")
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    if remove_media:
+        _assert_no_symlink_components(target)
+        if target == parent or not _path_overlap(target, parent):
+            raise OpsError("restore target must be inside the private restore parent")
+        if backup_root is not None and _path_overlap(target, _path(backup_root, "BACKUP_ROOT")):
+            raise OpsError("restore MEDIA_ROOT must be outside backup storage")
+        for value in production_media_roots:
+            production = _path(value, "production MEDIA_ROOT")
+            _assert_no_symlink_components(production, allow_missing_leaf=False)
+            if _path_overlap(target, production):
+                raise OpsError("restore MEDIA_ROOT is a production media destination")
+    else:
+        try:
+            target.relative_to(parent)
+        except ValueError as exc:
+            raise OpsError("restore target must be inside the private restore parent") from exc
+        if target == parent:
+            raise OpsError("restore target must be inside the private restore parent")
+    if _read_owner_marker(parent, target) != ownership_marker:
+        raise OpsError("restore ownership marker does not match this run")
+
+    target_server = _connection_server_identity(target_database_url)
+    target_name = _database_name(target_database_url)
+    for production_url in production_urls:
+        production_identity = _connection_database_identity(production_url)
+        if target_server == production_identity[:3] and target_name == production_identity[3]:
+            raise OpsError("refusing to clean a production database")
     try:
         import psycopg
     except ImportError as exc:
         raise OpsError("psycopg is required to clean the restore database") from exc
     try:
-        with psycopg.connect(_native_postgres_url(target_database_url), autocommit=True) as connection:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("DROP SCHEMA IF EXISTS public CASCADE")
-                cursor.execute("CREATE SCHEMA public")
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+                    (target_name,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise OpsError("owned restore database is missing")
+                if row[0] not in {None, ownership_marker}:
+                    raise OpsError("restore database ownership marker does not match")
+                if row[0] is None:
+                    cursor.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{ownership_marker}'")
+                cursor.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+    except OpsError:
+        raise
     except Exception as exc:
-        raise OpsError("could not clean isolated restore database; target is poisoned") from exc
+        raise OpsError("could not drop owned isolated restore database") from exc
+    if remove_media:
+        _remove_private_path_strict(target)
+    _remove_private_path_strict(_owner_marker_path(parent, target))
+
+
+def _assert_owned_database(target_database_url: str, ownership_marker: str) -> None:
+    """Verify the database comment before any restore command can mutate it."""
+    if _OWNER_MARKER_RE.fullmatch(ownership_marker) is None:
+        raise OpsError("restore ownership marker is invalid")
+    target_name = _database_name(target_database_url)
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to verify restore ownership") from exc
+    try:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+                    (target_name,),
+                )
+                row = cursor.fetchone()
+    except Exception as exc:
+        raise OpsError("could not verify restore database ownership") from exc
+    if row is None or row[0] != ownership_marker:
+        raise OpsError("restore target database is not owned by this run")
+
+
+def _set_owned_database_comment(target_database_url: str, ownership_marker: str) -> None:
+    """Restore the ownership comment after pg_restore may replace it."""
+    if _OWNER_MARKER_RE.fullmatch(ownership_marker) is None:
+        raise OpsError("restore ownership marker is invalid")
+    target_name = _database_name(target_database_url)
+    try:
+        import psycopg
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            connection.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{ownership_marker}'")
+    except Exception as exc:
+        raise OpsError("could not preserve restore database ownership marker") from exc
+
+
+def _cleanup_restore_database(target_database_url: str) -> None:
+    """Legacy test seam; production cleanup requires an ownership marker."""
+    raise OpsError("restore database cleanup requires an ownership marker")
 
 
 def _mark_restore_failed(parent: Path, target: Path, *, poisoned: bool = False) -> None:
@@ -887,19 +1168,13 @@ def prepare_isolated_media_target(
         _assert_no_symlink_components(production, allow_missing_leaf=False)
         if _path_overlap(target, production):
             raise OpsError("restore MEDIA_ROOT is a production media destination")
-    if target.exists():
-        _private_directory(target, create=False)
-        try:
-            if any(target.iterdir()):
-                raise OpsError("restore MEDIA_ROOT must be empty and isolated")
-        except OSError as exc:
-            raise OpsError("restore MEDIA_ROOT is not usable") from exc
-    else:
-        try:
-            target.mkdir(mode=0o700)
-            os.chmod(target, 0o700)
-        except OSError as exc:
-            raise OpsError("could not create isolated restore MEDIA_ROOT") from exc
+    if target.exists() or os.path.lexists(target):
+        raise OpsError("restore MEDIA_ROOT already exists; choose a new isolated target")
+    try:
+        target.mkdir(mode=0o700)
+        os.chmod(target, 0o700)
+    except OSError as exc:
+        raise OpsError("could not create isolated restore MEDIA_ROOT") from exc
     return target
 
 
@@ -911,46 +1186,36 @@ def cleanup_isolated_target(
     production_database_urls: Iterable[str],
     production_media_roots: Iterable[str | os.PathLike[str]] = (),
     backup_root: str | os.PathLike[str] | None = None,
+    ownership_marker: str | None = None,
 ) -> None:
-    """Drop a guarded isolated DB and remove its restore media."""
-    production_urls = tuple(
-        value for value in production_database_urls if isinstance(value, str) and value.strip()
-    )
-    if not production_urls:
-        raise OpsError("a production database identifier is required before cleanup")
+    """Drop only this run's owned database and remove its restore media."""
     target = _path(target_media_root, "restore MEDIA_ROOT")
     parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
-    _assert_no_symlink_components(target)
-    if target == parent or not _path_overlap(target, parent):
-        raise OpsError("restore target must be inside the private restore parent")
-    if backup_root is not None and _path_overlap(target, _path(backup_root, "BACKUP_ROOT")):
-        raise OpsError("restore MEDIA_ROOT must be outside backup storage")
-    for value in production_media_roots:
-        production = _path(value, "production MEDIA_ROOT")
-        _assert_no_symlink_components(production, allow_missing_leaf=False)
-        if _path_overlap(target, production):
-            raise OpsError("restore MEDIA_ROOT is a production media destination")
-
-    target_server = _connection_server_identity(target_database_url)
-    target_name = _database_name(target_database_url)
-    for production_url in production_urls:
-        production_identity = _connection_database_identity(production_url)
-        if target_server == production_identity[:3] and target_name == production_identity[3]:
-            raise OpsError("refusing to clean a production database")
+    marker = ownership_marker or _read_owner_marker(parent, target)
     try:
-        import psycopg
-    except ImportError as exc:
-        raise OpsError("psycopg is required to clean the restore database") from exc
+        _drop_owned_database(
+            target_database_url=target_database_url,
+            ownership_marker=marker,
+            restore_parent=parent,
+            target_media_root=target,
+            production_database_urls=production_database_urls,
+            production_media_roots=production_media_roots,
+            backup_root=backup_root,
+        )
+    except OpsError as exc:
+        try:
+            _mark_restore_failed(parent, target, poisoned=True)
+        except OpsError as marker_exc:
+            raise OpsError("isolated target cleanup failed; target is poisoned") from marker_exc
+        raise OpsError("isolated target cleanup failed; target is poisoned") from exc
     try:
-        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_name,))
-                if cursor.fetchone() is not None:
-                    cursor.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
-    except Exception as exc:
-        raise OpsError("could not drop isolated restore database") from exc
-    _remove_private_path_strict(target)
-    _remove_private_path_strict(parent / f".{target.name}.restore-failed")
+        _remove_private_path_strict(parent / f".{target.name}.restore-failed")
+    except OpsError as exc:
+        try:
+            _mark_restore_failed(parent, target, poisoned=True)
+        except OpsError as marker_exc:
+            raise OpsError("isolated target cleanup failed; target is poisoned") from marker_exc
+        raise OpsError("isolated target cleanup failed; target is poisoned") from exc
 
 
 def run_restore_check(
@@ -962,10 +1227,13 @@ def run_restore_check(
     production_database_urls: Iterable[str] = (),
     production_media_roots: Iterable[str | os.PathLike[str]] = (),
     source_database_url: str | None = None,
+    pg_dump: str = "pg_dump",
+    psql: str = "psql",
     pg_restore: str = "pg_restore",
     repo_root: str | os.PathLike[str] | None = None,
     alembic_ini: str | os.PathLike[str] | None = None,
     restore_parent: str | os.PathLike[str] | None = None,
+    ownership_marker: str | None = None,
     smoke_username: str | None = None,
     smoke_password: str | None = None,
     create_smoke_account: bool = False,
@@ -984,19 +1252,41 @@ def run_restore_check(
         production_media_roots=production_media_roots,
         source_database_url=source_database_url,
     )
+    postgres_restore_preflight(
+        selected,
+        target_database_url,
+        pg_dump=pg_dump,
+        pg_restore=pg_restore,
+        psql=psql,
+        source_database_url=source_database_url,
+    )
     parent = _private_directory(
         _path(restore_parent, "restore parent") if restore_parent is not None else target.parent,
         create=False,
     )
     if target == parent or not _path_overlap(target, parent):
         raise OpsError("restore target must be inside the private restore parent")
+    postgres_metadata = selected.manifest.get("postgresql")
+    test_only_target = isinstance(postgres_metadata, dict) and postgres_metadata.get("test_only") is True
+    if test_only_target:
+        if ownership_marker is not None:
+            raise OpsError("test-only restore targets cannot carry a production ownership marker")
+    else:
+        if not isinstance(ownership_marker, str):
+            raise OpsError("restore target must be provisioned by this run")
+        if _read_owner_marker(parent, target) != ownership_marker:
+            raise OpsError("restore ownership marker does not match this run")
+        _assert_owned_database(target_database_url, ownership_marker)
     source_staging: Path | None = None
     completed = False
+    smoke_account_created = False
     try:
         staged, source_staging = stage_verified_generation(selected, parent, pg_restore=pg_restore)
         restore_media(staged, target)
         verify_restored_media(staged, target)
         restore_database(staged, target_database_url=target_database_url, pg_restore=pg_restore)
+        if not test_only_target:
+            _set_owned_database_comment(target_database_url, ownership_marker or "")
         root = _path(repo_root, "repository root") if repo_root is not None else Path(__file__).resolve().parents[1]
         config = _path(alembic_ini, "alembic configuration") if alembic_ini is not None else None
         migration_check(
@@ -1020,7 +1310,8 @@ def run_restore_check(
             }
         )
         if create_smoke_account:
-            ensure_smoke_account(application, smoke_username, smoke_password)
+            assert_active_login(application)
+            smoke_account_created = ensure_smoke_account(application, smoke_username, smoke_password)
         _database_media_check(application, target)
         smoke_check(
             target_database_url=target_database_url,
@@ -1041,30 +1332,39 @@ def run_restore_check(
     except Exception as exc:
         raise OpsError("isolated restore check failed") from exc
     finally:
+        cleanup_errors: list[BaseException] = []
+        if smoke_account_created:
+            try:
+                remove_smoke_account(application, smoke_username)
+            except OpsError as exc:
+                cleanup_errors.append(exc)
+        if source_staging is not None:
+            try:
+                _remove_private_path_strict(source_staging)
+            except OpsError as exc:
+                cleanup_errors.append(exc)
         if not completed:
-            cleanup_errors: list[BaseException] = []
-            if source_staging is not None:
-                try:
-                    _remove_private_path_strict(source_staging)
-                except OpsError as exc:
-                    cleanup_errors.append(exc)
             try:
                 _remove_private_path_strict(target)
             except OpsError as exc:
                 cleanup_errors.append(exc)
+            if test_only_target:
+                try:
+                    _cleanup_restore_database(target_database_url)
+                except OpsError as exc:
+                    cleanup_errors.append(exc)
             try:
-                _cleanup_restore_database(target_database_url)
+                _mark_restore_failed(parent, target, poisoned=bool(cleanup_errors))
             except OpsError as exc:
                 cleanup_errors.append(exc)
             if cleanup_errors:
-                try:
-                    _mark_restore_failed(parent, target, poisoned=True)
-                except OpsError as exc:
-                    cleanup_errors.append(exc)
                 raise OpsError("restore failed and cleanup failed; target is poisoned") from cleanup_errors[0]
-            _mark_restore_failed(parent, target)
-        elif source_staging is not None:
-            _remove_private_path(source_staging)
+        elif cleanup_errors:
+            try:
+                _mark_restore_failed(parent, target, poisoned=True)
+            except OpsError as exc:
+                cleanup_errors.append(exc)
+            raise OpsError("restore passed checks but cleanup failed; target is poisoned") from cleanup_errors[0]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1082,7 +1382,9 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("PRODUCTION_MEDIA_ROOT", os.environ.get("MEDIA_ROOT")),
     )
     parser.add_argument("--source-database-url", default=os.environ.get("BACKUP_SOURCE_DATABASE_URL"))
+    parser.add_argument("--pg-dump", default=os.environ.get("PG_DUMP", "pg_dump"))
     parser.add_argument("--pg-restore", default=os.environ.get("PG_RESTORE", "pg_restore"))
+    parser.add_argument("--psql", default=os.environ.get("PSQL", "psql"))
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--alembic-ini", default=None)
     parser.add_argument("--restore-parent", default=os.environ.get("RESTORE_CHECK_PARENT"))
@@ -1133,6 +1435,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print("restore target cleaned")
             return 0
+        if not args.provision_target:
+            raise OpsError("restore-check requires --provision-target; existing targets are never restored")
         if args.smoke_password_file:
             smoke_password = _read_secret_file(args.smoke_password_file)
         elif args.smoke_password_stdin:
@@ -1141,22 +1445,19 @@ def main(argv: list[str] | None = None) -> int:
             smoke_password = os.environ["RESTORE_SMOKE_PASSWORD"]
         else:
             raise OpsError("restore smoke password file, stdin, or environment is required")
-        if args.provision_target:
-            if not args.target_database_url or not args.target_media_root:
-                raise OpsError("target database and media URLs are required to provision a restore target")
-            prepare_isolated_media_target(
-                args.target_media_root,
-                args.restore_parent or str(Path(args.target_media_root).parent),
-                backup_root=args.backup_root,
-                production_media_roots=(args.production_media_root,)
-                if args.production_media_root
-                else (),
-            )
-            create_isolated_database(
-                args.target_database_url,
-                (*production_database_urls,)
-                + ((args.source_database_url,) if args.source_database_url else ()),
-            )
+        if not args.target_database_url or not args.target_media_root or not args.restore_parent:
+            raise OpsError("target database, media root, and restore parent are required to provision a restore target")
+        ownership_marker = provision_isolated_target(
+            target_database_url=args.target_database_url,
+            target_media_root=args.target_media_root,
+            restore_parent=args.restore_parent,
+            production_database_urls=(
+                *production_database_urls,
+                *((args.source_database_url,) if args.source_database_url else ()),
+            ),
+            production_media_roots=(args.production_media_root,) if args.production_media_root else (),
+            backup_root=args.backup_root,
+        )
         result = run_restore_check(
             backup_root=args.backup_root,
             target_database_url=args.target_database_url,
@@ -1165,10 +1466,13 @@ def main(argv: list[str] | None = None) -> int:
             production_database_urls=(args.production_database_url,) if args.production_database_url else (),
             production_media_roots=(args.production_media_root,) if args.production_media_root else (),
             source_database_url=args.source_database_url,
+            pg_dump=args.pg_dump,
+            psql=args.psql,
             pg_restore=args.pg_restore,
             repo_root=args.repo_root,
             alembic_ini=args.alembic_ini,
             restore_parent=args.restore_parent,
+            ownership_marker=ownership_marker,
             smoke_username=args.smoke_username,
             smoke_password=smoke_password,
             create_smoke_account=args.create_smoke_account,

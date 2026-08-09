@@ -38,7 +38,7 @@ sudo /opt/before-after/deploy/bootstrap.sh --prepare-only
 sudo chown -R root:root /opt/before-after
 sudo python3 -m venv /opt/before-after/.venv
 sudo apt-get update
-sudo apt-get install --yes postgresql-client
+sudo apt-get install --yes postgresql-client-16
 sudo /opt/before-after/.venv/bin/pip install --requirement /opt/before-after/requirements.txt
 
 sudo install -o root -g before-after -m 0640 \
@@ -65,13 +65,13 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
 After upgrading an existing host, normalize the pre-group media tree once as
-root. New directories are setgid `2750` and new originals/previews/derivatives
-are created `0640` by `ManagedStorage`:
+root. The helper explicitly sets managed directories to `2750`, clinical files
+to `0640`, and pending/delete markers plus `.reconcile.lock` to `0600`; do not
+replace it with `chmod -R`:
 
 ```bash
-sudo chown -R before-after:before-after-media /var/lib/before-after/media
-sudo find /var/lib/before-after/media -type d -exec chmod 2750 {} +
-sudo find /var/lib/before-after/media -type f -exec chmod 0640 {} +
+sudo /opt/before-after/deploy/normalize-media-permissions.sh
+sudo MEDIA_ROOT=/var/lib/before-after/media /opt/before-after/deploy/verify-permissions.sh
 ```
 
 ## Mount and install the backup service
@@ -104,7 +104,7 @@ sudo systemctl enable --now before-after-backup.timer
 sudo systemctl start before-after-backup.service
 ```
 
-The backup service runs as `before-after-backup`. Only its `+`
+The backup service runs as `before-after-backup`. Only its
 `ExecStartPre`/`ExecStopPost` commands stop and start the app; the Python
 backup process never runs as root. `ops/backup.sh` fails closed unless
 `systemctl is-active` explicitly reports `inactive` (including systemd's
@@ -115,7 +115,11 @@ The backup code also requires `BACKUP_ROOT` to resolve to a non-root mount,
 rejects symlink/unsafe ACLs, requires mode `0700` and ownership by the current
 backup uid, and compares `findmnt` sources through `lsblk` top-level devices.
 NFS and removable media are accepted when their sources differ from the media
-source. There is no production same-device CLI bypass.
+source. Native `pg_dump`, `pg_restore`, and `psql` are preflighted against the
+actual source server; all majors must match. The source major and all client
+majors are recorded in the manifest, and restore rejects a target with a
+different major. Install `postgresql-client-16` for a PostgreSQL 16 clinic.
+There is no production same-device CLI bypass.
 
 Check the actual mount and ownership before enabling the timer:
 
@@ -163,9 +167,12 @@ aliases cannot bypass the guard. Media paths use realpath/inode/containment and
 reject symlink components.
 
 Choose a new target database name on the same PostgreSQL cluster (for example,
-`before_after_restore_20260809`) and create the private restore parent. The
-`--provision-target` helper performs the guarded database creation and creates
-an empty `0700` media target; it refuses an existing database:
+`before_after_restore_20260809`) and create the private restore parent. Never
+run `CREATE DATABASE` or restore into an existing target yourself. The
+`--provision-target` flow uses a mandatory admin connection, refuses an existing
+name, records a per-run ownership marker in `pg_database`, then creates the
+empty `0700` media target. If media provisioning fails, the newly created DB is
+rolled back:
 
 ```bash
 sudo install -d -o root -g root -m 0700 /var/lib/before-after/restore-drills
@@ -182,10 +189,12 @@ Set `RESTORE_CHECK_DATABASE_URL` to the new database name,
 `RESTORE_CHECK_MEDIA_ROOT` to
 `/var/lib/before-after/restore-drills/media`, and
 `RESTORE_SMOKE_USERNAME` to a temporary username. The protected password file
-is used for that account. `--create-smoke-account` creates an active Editor in
-the restored target only when that username is absent; if the restored dump
-already contains an active Editor/Admin with that name, it reuses it. It never
-creates an account in production.
+is used for that account. The restored backup must already contain an active
+login and an active Comparison Set. `--create-smoke-account` may create the
+named temporary Editor only in the owned isolated DB when it is absent; the
+account is removed explicitly after the smoke, and the owned DB is always
+cleaned on failure or by the cleanup trap. It never creates an account in
+production.
 
 Run the tool with URLs from the protected env file, not command arguments. The
 smoke password is read from a mode-`0600` file; it is not a CLI option:
@@ -229,9 +238,10 @@ used, members are checked for traversal, links, devices, and non-file types
 before extraction. Restore, migration, database/media checksum, or smoke
 failure removes restored media and staging and writes a private
 `.<target>.restore-failed` disposable marker. It never leaves clinical assets
-behind. Cleanup also drops/recreates the isolated database's `public` schema;
-if any cleanup step fails, the command fails loudly and marks the target
-`POISONED` so it must be destroyed before another drill.
+behind. The cleanup command drops only the database carrying this run's
+ownership marker; it never cleans an existing database. If any cleanup step
+fails, the command fails loudly and marks the target `POISONED` so it must be
+destroyed before another drill.
 
 The smoke is an actual authenticated login followed by Patient read,
 Comparison Set read/preview, and PNG export. It requires at least one restored
@@ -255,16 +265,22 @@ restore target.
 
 ## Verification commands
 
-The normal unit suite does not need Docker. The all-slice gate uses disposable
-PostgreSQL and native `pg_dump`/`pg_restore`/`psql`:
+The normal unit suite does not need Docker. The all-slice gate uses a
+PostgreSQL 16 server, matching native `postgresql-client-16`
+`pg_dump`/`pg_restore`/`psql`, and the mandatory disposable DAC proof:
 
 ```bash
-docker run --rm --name before-after-postgres-test \
+docker run --detach --rm --name before-after-postgres-test \
   -e POSTGRES_PASSWORD=test -e POSTGRES_DB=before_after_test \
-  -p 55432:5432 postgres:16
-export TEST_DATABASE_URL=postgresql+psycopg://postgres:test@127.0.0.1:55432/before_after_test
-PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts/test-postgres.sh
+  -p 55433:5432 postgres:16
+trap 'docker rm --force before-after-postgres-test >/dev/null 2>&1 || true' EXIT
+until docker exec before-after-postgres-test pg_isready -U postgres -d before_after_test >/dev/null; do sleep 1; done
+export TEST_DATABASE_URL=postgresql+psycopg://postgres:test@127.0.0.1:55433/before_after_test
+POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts/test-postgres.sh
 ```
+
+`test-postgres.sh` fails closed when a native client major or Docker DAC proof
+is unavailable; no mandatory PostgreSQL test is converted into a skip.
 
 Generate a redacted local evidence artifact for an issue without collecting
 clinical data:

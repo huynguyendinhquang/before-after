@@ -16,9 +16,11 @@ import uuid
 
 import pytest
 
-from ops.backup import OpsError, create_backup, prune_generations
+from ops.backup import OpsError, create_backup, postgres_preflight, prune_generations
 from ops.restore_check import (
     assert_isolated_targets,
+    cleanup_isolated_target,
+    provision_isolated_target,
     select_generation,
     stage_verified_generation,
     verify_generation,
@@ -100,6 +102,51 @@ def test_managed_storage_uses_media_group_modes(tmp_path: Path) -> None:
     stored = storage.store_derivative(b"synthetic", "png")
     assert stat.S_IMODE(storage.resolve(stored.storage_key).stat().st_mode) == 0o640
     storage.finalize(stored)
+
+
+def test_permission_repair_keeps_markers_private_and_reconcile_works(tmp_path: Path) -> None:
+    from app.storage import ManagedStorage, apply_media_permissions
+
+    storage = ManagedStorage(tmp_path / "media")
+    pending = storage.root / "quarantine" / (".pending-" + "a" * 32)
+    pending.write_bytes(b"marker")
+    with storage.reconciliation_lock():
+        lock = storage.root / ".reconcile.lock"
+        assert lock.is_file()
+    clinical = storage.root / "originals" / "clinical.bin"
+    clinical.write_bytes(b"clinical")
+    for entry in storage.root.rglob("*"):
+        os.chmod(entry, 0o640 if entry.is_file() else 0o750)
+    apply_media_permissions(storage.root)
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert stat.S_IMODE(clinical.stat().st_mode) == 0o640
+    storage.reconcile(set(), grace_seconds=3600, now=clinical.stat().st_mtime + 3600)
+
+
+def test_postgres_preflight_rejects_fake_major_mismatch(tmp_path: Path) -> None:
+    def client(name: str, major: int, server: str | None = None) -> Path:
+        script = tmp_path / name
+        version = f"{name} (PostgreSQL) {major}.4"
+        output = server if server is not None else version
+        script.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = \"--version\" ]; then printf '%s\\n'; else printf '%s\\n'; fi\n" % (version, output),
+            encoding="ascii",
+        )
+        script.chmod(0o700)
+        return script
+
+    dump = client("pg_dump", 17)
+    restore = client("pg_restore", 17)
+    psql = client("psql", 17, "160004")
+    with pytest.raises(OpsError, match="does not match server"):
+        postgres_preflight(
+            "postgresql://user:password@127.0.0.1/clinic",
+            pg_dump=str(dump),
+            pg_restore=str(restore),
+            psql=str(psql),
+        )
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="effective backup-user check requires root")
@@ -391,6 +438,7 @@ def shutil_which(command: str) -> str | None:
     return shutil.which(command)
 
 
+@pytest.mark.postgres
 def test_actual_postgresql_backup_restore_and_authenticated_smoke(postgres_restore_fixture) -> None:
     fixture = postgres_restore_fixture
     backup_root = fixture["root"] / "backup"
@@ -406,7 +454,17 @@ def test_actual_postgresql_backup_restore_and_authenticated_smoke(postgres_resto
     target_url = make_restore_database_url(fixture["database_url"])
     from ops.restore_check import run_restore_check
 
-    restored_media = fixture["root"] / "restored-media"
+    restore_parent = fixture["root"] / "restore-parent"
+    restore_parent.mkdir(mode=0o700)
+    restored_media = restore_parent / "restored-media"
+    marker = provision_isolated_target(
+        target_database_url=target_url,
+        target_media_root=restored_media,
+        restore_parent=restore_parent,
+        production_database_urls=(fixture["database_url"],),
+        production_media_roots=(fixture["media"],),
+        backup_root=backup_root,
+    )
     try:
         restored = run_restore_check(
             backup_root=backup_root,
@@ -416,34 +474,29 @@ def test_actual_postgresql_backup_restore_and_authenticated_smoke(postgres_resto
             source_database_url=fixture["database_url"],
             production_database_urls=(fixture["database_url"],),
             production_media_roots=(fixture["media"],),
+            restore_parent=restore_parent,
+            ownership_marker=marker,
             smoke_username=fixture["username"],
             smoke_password=fixture["password"],
         )
         assert restored.generation == result.generation
         assert restored.migration_checked and restored.database_media_checked and restored.smoke_checked
     finally:
-        drop_restore_database(target_url)
-
-
-def drop_restore_database(target_url: str) -> None:
-    parsed = urlsplit(target_url.replace("postgresql+psycopg://", "postgresql://"))
-    database = parsed.path.lstrip("/")
-    admin = urlunsplit(("postgresql", parsed.netloc, "/postgres", parsed.query, parsed.fragment))
-    import psycopg
-
-    with psycopg.connect(admin, autocommit=True) as connection:
-        connection.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+        cleanup_isolated_target(
+            target_database_url=target_url,
+            target_media_root=restored_media,
+            restore_parent=restore_parent,
+            production_database_urls=(fixture["database_url"],),
+            production_media_roots=(fixture["media"],),
+            backup_root=backup_root,
+            ownership_marker=marker,
+        )
 
 
 def make_restore_database_url(source: str) -> str:
     parsed = urlsplit(source.replace("postgresql+psycopg://", "postgresql://"))
     database = "before_after_restore_" + uuid.uuid4().hex[:12]
     target = urlunsplit(("postgresql", parsed.netloc, "/" + database, parsed.query, parsed.fragment))
-    admin = urlunsplit(("postgresql", parsed.netloc, "/postgres", parsed.query, parsed.fragment))
-    import psycopg
-
-    with psycopg.connect(admin, autocommit=True) as connection:
-        connection.execute(f'CREATE DATABASE "{database}"')
     return target.replace("postgresql://", "postgresql+psycopg://", 1)
 
 
@@ -754,6 +807,22 @@ def test_smoke_failure_cleans_database_state_and_assets(tmp_path: Path, monkeypa
     assert clinical_rows == {}
     assert not target.exists()
     assert not source_staging.exists()
+
+
+def test_restore_cleanup_deletion_failure_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.restore_check as restore_module
+
+    target = tmp_path / "staging"
+    target.mkdir(mode=0o700)
+    (target / "clinical.bin").write_bytes(b"clinical")
+    monkeypatch.setattr(
+        restore_module.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("delete blocked")),
+    )
+    with pytest.raises(OpsError, match="remove restore cleanup path"):
+        restore_module._remove_private_path_strict(target)
+    assert target.exists()
 
 
 def test_runbook_uses_bootstrap_and_secret_files_not_password_arguments() -> None:

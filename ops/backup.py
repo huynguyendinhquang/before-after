@@ -30,8 +30,9 @@ GENERATION_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$")
 MEDIA_DIRS = ("originals", "previews", "derivatives", "quarantine")
 MANIFEST_NAME = "manifest.json"
 DATABASE_DUMP_NAME = "database.dump"
-MANIFEST_FORMAT_VERSION = 1
+MANIFEST_FORMAT_VERSION = 2
 POSTGRES_DUMP_MAGIC = b"PGDMP"
+POSTGRES_CLIENTS = ("pg_dump", "pg_restore", "psql")
 _PG_ENV_QUERY_KEYS = {
     "application_name",
     "channel_binding",
@@ -201,6 +202,82 @@ def _run_output(command: list[str], *, label: str) -> str:
     if completed.returncode != 0:
         raise OpsError(f"{label} failed with exit status {completed.returncode}")
     return completed.stdout.strip()
+
+
+def _postgres_major_from_text(output: str, *, label: str) -> int:
+    """Extract a PostgreSQL major from a client/server version response."""
+    match = re.search(r"(?<!\d)(\d+)(?:(?:\.\d+)+|devel|beta\d*|rc\d*)?", output)
+    if match is None:
+        raise OpsError(f"{label} returned an invalid PostgreSQL version")
+    major = int(match.group(1))
+    if major < 9 or major > 99:
+        raise OpsError(f"{label} returned an invalid PostgreSQL major")
+    return major
+
+
+def _postgres_client_major(command: str, *, label: str) -> int:
+    try:
+        completed = subprocess.run(
+            [command, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise OpsError(f"{label} is unavailable") from exc
+    if completed.returncode != 0:
+        raise OpsError(f"{label} version check failed with exit status {completed.returncode}")
+    return _postgres_major_from_text(completed.stdout or completed.stderr, label=label)
+
+
+def _postgres_server_major(database_url: str, *, psql: str = "psql") -> int:
+    """Read the actual server major through the native psql client."""
+    with _postgres_environment(database_url) as environment:
+        try:
+            completed = subprocess.run(
+                [psql, "--no-psqlrc", "--tuples-only", "--no-align", "--command", "SHOW server_version_num"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise OpsError("psql is unavailable") from exc
+    if completed.returncode != 0:
+        raise OpsError(f"PostgreSQL server version check failed with exit status {completed.returncode}")
+    value = completed.stdout.strip()
+    if value.isdigit() and len(value) >= 5:
+        major = int(value) // 10000
+        if 9 <= major <= 99:
+            return major
+    return _postgres_major_from_text(value, label="PostgreSQL server")
+
+
+def postgres_preflight(
+    database_url: str,
+    *,
+    pg_dump: str = "pg_dump",
+    pg_restore: str = "pg_restore",
+    psql: str = "psql",
+) -> dict[str, object]:
+    """Require matching native clients and the connected server major."""
+    clients = {
+        "pg_dump": _postgres_client_major(pg_dump, label="pg_dump"),
+        "pg_restore": _postgres_client_major(pg_restore, label="pg_restore"),
+        "psql": _postgres_client_major(psql, label="psql"),
+    }
+    client_majors = set(clients.values())
+    if len(client_majors) != 1:
+        raise OpsError("PostgreSQL native client major versions do not match")
+    server_major = _postgres_server_major(database_url, psql=psql)
+    client_major = next(iter(client_majors))
+    if client_major != server_major:
+        raise OpsError(
+            f"PostgreSQL client major {client_major} does not match server major {server_major}"
+        )
+    return {"server_major": server_major, "client_majors": clients}
 
 
 def _mount_info(path: Path, *, require_non_root_mount: bool = False) -> tuple[str, Path, str]:
@@ -561,6 +638,7 @@ def create_backup(
     database_url: str,
     pg_dump: str = "pg_dump",
     pg_restore: str = "pg_restore",
+    psql: str = "psql",
     retention: int | None = None,
     _storage_policy: Callable[[Path, Path], None] | None = None,
 ) -> BackupResult:
@@ -574,6 +652,16 @@ def create_backup(
     if _path_overlap(source, destination_root):
         raise OpsError("backup root must not contain or be contained by MEDIA_ROOT")
     _validate_backup_storage(source, destination_root, storage_policy=_storage_policy)
+    postgres_metadata = (
+        postgres_preflight(
+            database_url,
+            pg_dump=pg_dump,
+            pg_restore=pg_restore,
+            psql=psql,
+        )
+        if _storage_policy is None or (pg_dump, pg_restore, psql) == ("pg_dump", "pg_restore", "psql")
+        else {"test_only": True}
+    )
     _cleanup_staging(destination_root)
     generation = _generation_name()
     _validate_generation_name(generation)
@@ -620,6 +708,7 @@ def create_backup(
             "generation": generation,
             "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "database": {"path": DATABASE_DUMP_NAME, "format": "custom"},
+            "postgresql": postgres_metadata,
             "media": {"path": "media", "directories": list(MEDIA_DIRS)},
             "files": files,
         }
@@ -755,6 +844,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--pg-dump", default=os.environ.get("PG_DUMP", "pg_dump"))
     parser.add_argument("--pg-restore", default=os.environ.get("PG_RESTORE", "pg_restore"))
+    parser.add_argument("--psql", default=os.environ.get("PSQL", "psql"))
     parser.add_argument(
         "--retain",
         type=int,
@@ -772,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
             database_url=args.database_url,
             pg_dump=args.pg_dump,
             pg_restore=args.pg_restore,
+            psql=args.psql,
             retention=args.retain,
         )
     except OpsError as exc:

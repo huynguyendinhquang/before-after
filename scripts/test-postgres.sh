@@ -22,6 +22,8 @@ for native_client in pg_dump pg_restore psql; do
   fi
 done
 
+./scripts/test-dac.sh
+
 export DATABASE_URL="$TEST_DATABASE_URL"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
