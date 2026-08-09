@@ -29,7 +29,11 @@ find "$media" -type d -exec chmod 2750 {} +
 
 su before-after -s /bin/sh -c 'printf clinical > /var/lib/before-after/media/originals/proof.bin'
 chmod 0640 "$media/originals/proof.bin"
+su before-after -s /bin/sh -c 'mkdir /var/lib/before-after/media/originals/nested && chmod 0750 /var/lib/before-after/media/originals/nested && printf nested > /var/lib/before-after/media/originals/nested/proof.bin'
+chown -R before-after:before-after-media "$media/originals/nested"
+chmod 0640 "$media/originals/nested/proof.bin"
 su before-after-backup -s /bin/sh -c 'test "$(cat /var/lib/before-after/media/originals/proof.bin)" = clinical'
+su before-after-backup -s /bin/sh -c 'test "$(cat /var/lib/before-after/media/originals/nested/proof.bin)" = nested'
 if su before-after-backup -s /bin/sh -c 'printf denied > /var/lib/before-after/media/originals/proof.bin' 2>/dev/null; then
     echo "backup user can modify clinical media" >&2
     exit 1
@@ -38,6 +42,15 @@ if su before-after-backup -s /bin/sh -c 'rm /var/lib/before-after/media/original
     echo "backup user can delete clinical media" >&2
     exit 1
 fi
+if su before-after-backup -s /bin/sh -c 'printf denied > /var/lib/before-after/media/originals/nested/created.bin' 2>/dev/null; then
+    echo "backup user can create nested clinical media" >&2
+    exit 1
+fi
+if su before-after-backup -s /bin/sh -c 'rm /var/lib/before-after/media/originals/nested/proof.bin' 2>/dev/null; then
+    echo "backup user can delete nested clinical media" >&2
+    exit 1
+fi
 su before-after -s /bin/sh -c 'rm /var/lib/before-after/media/originals/proof.bin'
+su before-after -s /bin/sh -c 'rm -rf /var/lib/before-after/media/originals/nested'
 CONTAINER
 )"

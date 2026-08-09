@@ -11,6 +11,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fnmatch
 import hashlib
 import json
 import os
@@ -577,6 +578,59 @@ def _copy_media(source_root: Path, staging_media: Path) -> list[dict[str, object
     return sorted(entries, key=lambda item: str(item["path"]))
 
 
+def _is_recovery_marker(name: str) -> bool:
+    return (
+        name.startswith(".pending-")
+        or name.startswith(".capture-delete-")
+        or name.startswith(".restore-")
+        or fnmatch.fnmatchcase(name, ".upload-*.tmp")
+    )
+
+
+def _reject_recovery_marker(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise OpsError("recovery required: could not inspect an active recovery marker") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise OpsError("recovery required: active recovery marker has unsafe permissions or type")
+    raise OpsError(
+        "recovery required: MEDIA_ROOT contains an active recovery marker; "
+        "reconcile it as before-after before retrying the backup"
+    )
+
+
+def _assert_media_snapshot_ready(source_root: Path) -> None:
+    """Refuse a snapshot that would omit an in-flight media operation.
+
+    Recovery markers are application-private and intentionally not group
+    readable.  The backup identity cannot safely reconcile them, so the
+    stopped-app precondition fails closed instead of copying a mixed pair.
+    The root reconciliation lock is a quiescent coordination file and is
+    deliberately excluded from the published media set.
+    """
+    for current, directories, files in os.walk(source_root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        _private_directory(current_path, create=False, media=True)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink():
+                raise OpsError("MEDIA_ROOT contains a symlink")
+            if _is_recovery_marker(name):
+                _reject_recovery_marker(path)
+            _private_directory(path, create=False, media=True)
+        for name in files:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise OpsError("MEDIA_ROOT contains an unsupported file type")
+            if name == ".reconcile.lock" and current_path == source_root:
+                _private_file(path, label="reconciliation lock")
+                continue
+            if _is_recovery_marker(name):
+                _reject_recovery_marker(path)
+            _private_file(path, label="media source", media=True)
+
+
 def _write_json(path: Path, value: dict[str, object]) -> None:
     payload = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -631,6 +685,34 @@ def _cleanup_staging(root: Path) -> None:
     _fsync_directory(root)
 
 
+def _remove_private_path_strict(path: Path) -> None:
+    """Remove a backup staging artifact, surfacing a poisoned cleanup."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise OpsError("could not inspect backup staging cleanup path") from exc
+    try:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            path.unlink()
+            return
+        for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+            current_path = Path(current)
+            for name in files:
+                file_path = current_path / name
+                if not file_path.is_symlink():
+                    os.chmod(file_path, 0o600)
+            for name in directories:
+                directory = current_path / name
+                if not directory.is_symlink():
+                    os.chmod(directory, 0o700)
+        os.chmod(path, 0o700)
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise OpsError("could not remove backup staging; staging is poisoned") from exc
+
+
 def create_backup(
     *,
     media_root: str | os.PathLike[str],
@@ -652,6 +734,7 @@ def create_backup(
     if _path_overlap(source, destination_root):
         raise OpsError("backup root must not contain or be contained by MEDIA_ROOT")
     _validate_backup_storage(source, destination_root, storage_policy=_storage_policy)
+    _assert_media_snapshot_ready(source)
     postgres_metadata = (
         postgres_preflight(
             database_url,
@@ -732,65 +815,21 @@ def create_backup(
         os.umask(old_umask)
         if staging.exists() or os.path.lexists(staging):
             try:
-                if staging.is_dir() and not os.path.islink(staging):
-                    shutil.rmtree(staging)
-            except OSError:
-                pass
+                _remove_private_path_strict(staging)
+            except OpsError as cleanup_exc:
+                raise OpsError(
+                    "backup failed and staging cleanup failed; clinical staging is poisoned"
+                ) from cleanup_exc
 
 
 def _generation_is_verified(generation: Path) -> bool:
-    """Return true only for a private, complete generation with valid files."""
+    """Return true only for the same restorable-v2 verifier used by restore."""
     try:
-        _private_directory(generation, create=False)
-        _validate_generation_name(generation.name)
-        manifest_path = generation / MANIFEST_NAME
-        _private_file(manifest_path, label="backup manifest")
-        with manifest_path.open(encoding="ascii") as stream:
-            manifest = json.load(stream)
-        if not isinstance(manifest, dict) or manifest.get("complete") is not True:
-            return False
-        if manifest.get("generation") != generation.name:
-            return False
-        raw_files = manifest.get("files")
-        if not isinstance(raw_files, list) or not raw_files:
-            return False
-        expected: set[str] = set()
-        for raw in raw_files:
-            if not isinstance(raw, dict):
-                return False
-            relative = _safe_relative_path(Path(str(raw.get("path", ""))))
-            if relative in expected:
-                return False
-            size = raw.get("bytes")
-            digest = raw.get("sha256")
-            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-                return False
-            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-                return False
-            if relative != DATABASE_DUMP_NAME and not relative.startswith("media/"):
-                return False
-            file_path = generation / Path(*PurePosixPath(relative).parts)
-            _assert_no_symlink_components(file_path, allow_missing_leaf=False)
-            actual_size, actual_digest = _sha256_file(file_path)
-            if (actual_size, actual_digest) != (size, digest):
-                return False
-            expected.add(relative)
-        if DATABASE_DUMP_NAME not in expected:
-            return False
-        actual = set()
-        for current, directories, files in os.walk(generation, topdown=True, followlinks=False):
-            current_path = Path(current)
-            _private_directory(current_path, create=False)
-            for directory in directories:
-                _private_directory(current_path / directory, create=False)
-            for filename in files:
-                file_path = current_path / filename
-                _private_file(file_path, label="backup file")
-                relative = file_path.relative_to(generation).as_posix()
-                if relative != MANIFEST_NAME:
-                    actual.add(relative)
-        return actual == expected
-    except (OSError, OpsError, UnicodeError, ValueError, TypeError):
+        from ops.restore_check import verify_generation
+
+        verify_generation(generation)
+        return True
+    except (ImportError, OSError, OpsError, UnicodeError, ValueError, TypeError):
         return False
 
 

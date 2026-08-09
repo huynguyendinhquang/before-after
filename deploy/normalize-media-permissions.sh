@@ -34,18 +34,20 @@ for directory in originals previews derivatives quarantine; do
         echo "normalize-media-permissions: symlink in managed media: $root" >&2
         exit 1
     fi
-    find "$root" -type d -exec chmod 2750 {} +
+    find "$root" -mindepth 1 -type d -exec chmod 0750 {} +
     find "$root" -type f \
         ! -name '.pending-*' \
         ! -name '.capture-delete-*' \
+        ! -name '.restore-*' \
         ! -name '.reconcile.lock' \
         ! -name '.upload-*.tmp' \
         -exec chmod 0640 {} +
-    find "$root" -type d -exec chown "$MEDIA_OWNER:$MEDIA_GROUP" {} +
+    find "$root" -mindepth 1 -type d -exec chown "$MEDIA_OWNER:$MEDIA_GROUP" {} +
     find "$root" -type f -exec chown "$MEDIA_OWNER:$MEDIA_GROUP" {} +
     find "$root" -type f \( \
         -name '.pending-*' -o \
         -name '.capture-delete-*' -o \
+        -name '.restore-*' -o \
         -name '.reconcile.lock' -o \
         -name '.upload-*.tmp' \
         \) -exec chmod 0600 {} +

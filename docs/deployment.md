@@ -65,9 +65,10 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
 After upgrading an existing host, normalize the pre-group media tree once as
-root. The helper explicitly sets managed directories to `2750`, clinical files
-to `0640`, and pending/delete markers plus `.reconcile.lock` to `0600`; do not
-replace it with `chmod -R`:
+root. The helper explicitly sets the root and four managed directories to
+`2750`, nested directories to `0750`, clinical files to `0640`, and
+pending/delete/restore markers, upload temps, plus `.reconcile.lock` to `0600`;
+do not replace it with `chmod -R`:
 
 ```bash
 sudo /opt/before-after/deploy/normalize-media-permissions.sh
@@ -119,7 +120,19 @@ source. Native `pg_dump`, `pg_restore`, and `psql` are preflighted against the
 actual source server; all majors must match. The source major and all client
 majors are recorded in the manifest, and restore rejects a target with a
 different major. Install `postgresql-client-16` for a PostgreSQL 16 clinic.
-There is no production same-device CLI bypass.
+There is no production same-device CLI bypass. A stopped-app media tree with a
+`.pending-*`, `.capture-delete-*`, `.restore-*`, or upload-temp marker is not
+copied as if it were clinical media: the backup fails before staging with
+`recovery required`. Stop the service, run the app's `reconcile-media` CLI as
+`before-after`, then retry; this keeps the database/media generation paired
+rather than omitting active recovery state. For example, with the protected
+app environment loaded by root:
+
+```bash
+sudo systemctl stop before-after.service
+sudo /bin/bash -c 'set -a; . /etc/before-after/before-after.env; set +a; cd /opt/before-after; exec runuser --user before-after -- env APP_ENV=production DATABASE_URL="$DATABASE_URL" MEDIA_ROOT="${MEDIA_ROOT:-/var/lib/before-after/media}" SECRET_KEY="$SECRET_KEY" /opt/before-after/.venv/bin/flask --app app:create_app reconcile-media'
+sudo systemctl start before-after.service
+```
 
 Check the actual mount and ownership before enabling the timer:
 
@@ -133,9 +146,12 @@ sudo stat -c '%U:%G %a %n' /mnt/clinic-backup/before-after
 Each generation is private and contains a custom PostgreSQL dump, all four
 managed media directories, and a checksum manifest. The dump is fsynced,
 checked for the `PGDMP` header, and validated by `pg_restore --list` before the
-manifest is published. Retention never removes the last checksum-verified
-generation when a new generation has not verified. Stale `.staging-*` entries
-are safely removed and are never restore candidates.
+manifest is published. Retention uses the same restorable-v2 verifier as
+restore and never removes the last verified v2 generation. Unsupported v1
+generations are ignored for selection and retention, but preserved until
+explicitly migrated or removed. Stale `.staging-*` entries are safely removed
+and are never restore candidates; a failed staging cleanup is reported as
+poisoned instead of being silently left behind.
 
 ## HTTPS reverse proxy
 
@@ -231,8 +247,10 @@ sudo /bin/bash -c '
 '
 ```
 
-`restore_check` first copies the verified dump and media generation into a
-private staging tree, checks checksums and `PGDMP`/`pg_restore --list` there,
+`restore_check` validates the private restore parent, target containment,
+backup/production path separation, and every symlink constraint before creating
+the target database. It then copies the verified dump and media generation into
+a private staging tree, checks checksums and `PGDMP`/`pg_restore --list` there,
 then makes those copies read-only before restoring. If a tar archive is ever
 used, members are checked for traversal, links, devices, and non-file types
 before extraction. Restore, migration, database/media checksum, or smoke
@@ -280,7 +298,10 @@ POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts
 ```
 
 `test-postgres.sh` fails closed when a native client major or Docker DAC proof
-is unavailable; no mandatory PostgreSQL test is converted into a skip.
+is unavailable; no mandatory PostgreSQL test is converted into a skip. The
+fixed gate rejects all extra pytest selector/filter arguments, clears
+`PYTEST_ADDOPTS`, excludes only the optional host probe, and writes a hashed
+JUnit output plus completion metadata to `artifacts/slice8-fixed-gate.*`.
 
 Generate a redacted local evidence artifact for an issue without collecting
 clinical data:
@@ -291,13 +312,16 @@ python3 -m ops.evidence --output artifacts/slice8-local-evidence.json
 
 Use [`docs/issue-evidence-template.md`](issue-evidence-template.md) for the
 ticket. The artifact explicitly records clinic hardware and TLS/LAN UAT as
-`not_run`; local checks do not claim clinic UAT passed.
+`not_run`; local syntax/compile checks do not claim runtime success. Runtime
+success is recorded only when the completed fixed-gate metadata and its
+hash-matching JUnit output artifact are present.
 
 The acceptance tests use an injected storage policy only for their same-device
 temporary test directory; production policy is never bypassed. Also run:
 
 ```bash
-bash -n deploy/bootstrap.sh ops/backup.sh scripts/test-postgres.sh
+bash -n deploy/bootstrap.sh ops/backup.sh deploy/normalize-media-permissions.sh \
+  deploy/verify-permissions.sh scripts/test-dac.sh scripts/test-postgres.sh
 python3 -m compileall -q app migrations ops tests
 sudo systemd-analyze verify /etc/systemd/system/before-after*.service \
   /etc/systemd/system/before-after-backup.timer

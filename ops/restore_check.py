@@ -267,9 +267,23 @@ def select_generation(
         raise OpsError("could not list backup generations") from exc
     if not candidates:
         raise OpsError("no complete backup generations were found")
-    # Validate every published-looking generation so a damaged/partial copy is
-    # never silently skipped in favour of an older good copy.
-    verified = [verify_generation(entry) for entry in candidates]
+    # A legacy v1 generation is retained for explicit migration/removal, but
+    # cannot make a valid v2 restore unavailable.  Published-looking v2
+    # generations remain fail-closed: corruption is not silently skipped.
+    verified: list[VerifiedGeneration] = []
+    for entry in candidates:
+        try:
+            verified.append(verify_generation(entry))
+        except OpsError:
+            try:
+                manifest = _load_json(entry / MANIFEST_NAME)
+            except OpsError:
+                raise
+            if manifest.get("format_version") == 1:
+                continue
+            raise
+    if not verified:
+        raise OpsError("no restorable v2 backup generations were found")
     return verified[-1]
 
 
@@ -461,28 +475,29 @@ def provision_isolated_target(
     production_media_roots: Iterable[str | os.PathLike[str]] = (),
     backup_root: str | os.PathLike[str] | None = None,
 ) -> str:
-    """Create the owned database first, then its empty media destination."""
-    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    """Validate media safety first, then create and mark the owned database."""
+    parent, target = _validate_isolated_media_target(
+        target_media_root,
+        restore_parent,
+        backup_root=backup_root,
+        production_media_roots=production_media_roots,
+    )
     marker = create_isolated_database(
         target_database_url,
         production_database_urls,
         restore_parent=parent,
-        target_media_root=target_media_root,
+        target_media_root=target,
     )
     try:
-        prepare_isolated_media_target(
-            target_media_root,
-            parent,
-            backup_root=backup_root,
-            production_media_roots=production_media_roots,
-        )
+        target.mkdir(mode=0o700)
+        os.chmod(target, 0o700)
     except Exception as exc:
         try:
             _drop_owned_database(
                 target_database_url=target_database_url,
                 ownership_marker=marker,
                 restore_parent=parent,
-                target_media_root=target_media_root,
+                target_media_root=target,
                 production_database_urls=production_database_urls,
                 production_media_roots=production_media_roots,
                 backup_root=backup_root,
@@ -490,7 +505,7 @@ def provision_isolated_target(
             )
         except OpsError as rollback_exc:
             try:
-                _mark_restore_failed(parent, _path(target_media_root, "restore MEDIA_ROOT"), poisoned=True)
+                _mark_restore_failed(parent, target, poisoned=True)
             except OpsError:
                 pass
             raise OpsError("restore target provisioning failed; target is poisoned") from rollback_exc
@@ -1066,10 +1081,8 @@ def _drop_owned_database(
                 row = cursor.fetchone()
                 if row is None:
                     raise OpsError("owned restore database is missing")
-                if row[0] not in {None, ownership_marker}:
+                if row[0] != ownership_marker:
                     raise OpsError("restore database ownership marker does not match")
-                if row[0] is None:
-                    cursor.execute(f"COMMENT ON DATABASE \"{target_name}\" IS '{ownership_marker}'")
                 cursor.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
     except OpsError:
         raise
@@ -1148,6 +1161,42 @@ def _read_secret_file(path: str | os.PathLike[str]) -> str:
     return value.rstrip("\r\n")
 
 
+def _validate_isolated_media_target(
+    target_media_root: str | os.PathLike[str],
+    restore_parent: str | os.PathLike[str],
+    *,
+    backup_root: str | os.PathLike[str] | None = None,
+    production_media_roots: Iterable[str | os.PathLike[str]] = (),
+) -> tuple[Path, Path]:
+    """Validate every media boundary without creating the target."""
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    _assert_no_symlink_components(target)
+    try:
+        target.relative_to(parent)
+    except ValueError as exc:
+        raise OpsError("restore target must be inside the private restore parent") from exc
+    if target == parent:
+        raise OpsError("restore target must be inside the private restore parent")
+    ancestor = target.parent
+    while ancestor != parent:
+        _private_directory(ancestor, create=False)
+        ancestor = ancestor.parent
+    if backup_root is not None:
+        backup = _path(backup_root, "BACKUP_ROOT")
+        _assert_no_symlink_components(backup, allow_missing_leaf=False)
+        if _path_overlap(target, backup):
+            raise OpsError("restore MEDIA_ROOT must be outside backup storage")
+    for value in production_media_roots:
+        production = _path(value, "production MEDIA_ROOT")
+        _assert_no_symlink_components(production, allow_missing_leaf=False)
+        if _path_overlap(target, production):
+            raise OpsError("restore MEDIA_ROOT is a production media destination")
+    if target.exists() or os.path.lexists(target):
+        raise OpsError("restore MEDIA_ROOT already exists; choose a new isolated target")
+    return parent, target
+
+
 def prepare_isolated_media_target(
     target_media_root: str | os.PathLike[str],
     restore_parent: str | os.PathLike[str],
@@ -1156,20 +1205,12 @@ def prepare_isolated_media_target(
     production_media_roots: Iterable[str | os.PathLike[str]] = (),
 ) -> Path:
     """Create the empty `0700` media target inside a private restore parent."""
-    target = _path(target_media_root, "restore MEDIA_ROOT")
-    parent = _private_directory(_path(restore_parent, "restore parent"), create=True)
-    _assert_no_symlink_components(target)
-    if target == parent or not _path_overlap(target, parent):
-        raise OpsError("restore target must be inside the private restore parent")
-    if backup_root is not None and _path_overlap(target, _path(backup_root, "BACKUP_ROOT")):
-        raise OpsError("restore MEDIA_ROOT must be outside backup storage")
-    for value in production_media_roots:
-        production = _path(value, "production MEDIA_ROOT")
-        _assert_no_symlink_components(production, allow_missing_leaf=False)
-        if _path_overlap(target, production):
-            raise OpsError("restore MEDIA_ROOT is a production media destination")
-    if target.exists() or os.path.lexists(target):
-        raise OpsError("restore MEDIA_ROOT already exists; choose a new isolated target")
+    _parent, target = _validate_isolated_media_target(
+        target_media_root,
+        restore_parent,
+        backup_root=backup_root,
+        production_media_roots=production_media_roots,
+    )
     try:
         target.mkdir(mode=0o700)
         os.chmod(target, 0o700)

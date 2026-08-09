@@ -36,6 +36,7 @@ _PENDING_MARKER_NAME = re.compile(r"^\.pending-([0-9a-f]{32})$")
 _CAPTURE_DELETE_PREFIX = ".capture-delete-"
 _CAPTURE_DELETE_MARKER_NAME = re.compile(r"^\.capture-delete-([0-9a-f]{32})$")
 _TEMP_NAME = re.compile(r"^\.upload-.+\.tmp$")
+_RESTORE_MARKER_PREFIX = ".restore-"
 _POSIX_DIRFD = (
     os.name == "posix"
     and hasattr(os, "O_NOFOLLOW")
@@ -51,9 +52,10 @@ def _managed_file_mode(name: str) -> int:
     """Return the mode for one entry in the managed media tree."""
     if (
         name == ".reconcile.lock"
-        or _PENDING_MARKER_NAME.fullmatch(name)
-        or _CAPTURE_DELETE_MARKER_NAME.fullmatch(name)
-        or name.endswith(".tmp")
+        or name.startswith(_PENDING_PREFIX)
+        or name.startswith(_CAPTURE_DELETE_PREFIX)
+        or _TEMP_NAME.fullmatch(name)
+        or name.startswith(_RESTORE_MARKER_PREFIX)
     ):
         return PRIVATE_FILE_MODE
     return MEDIA_FILE_MODE
@@ -77,7 +79,8 @@ def apply_media_permissions(root: str | os.PathLike[str]) -> None:
                 entry = current_path / name
                 if entry.is_symlink():
                     raise StorageError("symlinks are not allowed in MEDIA_ROOT")
-                os.chmod(entry, MEDIA_DIRECTORY_MODE, follow_symlinks=False)
+                mode = MEDIA_DIRECTORY_MODE if current_path == path else 0o750
+                os.chmod(entry, mode, follow_symlinks=False)
             for name in files:
                 entry = current_path / name
                 if entry.is_symlink():
@@ -496,7 +499,7 @@ class ManagedStorage:
             with os.fdopen(fd, "wb", closefd=False) as stream:
                 stream.write(payload)
                 stream.flush()
-                os.fchmod(stream.fileno(), MEDIA_FILE_MODE)
+                os.fchmod(stream.fileno(), PRIVATE_FILE_MODE)
                 os.fsync(stream.fileno())
 
             os.link(
@@ -509,6 +512,7 @@ class ManagedStorage:
             linked = True
             os.unlink(temporary_name, dir_fd=parent_fd)
             temporary_name = None
+            os.fchmod(fd, MEDIA_FILE_MODE)
             self._fsync_directory(parent_fd)
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)

@@ -18,6 +18,7 @@ import pytest
 
 from ops.backup import OpsError, create_backup, postgres_preflight, prune_generations
 from ops.restore_check import (
+    _drop_owned_database,
     assert_isolated_targets,
     cleanup_isolated_target,
     provision_isolated_target,
@@ -110,6 +111,10 @@ def test_permission_repair_keeps_markers_private_and_reconcile_works(tmp_path: P
     storage = ManagedStorage(tmp_path / "media")
     pending = storage.root / "quarantine" / (".pending-" + "a" * 32)
     pending.write_bytes(b"marker")
+    upload_temp = storage.root / "originals" / ".upload-crash.tmp"
+    upload_temp.write_bytes(b"partial")
+    restore_marker = storage.root / "quarantine" / ".restore-crash"
+    restore_marker.write_bytes(b"failed")
     with storage.reconciliation_lock():
         lock = storage.root / ".reconcile.lock"
         assert lock.is_file()
@@ -120,6 +125,8 @@ def test_permission_repair_keeps_markers_private_and_reconcile_works(tmp_path: P
     apply_media_permissions(storage.root)
     assert stat.S_IMODE(lock.stat().st_mode) == 0o600
     assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert stat.S_IMODE(upload_temp.stat().st_mode) == 0o600
+    assert stat.S_IMODE(restore_marker.stat().st_mode) == 0o600
     assert stat.S_IMODE(clinical.stat().st_mode) == 0o640
     storage.reconcile(set(), grace_seconds=3600, now=clinical.stat().st_mtime + 3600)
 
@@ -149,6 +156,153 @@ def test_postgres_preflight_rejects_fake_major_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_backup_fails_before_staging_when_recovery_marker_is_present(tmp_path: Path) -> None:
+    media = private_media_root(tmp_path / "media")
+    (media / "originals" / "clinical.bin").write_bytes(b"clinical")
+    os.chmod(media / "originals" / "clinical.bin", 0o640)
+    marker = media / "quarantine" / (".pending-" + "a" * 32)
+    marker.write_bytes(b"originals/a.jpg\npreviews/a.jpg\n")
+    os.chmod(marker, 0o600)
+    backup_root = tmp_path / "backup"
+    backup_root.mkdir(mode=0o700)
+
+    with pytest.raises(OpsError, match="recovery required"):
+        create_backup(
+            media_root=media,
+            backup_root=backup_root,
+            database_url="postgresql://user:password@127.0.0.1/clinic",
+            pg_dump=str(fake_pg_dump(tmp_path)),
+            pg_restore=str(fake_pg_restore(tmp_path)),
+            _storage_policy=lambda _media, _backup: None,
+        )
+    assert not list(backup_root.glob(".staging-*"))
+    assert not list(backup_root.glob("[0-9]*T*"))
+
+
+def test_mixed_v1_generation_is_ignored_and_retention_keeps_v2(tmp_path: Path) -> None:
+    _media, backup, generation, _restore = _synthetic_backup(tmp_path)
+    v1 = backup / ("20990101T010101Z-" + "a" * 32)
+    shutil.copytree(generation, v1)
+    manifest_path = v1 / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    manifest["generation"] = v1.name
+    manifest["format_version"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="ascii")
+    os.chmod(manifest_path, 0o600)
+
+    assert select_generation(backup).path == generation
+    assert prune_generations(backup, retain=1) == []
+    assert generation.exists()
+    assert v1.exists()
+
+
+def test_backup_staging_cleanup_failure_is_poisoned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.backup as backup_module
+
+    media = private_media_root(tmp_path / "media")
+    (media / "originals" / "clinical.bin").write_bytes(b"clinical")
+    os.chmod(media / "originals" / "clinical.bin", 0o640)
+    backup_root = tmp_path / "backup"
+    backup_root.mkdir(mode=0o700)
+    dump = tmp_path / "failing-pg-dump"
+    dump.write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+    dump.chmod(0o700)
+    monkeypatch.setattr(
+        backup_module.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("delete blocked")),
+    )
+
+    with pytest.raises(OpsError, match="clinical staging is poisoned"):
+        create_backup(
+            media_root=media,
+            backup_root=backup_root,
+            database_url="postgresql://user:password@127.0.0.1/clinic",
+            pg_dump=str(dump),
+            pg_restore=str(fake_pg_restore(tmp_path)),
+            _storage_policy=lambda _media, _backup: None,
+        )
+    assert list(backup_root.glob(".staging-*"))
+
+
+def test_provision_validates_media_before_database_creation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    called = False
+
+    def create_database(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("database creation must not run")
+
+    monkeypatch.setattr(restore_module, "create_isolated_database", create_database)
+    with pytest.raises(OpsError, match="inside the private restore parent"):
+        provision_isolated_target(
+            target_database_url="postgresql://restore@127.0.0.1/restore",
+            target_media_root=tmp_path / "outside-media",
+            restore_parent=parent,
+            production_database_urls=("postgresql://production@127.0.0.1/clinic",),
+        )
+    assert not called
+
+
+@pytest.mark.parametrize("database_comment", [None, "another-run"])
+def test_cleanup_requires_exact_database_ownership_comment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    database_comment: str | None,
+) -> None:
+    import types
+    import ops.restore_check as restore_module
+
+    parent = tmp_path / "restore-parent"
+    parent.mkdir(mode=0o700)
+    target = parent / "media"
+    owner_file = parent / ".media.restore-owner"
+    owner_file.write_text("before-after-restore-" + "a" * 32 + "\n", encoding="ascii")
+    owner_file.chmod(0o600)
+    statements: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            statements.append(statement)
+
+        def fetchone(self):
+            return (database_comment,)
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(restore_module, "_connection_server_identity", lambda _value: ("server", 5432))
+    monkeypatch.setattr(restore_module, "_connection_database_identity", lambda _value: ("server", 5432, "clinic"))
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=lambda *_args, **_kwargs: Connection()))
+
+    with pytest.raises(OpsError, match="ownership marker does not match"):
+        _drop_owned_database(
+            target_database_url="postgresql://restore@127.0.0.1/restore",
+            ownership_marker="before-after-restore-" + "a" * 32,
+            restore_parent=parent,
+            target_media_root=target,
+            production_database_urls=("postgresql://production@127.0.0.1/clinic",),
+            remove_media=False,
+        )
+    assert not any("DROP DATABASE" in statement or "COMMENT ON DATABASE" in statement for statement in statements)
+@pytest.mark.host_probe
 @pytest.mark.skipif(os.geteuid() != 0, reason="effective backup-user check requires root")
 def test_backup_user_can_read_media_but_cannot_modify_or_delete(tmp_path: Path) -> None:
     try:
