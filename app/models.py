@@ -18,6 +18,7 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(512), nullable=False)
     role = db.Column(db.String(16), nullable=False, default="viewer", server_default="viewer")
     active = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
+    session_version = db.Column(db.Integer, nullable=False, default=1, server_default="1")
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
     updated_at = db.Column(
         db.DateTime(timezone=True),
@@ -33,6 +34,7 @@ class User(UserMixin, db.Model):
         ),
         db.CheckConstraint("length(trim(username)) > 0", name="ck_users_username_not_blank"),
         db.CheckConstraint("length(trim(display_name)) > 0", name="ck_users_display_name_not_blank"),
+        db.CheckConstraint("session_version > 0", name="ck_users_session_version"),
         db.UniqueConstraint("username", name="uq_users_username"),
     )
 
@@ -57,6 +59,10 @@ class User(UserMixin, db.Model):
     @property
     def is_editor(self) -> bool:
         return self.role in {"admin", "editor"}
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
 
 
 class Patient(db.Model):

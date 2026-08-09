@@ -14,7 +14,7 @@ from PIL import Image
 from sqlalchemy import create_engine, func, select, text
 
 from app import create_app
-from app.audit import append_audit
+from app.audit import append_audit, bounded_audit_details
 from app.admin import FinalAdminError, list_audit_events, update_user
 from app.captures import (
     CaptureReferencedError,
@@ -30,11 +30,14 @@ from app.comparisons import (
     archive_comparison_set,
     create_comparison_set,
     duplicate_comparison_set,
+    EditLeaseError,
+    remove_frame,
+    StaleVersionError,
     unarchive_comparison_set,
 )
 from app.db import db, normalize_database_url
 from app.models import AuditEvent, Capture, ComparisonSet, Frame, Patient, ShotType, User
-from app.patients import archive_patient, search_patients, unarchive_patient
+from app.patients import search_patients
 from app.storage import ManagedStorage
 
 
@@ -233,6 +236,97 @@ def test_duplicate_copies_frame_configuration_and_capture_ids(app):
         ) == 1
 
 
+def test_duplicate_requires_matching_expected_version(app):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and patient is not None
+        source = create_comparison_set(actor=actor, patient=patient, name="History")
+        with pytest.raises(StaleVersionError):
+            duplicate_comparison_set(
+                actor=actor,
+                comparison_set=source,
+                name="Stale copy",
+                expected_version=source.version + 1,
+            )
+        copied = duplicate_comparison_set(
+            actor=actor,
+            comparison_set=source,
+            name="Current copy",
+            expected_version=source.version,
+        )
+        assert copied.name == "Current copy"
+
+
+def test_remove_frame_requires_lease_version_csrf_and_audits(app):
+    editor_id = add_user(app, "editor", "editor")
+    other_id = add_user(app, "other", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, shot_type_id, "red")
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        other = db.session.get(User, other_id)
+        patient = db.session.get(Patient, patient_id)
+        assert actor is not None and other is not None and patient is not None
+        comparison_set = create_comparison_set(actor=actor, patient=patient, name="History")
+        comparison_set = acquire_edit_lease(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=comparison_set.version,
+        )
+        frame = add_frame(
+            actor=actor,
+            comparison_set=comparison_set,
+            capture_id=capture_id,
+            expected_version=comparison_set.version,
+        )
+        comparison_set = db.session.get(ComparisonSet, comparison_set.id)
+        assert comparison_set is not None
+        version = comparison_set.version
+        comparison_set_id = comparison_set.id
+        frame_id = frame.id
+        with pytest.raises(EditLeaseError):
+            remove_frame(
+                actor=other,
+                comparison_set=comparison_set,
+                frame_id=frame.id,
+                expected_version=version,
+            )
+        with pytest.raises(StaleVersionError):
+            remove_frame(
+                actor=actor,
+                comparison_set=comparison_set,
+                frame_id=frame.id,
+                expected_version=version - 1,
+            )
+
+    client = app.test_client()
+    login(client, "editor")
+    assert client.post(
+        f"/comparison-sets/{comparison_set_id}/frames/{frame_id}/remove",
+        data={"version": version},
+    ).status_code == 400
+
+    with app.app_context():
+        actor = db.session.get(User, editor_id)
+        comparison_set = db.session.get(ComparisonSet, comparison_set_id)
+        assert actor is not None and comparison_set is not None
+        removed = remove_frame(
+            actor=actor,
+            comparison_set=comparison_set,
+            frame_id=frame_id,
+            expected_version=version,
+        )
+        assert removed.id == frame_id
+        assert db.session.get(Frame, frame_id) is None
+        assert db.session.scalar(
+            select(func.count(AuditEvent.id)).where(AuditEvent.action == "frame.remove")
+        ) == 1
+
+
 def test_archive_unarchive_keeps_existing_frame_reference_and_hides_normal_lists(app):
     editor_id = add_user(app, "editor", "editor")
     patient_id = fixture_patient(app, editor_id)
@@ -258,17 +352,10 @@ def test_archive_unarchive_keeps_existing_frame_reference_and_hides_normal_lists
         assert db.session.get(ComparisonSet, comparison_set.id).archived_at is None
 
 
-def test_archive_unarchive_patient_hides_children_from_normal_lists(app):
-    editor_id = add_user(app, "editor", "editor")
-    patient_id = fixture_patient(app, editor_id)
-    with app.app_context():
-        actor = db.session.get(User, editor_id)
-        assert actor is not None
-        archive_patient(actor=actor, patient_id=patient_id)
-        assert search_patients() == []
-        assert search_patients(include_archived=True)[0].archived_at is not None
-        unarchive_patient(actor=actor, patient_id=patient_id)
-        assert [patient.id for patient in search_patients()] == [patient_id]
+def test_patient_archive_scope_is_not_exposed(app):
+    add_user(app, "editor", "editor")
+    assert "/patients/<int:patient_pk>/archive" not in {rule.rule for rule in app.url_map.iter_rules()}
+    assert "/patients/<int:patient_pk>/unarchive" not in {rule.rule for rule in app.url_map.iter_rules()}
 
 
 def test_referenced_capture_delete_fails_and_unreferenced_delete_removes_media(app):
@@ -324,6 +411,57 @@ def test_capture_delete_commit_ambiguity_reconciles_media_safely(app, monkeypatc
     with pytest.raises(Exception):
         storage.resolve(original_key)
     assert not list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())
+
+
+def test_capture_delete_manifest_recovers_after_process_loss(app):
+    editor_id = add_user(app, "editor", "editor")
+    patient_id = fixture_patient(app, editor_id)
+    shot_type_id = fixture_shot_type(app, editor_id)
+    capture_id = fixture_capture(app, editor_id, patient_id, shot_type_id, "red")
+    with app.app_context():
+        capture = db.session.get(Capture, capture_id)
+        assert capture is not None
+        original_key = capture.storage_key
+        preview_key = ManagedStorage.preview_key(original_key)
+        storage = ManagedStorage(app.config["MEDIA_ROOT"])
+        manifest = storage.prepare_capture_quarantine(
+            capture.id,
+            (original_key, preview_key),
+        )
+        storage.quarantine_capture(manifest)
+        storage._release_pending(manifest.manifest_key)
+
+    with app.app_context():
+        storage = ManagedStorage(app.config["MEDIA_ROOT"])
+        removed = storage.reconcile(
+            {original_key},
+            capture_exists=lambda value: value == capture_id,
+            grace_seconds=0,
+        )
+        assert removed
+        assert db.session.get(Capture, capture_id) is not None
+    storage = ManagedStorage(app.config["MEDIA_ROOT"])
+    assert storage.resolve(original_key).is_file()
+    assert storage.resolve(preview_key).is_file()
+    assert not list((Path(app.config["MEDIA_ROOT"]) / "quarantine").iterdir())
+
+
+def test_user_session_version_revokes_existing_session(app):
+    admin_id = add_user(app, "admin", "admin")
+    editor_id = add_user(app, "editor", "editor")
+    client = app.test_client()
+    login(client, "editor")
+    assert client.get("/patients").status_code == 200
+    with app.app_context():
+        admin = db.session.get(User, admin_id)
+        editor = db.session.get(User, editor_id)
+        assert admin is not None and editor is not None
+        old_version = editor.session_version
+        update_user(actor=admin, user=editor, display_name="Revoked Editor")
+        assert editor.session_version == old_version + 1
+    response = client.get("/patients")
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
 
 
 def test_admin_can_create_update_and_disable_users(app):
@@ -473,3 +611,7 @@ def test_admin_last_account_guard_and_bounded_audit_omit_pii(app):
     assert response.headers["Cache-Control"] == "no-store"
     assert "secret-original.jpg" not in response.get_data(as_text=True)
     assert "Sensitive Patient" not in response.get_data(as_text=True)
+    assert "admin" in response.get_data(as_text=True)
+    bounded = bounded_audit_details({"frame_ids": list(range(100)), "patient_name": "hidden"})
+    assert len(bounded["frame_ids"]) == 20
+    assert "patient_name" not in bounded

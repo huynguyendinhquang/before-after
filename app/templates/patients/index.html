@@ -4,11 +4,7 @@
 <section class="panel">
   <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
     <h1>Patients</h1>
-    {% if current_user.is_editor %}
-      <span><a class="button" href="{{ url_for('patients.new') }}">New Patient</a>
-      {% if include_archived %}<a class="button" href="{{ url_for('patients.index') }}">Active only</a>
-      {% else %}<a class="button" href="{{ url_for('patients.index', archived=1) }}">Show archived</a>{% endif %}</span>
-    {% endif %}
+    {% if current_user.is_editor %}<a class="button" href="{{ url_for('patients.new') }}">New Patient</a>{% endif %}
   </div>
   <form method="get">
     <label for="q">Search by Patient ID or name</label>
@@ -17,23 +13,13 @@
   </form>
   {% if patients %}
     <table>
-      <thead><tr><th>Patient ID</th><th>Name</th><th>Birth year</th><th>Status</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Patient ID</th><th>Name</th><th>Birth year</th></tr></thead>
       <tbody>
       {% for patient in patients %}
         <tr>
-          <td>{% if patient.archived_at %}{{ patient.patient_id }}{% else %}<a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">{{ patient.patient_id }}</a>{% endif %}</td>
+          <td><a href="{{ url_for('patients.detail', patient_pk=patient.id) }}">{{ patient.patient_id }}</a></td>
           <td>{{ patient.name }}</td>
           <td>{{ patient.birth_year }}</td>
-          <td>{{ 'archived' if patient.archived_at else 'active' }}</td>
-          <td>
-            {% if current_user.is_editor %}
-              {% if patient.archived_at %}
-              <form method="post" action="{{ url_for('patients.unarchive_route', patient_pk=patient.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Unarchive</button></form>
-              {% else %}
-              <form method="post" action="{{ url_for('patients.archive_route', patient_pk=patient.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Archive</button></form>
-              {% endif %}
-            {% endif %}
-          </td>
         </tr>
       {% endfor %}
       </tbody>

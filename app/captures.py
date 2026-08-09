@@ -19,7 +19,7 @@ from app.auth import editor_required
 from app.db import db
 from app.image_policy import FORMAT_EXTENSIONS, mimetype_for_format, read_bounded
 from app.models import Capture, ComparisonSet, Frame, Patient, ShotType, User
-from app.storage import ImageInspection, ManagedStorage, StorageError, StoredMedia
+from app.storage import CaptureQuarantine, ImageInspection, ManagedStorage, StorageError, StoredMedia
 
 
 captures_bp = Blueprint("captures", __name__)
@@ -203,6 +203,31 @@ def _shot_type(
     return selected
 
 
+def _locked_shot_type(selected: ShotType) -> ShotType:
+    """Reload and lock vocabulary state immediately before Capture insertion."""
+    selected_id = selected.id
+    locked = db.session.scalar(
+        select(ShotType)
+        .where(ShotType.id == selected_id)
+        .with_for_update(of=ShotType)
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        raise CaptureError("Shot Type is unavailable")
+    if locked.state == "merged":
+        if locked.canonical_target_id is None:
+            raise CaptureError("Shot Type is unavailable")
+        locked = db.session.scalar(
+            select(ShotType)
+            .where(ShotType.id == locked.canonical_target_id)
+            .with_for_update(of=ShotType)
+            .execution_options(populate_existing=True)
+        )
+    if locked is None or locked.state not in {"canonical", "proposal"} or locked.canonical_target_id is not None:
+        raise CaptureError("Shot Type is unavailable")
+    return locked
+
+
 def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
     return db.session.scalar(
         select(Capture).where(Capture.patient_id == patient_id, Capture.sha256 == sha256)
@@ -321,6 +346,7 @@ def prepare_capture(
             create_proposal=create_proposal,
         )
         stored = managed.store(payload, inspection)
+        selected_shot_type = _locked_shot_type(selected_shot_type)
         capture = Capture(
             patient_id=patient_id,
             capture_date=authoritative_date,
@@ -580,6 +606,12 @@ def _locked_capture(capture: Capture | int | None = None, capture_id: int | None
     )
     if locked is None:
         raise CaptureError("Capture is unavailable")
+    patient = db.session.scalar(
+        select(Patient).where(Patient.id == locked.patient_id).with_for_update(of=Patient)
+    )
+    if patient is None or patient.archived_at is not None:
+        raise CaptureError("Patient is unavailable")
+    locked.patient = patient
     return locked
 
 
@@ -646,29 +678,27 @@ def delete_capture(
     capture_id: int | None = None,
     storage: ManagedStorage | None = None,
 ) -> Capture:
-    """Delete an unreferenced Capture after quarantining its media."""
+    """Delete an unreferenced Capture with durable quarantine intent."""
     if not actor.is_editor:
         raise PermissionError("only an Editor or Admin can delete Captures")
     managed = storage or _storage()
-    quarantined: list[tuple[str, str]] = []
+    manifest: CaptureQuarantine | None = None
     locked: Capture | None = None
+    committed = False
     try:
         with managed.reconciliation_lock():
             locked = _locked_capture(capture, capture_id)
             referenced = db.session.scalar(
-                select(Frame.id).where(Frame.capture_id == locked.id).limit(1)
+                select(Frame.id)
+                .where(Frame.capture_id == locked.id)
+                .with_for_update(of=Frame)
+                .limit(1)
             )
             if referenced is not None:
                 raise CaptureReferencedError("Capture is still referenced by a Comparison Set")
-            media_keys = [locked.storage_key]
-            try:
-                media_keys.append(ManagedStorage.preview_key(locked.storage_key))
-            except StorageError:
-                pass
-            for media_key in media_keys:
-                quarantined_key = managed.quarantine(media_key)
-                if quarantined_key is not None:
-                    quarantined.append((quarantined_key, media_key))
+            media_keys = [locked.storage_key, ManagedStorage.preview_key(locked.storage_key)]
+            manifest = managed.prepare_capture_quarantine(locked.id, media_keys)
+            managed.quarantine_capture(manifest)
             capture_id_value = locked.id
             db.session.delete(locked)
             db.session.flush()
@@ -690,34 +720,38 @@ def delete_capture(
                     ) from reconcile_exc
                 if still_exists:
                     try:
-                        for quarantined_key, media_key in reversed(quarantined):
-                            managed.restore(quarantined_key, media_key)
+                        managed.restore_capture_quarantine(manifest)
                     except Exception as restore_exc:
                         raise CaptureDeleteReconciliationError(
                             "Capture deletion failed and media restoration could not be confirmed"
                         ) from restore_exc
-                    quarantined.clear()
+                    manifest = None
                     raise
-                for quarantined_key, _media_key in quarantined:
-                    try:
-                        managed.cleanup(quarantined_key)
-                    except StorageError:
-                        pass
-                return locked
-            for quarantined_key, _media_key in quarantined:
+                committed = True
                 try:
-                    managed.cleanup(quarantined_key)
-                except StorageError:
-                    pass
+                    managed.finish_capture_quarantine(manifest)
+                except StorageError as finish_exc:
+                    raise CaptureDeleteReconciliationError(
+                        "Capture was deleted but quarantined media cleanup is pending"
+                    ) from finish_exc
+                manifest = None
+                return locked
+            committed = True
+            try:
+                managed.finish_capture_quarantine(manifest)
+            except StorageError as finish_exc:
+                raise CaptureDeleteReconciliationError(
+                    "Capture was deleted but quarantined media cleanup is pending"
+                ) from finish_exc
+            manifest = None
             return locked
     except CaptureDeleteReconciliationError:
         raise
     except Exception:
         db.session.rollback()
-        if quarantined:
+        if manifest is not None and not committed:
             try:
-                for quarantined_key, media_key in reversed(quarantined):
-                    managed.restore(quarantined_key, media_key)
+                managed.restore_capture_quarantine(manifest)
             except Exception as restore_exc:
                 raise CaptureDeleteReconciliationError(
                     "Capture deletion failed and media restoration could not be confirmed"

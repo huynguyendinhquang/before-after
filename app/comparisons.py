@@ -146,6 +146,20 @@ def _active_patient(patient: Patient | None) -> Patient:
     return current
 
 
+def _locked_patient(patient: Patient | None) -> Patient:
+    """Reload and lock the Patient before a Set mutation or uniqueness check."""
+    current = _active_patient(patient)
+    locked = db.session.scalar(
+        select(Patient)
+        .where(Patient.id == current.id)
+        .with_for_update(of=Patient)
+        .execution_options(populate_existing=True)
+    )
+    if locked is None or locked.archived_at is not None:
+        raise ComparisonError("Patient is unavailable")
+    return locked
+
+
 def _active_set(comparison_set: ComparisonSet | None) -> ComparisonSet:
     if comparison_set is None:
         raise ComparisonError("Comparison Set is unavailable")
@@ -488,7 +502,7 @@ def create_comparison_set(
 ) -> ComparisonSet:
     """Create a named Set and its audit event in one transaction."""
     _require_editor(actor)
-    patient = _active_patient(patient)
+    patient = _locked_patient(patient)
     set_name = _name(name)
     preset_key, width, height = _canvas_values(
         preset_key=preset_key,
@@ -564,8 +578,9 @@ def duplicate_comparison_set(
     comparison_set: ComparisonSet | int | None = None,
     set_id: int | None = None,
     name: str | None = None,
+    expected_version: object | None = None,
 ) -> ComparisonSet:
-    """Duplicate a Set in one transaction while retaining Capture references."""
+    """Duplicate a Set snapshot after checking its expected persisted version."""
     _require_editor(actor)
     if comparison_set is not None and set_id is not None:
         raise SetLifecycleError("choose one Comparison Set")
@@ -579,8 +594,11 @@ def duplicate_comparison_set(
         )
         if source is None or source.archived_at is not None:
             raise SetLifecycleError("Comparison Set is unavailable")
-        if source.patient is None or source.patient.archived_at is not None:
-            raise SetLifecycleError("Patient is unavailable")
+        expected = source.version if expected_version is None else _version(expected_version)
+        if source.version != expected:
+            raise StaleVersionError("Set has changed; reload before duplicating")
+        patient = _locked_patient(source.patient)
+        source.patient = patient
         active_name = db.session.scalar(
             select(ComparisonSet.id).where(
                 ComparisonSet.patient_id == source.patient_id,
@@ -656,6 +674,15 @@ def _locked_set(set_id: int) -> ComparisonSet:
     )
     if locked is None:
         raise SetLifecycleError("Comparison Set is unavailable")
+    patient = db.session.scalar(
+        select(Patient)
+        .where(Patient.id == locked.patient_id)
+        .with_for_update(of=Patient)
+        .execution_options(populate_existing=True)
+    )
+    if patient is None or patient.archived_at is not None:
+        raise SetLifecycleError("Patient is unavailable")
+    locked.patient = patient
     return locked
 
 
@@ -774,20 +801,17 @@ def _capture_for_frame(capture: Capture | int | None, capture_id: int | None) ->
         raise ComparisonError("Capture is invalid")
     if isinstance(candidate_id, bool) or not isinstance(candidate_id, int):
         raise ComparisonError("Capture is invalid")
-    with db.session.no_autoflush:
-        result = db.session.scalar(
-            select(Capture)
-            .where(Capture.id == candidate_id)
-            .execution_options(autoflush=False)
-        )
-        if result is not None:
-            db.session.expunge(result)
-            result = db.session.scalar(
-                select(Capture)
-                .where(Capture.id == candidate_id)
-                .execution_options(autoflush=False)
-            )
+    result = db.session.scalar(
+        select(Capture)
+        .where(Capture.id == candidate_id)
+        .with_for_update(of=Capture)
+        .execution_options(autoflush=False, populate_existing=True)
+    )
     if result is None:
+        raise ComparisonError("Capture is unavailable")
+    if result.patient is None or result.patient.archived_at is not None:
+        raise ComparisonError("Patient is unavailable")
+    if result.archived_at is not None:
         raise ComparisonError("Capture is unavailable")
     return result
 
@@ -986,6 +1010,62 @@ def add_frame(
         except Exception:
             pending.preserve()
     return frame
+
+
+def remove_frame(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet,
+    frame_id: int,
+    expected_version: object,
+) -> Frame:
+    """Remove one Frame only under the Set's active lease and version."""
+    _require_editor(actor)
+    try:
+        locked_set, expected = _write_guard(
+            actor=actor,
+            comparison_set=comparison_set,
+            expected_version=expected_version,
+        )
+        if isinstance(frame_id, bool) or not isinstance(frame_id, int) or frame_id <= 0:
+            raise ComparisonError("Frame is unavailable")
+        frame = db.session.scalar(
+            select(Frame)
+            .where(Frame.id == frame_id, Frame.comparison_set_id == locked_set.id)
+            .with_for_update(of=Frame)
+        )
+        if frame is None:
+            raise ComparisonError("Frame is unavailable")
+        remaining = list(
+            db.session.scalars(
+                select(Frame)
+                .where(Frame.comparison_set_id == locked_set.id, Frame.id != frame.id)
+                .order_by(Frame.position, Frame.id)
+                .with_for_update(of=Frame)
+            )
+        )
+        db.session.delete(frame)
+        db.session.flush()
+        offset = max((item.position for item in remaining), default=-1) + len(remaining) + 1
+        for index, item in enumerate(remaining):
+            item.position = offset + index
+        db.session.flush()
+        for index, item in enumerate(remaining):
+            item.position = index
+        locked_set.version = expected + 1
+        locked_set.updated_by_id = actor.id
+        append_audit(
+            actor=actor,
+            action="frame.remove",
+            entity_type="frame",
+            entity_id=frame.id,
+            details={"comparison_set_id": locked_set.id, "version": expected + 1},
+        )
+        db.session.commit()
+        return frame
+    except Exception:
+        db.session.rollback()
+        raise
 
 
 def reorder_frames(
@@ -1669,8 +1749,9 @@ def duplicate_route(set_pk: int, patient_pk: int | None = None):
             actor=current_user,
             comparison_set=comparison_set,
             name=form.name.data,
+            expected_version=request.form.get("version"),
         )
-    except (SetLifecycleError, IntegrityError) as exc:
+    except (SetLifecycleError, StaleVersionError, IntegrityError) as exc:
         flash(str(exc), "error")
         return redirect(url_for("comparisons.detail", set_pk=set_pk)), 409
     flash("Comparison Set duplicated.", "success")
@@ -1819,6 +1900,35 @@ def _request_payload() -> dict[str, object]:
         except (TypeError, ValueError, OverflowError):
             pass
     return payload
+
+
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/frames/<int:frame_id>/remove")
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/frames/<int:frame_id>/delete")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/frames/<int:frame_id>/remove")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/frames/<int:frame_id>/delete")
+@editor_required
+def remove_frame_route(set_pk: int, frame_id: int, patient_pk: int | None = None):
+    comparison_set = _route_set(set_pk, patient_pk)
+    try:
+        payload = _request_payload()
+        removed = remove_frame(
+            actor=current_user,
+            comparison_set=comparison_set,
+            frame_id=frame_id,
+            expected_version=payload.get("version", payload.get("expected_version")),
+        )
+    except (StaleVersionError, EditLeaseError) as exc:
+        return jsonify(error=str(exc)), 409
+    except ComparisonError as exc:
+        return jsonify(error=str(exc)), 400
+    version = db.session.scalar(
+        select(ComparisonSet.version).where(ComparisonSet.id == set_pk)
+    )
+    if request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify(frame_id=removed.id, version=version)
+    response = redirect(url_for("comparisons.detail", set_pk=set_pk))
+    response.headers["X-Comparison-Set-Version"] = str(version)
+    return response
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/save")

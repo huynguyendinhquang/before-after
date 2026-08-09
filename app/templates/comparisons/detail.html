@@ -44,7 +44,7 @@
     <h2>Frames</h2>
     {% if comparison_set.frames %}
       <table>
-        <thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Visible</th><th>Label</th><th>Date</th><th>Zoom</th><th>Pan X</th><th>Pan Y</th></tr></thead>
+        <thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Visible</th><th>Label</th><th>Date</th><th>Zoom</th><th>Pan X</th><th>Pan Y</th><th>Actions</th></tr></thead>
         <tbody id="frame-list">
         {% for frame in comparison_set.frames %}
           <tr data-frame-id="{{ frame.id }}">
@@ -64,6 +64,7 @@
             <td><input class="frame-zoom" type="number" min="1" max="5" step="0.01" value="{{ frame.zoom }}" aria-label="Frame {{ loop.index }} zoom"></td>
             <td><input class="frame-pan-x" type="number" min="-1" max="1" step="0.01" value="{{ frame.pan_x }}" aria-label="Frame {{ loop.index }} horizontal pan"></td>
             <td><input class="frame-pan-y" type="number" min="-1" max="1" step="0.01" value="{{ frame.pan_y }}" aria-label="Frame {{ loop.index }} vertical pan"></td>
+            <td><button type="submit" form="remove-frame-{{ frame.id }}">Remove</button></td>
           </tr>
         {% endfor %}
         </tbody>
@@ -75,6 +76,12 @@
     <button type="submit">Save Canvas and Frames</button>
     <span id="save-status" class="muted" role="status"></span>
   </form>
+  {% for frame in comparison_set.frames %}
+    <form id="remove-frame-{{ frame.id }}" method="post" action="{{ url_for('comparisons.remove_frame_route', set_pk=comparison_set.id, frame_id=frame.id) }}" hidden>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="version" value="{{ comparison_set.version }}">
+    </form>
+  {% endfor %}
 
   {% if comparison_set.frames %}
   <h2>Frame order</h2>

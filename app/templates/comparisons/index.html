@@ -27,7 +27,7 @@
               <form method="post" action="{{ url_for('comparisons.unarchive_route', set_pk=comparison_set.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Unarchive</button></form>
               {% else %}
               <form method="post" action="{{ url_for('comparisons.archive_route', set_pk=comparison_set.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Archive</button></form>
-              <form method="post" action="{{ url_for('comparisons.duplicate_route', set_pk=comparison_set.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input name="name" placeholder="New unique name" maxlength="200" required><button type="submit">Duplicate</button></form>
+              <form method="post" action="{{ url_for('comparisons.duplicate_route', set_pk=comparison_set.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="version" value="{{ comparison_set.version }}"><input name="name" placeholder="New unique name" maxlength="200" required><button type="submit">Duplicate</button></form>
               {% endif %}
             {% endif %}
           </td>

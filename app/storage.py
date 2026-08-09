@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import io
+import json
 import math
 import os
 import re
@@ -13,7 +14,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,8 @@ _ALLOWED_ROOTS = frozenset({"originals", "previews", "derivatives", "quarantine"
 _HEX_KEY = re.compile(r"^[0-9a-f]{32}$")
 _PENDING_PREFIX = ".pending-"
 _PENDING_MARKER_NAME = re.compile(r"^\.pending-([0-9a-f]{32})$")
+_CAPTURE_DELETE_PREFIX = ".capture-delete-"
+_CAPTURE_DELETE_MARKER_NAME = re.compile(r"^\.capture-delete-([0-9a-f]{32})$")
 _TEMP_NAME = re.compile(r"^\.upload-.+\.tmp$")
 _POSIX_DIRFD = (
     os.name == "posix"
@@ -67,6 +70,15 @@ class StoredMedia:
 class StoredDerivative:
     storage_key: str
     pending_key: str
+
+
+@dataclass(frozen=True)
+class CaptureQuarantine:
+    """Durable intent and generated targets for one Capture deletion."""
+
+    manifest_key: str
+    capture_id: int
+    entries: tuple[tuple[str, str], ...]
 
 
 StoredObject = StoredMedia | StoredDerivative
@@ -238,12 +250,7 @@ class ManagedStorage:
             finally:
                 os.close(fd)
 
-    def _create_pending_marker(
-        self,
-        key: str,
-        original_key: str,
-        preview_key: str,
-    ) -> None:
+    def _create_marker(self, key: str, payload: bytes) -> None:
         parts = self._key_parts(key)
         parent_fd: int | None = None
         temporary_name: str | None = None
@@ -272,7 +279,6 @@ class ManagedStorage:
                 dir_fd=parent_fd,
             )
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            payload = f"{original_key}\n{preview_key}\n".encode("ascii")
             view = memoryview(payload)
             while view:
                 written = os.write(fd, view)
@@ -297,7 +303,7 @@ class ManagedStorage:
         except StorageError:
             raise
         except (OSError, TypeError, ValueError) as exc:
-            raise StorageError(f"could not create pending marker: {exc}") from exc
+            raise StorageError(f"could not create storage marker: {exc}") from exc
         finally:
             if fd is not None:
                 try:
@@ -318,6 +324,18 @@ class ManagedStorage:
                     pass
             if parent_fd is not None:
                 os.close(parent_fd)
+
+    def _create_pending_marker(
+        self,
+        key: str,
+        original_key: str,
+        preview_key: str,
+    ) -> None:
+        try:
+            payload = f"{original_key}\n{preview_key}\n".encode("ascii")
+        except UnicodeError as exc:
+            raise StorageError("pending marker contains invalid media keys") from exc
+        self._create_marker(key, payload)
 
     def _release_pending(self, key: str | None) -> None:
         if not key:
@@ -538,6 +556,162 @@ class ManagedStorage:
             finally:
                 os.close(parent_fd)
 
+    @staticmethod
+    def _capture_manifest_payload(manifest: CaptureQuarantine) -> bytes:
+        payload = {
+            "capture_id": manifest.capture_id,
+            "entries": [
+                {"source": source, "quarantine": quarantine}
+                for source, quarantine in manifest.entries
+            ],
+        }
+        try:
+            encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise StorageError("capture deletion manifest is invalid") from exc
+        if len(encoded) > 4096:
+            raise StorageError("capture deletion manifest is too large")
+        return encoded
+
+    def prepare_capture_quarantine(
+        self,
+        capture_id: int,
+        media_keys: Iterable[str],
+    ) -> CaptureQuarantine:
+        """Persist deletion intent before moving any Capture media."""
+        if isinstance(capture_id, bool) or not isinstance(capture_id, int) or capture_id <= 0:
+            raise StorageError("capture id is invalid")
+        try:
+            sources = tuple(dict.fromkeys(media_keys))
+        except (TypeError, ValueError) as exc:
+            raise StorageError("capture media keys are invalid") from exc
+        if not sources or any(not isinstance(key, str) for key in sources):
+            raise StorageError("capture media keys are invalid")
+        token = uuid.uuid4().hex
+        entries = tuple(
+            (
+                source,
+                f"quarantine/{token}-{index}{Path(source).suffix.lower() or '.bin'}",
+            )
+            for index, source in enumerate(sources)
+        )
+        for source, target in entries:
+            source_parts = self._key_parts(source)
+            if source_parts[0] not in {"originals", "previews"}:
+                raise StorageError("capture media key is invalid")
+            self._key_parts(target)
+        manifest = CaptureQuarantine(
+            manifest_key=f"quarantine/{_CAPTURE_DELETE_PREFIX}{token}",
+            capture_id=capture_id,
+            entries=entries,
+        )
+        self._create_marker(manifest.manifest_key, self._capture_manifest_payload(manifest))
+        return manifest
+
+    def _read_capture_quarantine(self, manifest_key: str) -> CaptureQuarantine:
+        parts = self._key_parts(manifest_key)
+        if len(parts) != 2 or parts[0] != "quarantine" or not _CAPTURE_DELETE_MARKER_NAME.fullmatch(parts[-1]):
+            raise StorageError("capture deletion manifest name is invalid")
+        try:
+            with self.open_read(manifest_key) as stream:
+                payload = stream.read(4096)
+                if stream.read(1):
+                    raise StorageError("capture deletion manifest is too large")
+            value = json.loads(payload.decode("ascii"))
+            capture_id = value["capture_id"]
+            raw_entries = value["entries"]
+            if isinstance(capture_id, bool) or not isinstance(capture_id, int) or capture_id <= 0:
+                raise ValueError
+            if not isinstance(raw_entries, list) or not 1 <= len(raw_entries) <= 4:
+                raise ValueError
+            entries: list[tuple[str, str]] = []
+            for item in raw_entries:
+                if not isinstance(item, dict):
+                    raise ValueError
+                source = item.get("source")
+                target = item.get("quarantine")
+                if not isinstance(source, str) or not isinstance(target, str):
+                    raise ValueError
+                source_parts = self._key_parts(source)
+                target_parts = self._key_parts(target)
+                if source_parts[0] not in {"originals", "previews"} or target_parts[0] != "quarantine":
+                    raise ValueError
+                entries.append((source, target))
+            if len({source for source, _target in entries}) != len(entries):
+                raise ValueError
+            return CaptureQuarantine(manifest_key, capture_id, tuple(entries))
+        except StorageError:
+            raise
+        except (UnicodeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageError("capture deletion manifest is invalid") from exc
+
+    def quarantine_capture(self, manifest: CaptureQuarantine) -> None:
+        """Move every existing media file using the manifest's fixed targets."""
+        for source, target in manifest.entries:
+            self.quarantine(source, target)
+
+    def _media_exists(self, key: str) -> bool:
+        try:
+            self.resolve(key)
+        except StorageError as exc:
+            if "missing" in str(exc):
+                return False
+            raise
+        return True
+
+    def restore_capture_quarantine(self, manifest: CaptureQuarantine) -> None:
+        """Restore a manifest after a database rollback or interrupted delete."""
+        try:
+            for source, target in reversed(manifest.entries):
+                source_exists = self._media_exists(source)
+                target_exists = self._media_exists(target)
+                if source_exists and target_exists:
+                    self.cleanup(target)
+                elif target_exists:
+                    self.restore(target, source)
+                elif not source_exists:
+                    raise StorageError("capture media is missing during restore")
+            self.cleanup(manifest.manifest_key)
+        finally:
+            self._release_pending(manifest.manifest_key)
+
+    def finish_capture_quarantine(self, manifest: CaptureQuarantine) -> None:
+        """Remove quarantined media and its manifest after a committed delete."""
+        try:
+            for _source, target in manifest.entries:
+                self.cleanup(target)
+            self.cleanup(manifest.manifest_key)
+        finally:
+            self._release_pending(manifest.manifest_key)
+
+    def reconcile_capture_deletions(
+        self,
+        capture_exists: Callable[[int], bool],
+    ) -> list[str]:
+        """Finish or roll back durable Capture-delete manifests after a crash."""
+        removed: list[str] = []
+        for name in self._regular_entries("quarantine"):
+            if not _CAPTURE_DELETE_MARKER_NAME.fullmatch(name):
+                continue
+            manifest_key = f"quarantine/{name}"
+            locked = self._try_locked_file(manifest_key)
+            if locked is None:
+                continue
+            marker_fd, _modified = locked
+            try:
+                manifest = self._read_capture_quarantine(manifest_key)
+                if capture_exists(manifest.capture_id):
+                    self.restore_capture_quarantine(manifest)
+                else:
+                    self.finish_capture_quarantine(manifest)
+                removed.append(manifest_key)
+            finally:
+                try:
+                    fcntl.flock(marker_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(marker_fd)
+        return removed
+
     def _regular_entries(self, directory: str) -> dict[str, float]:
         directory_fd = self._open_parent((directory, ".scan"))
         entries: dict[str, float] = {}
@@ -634,13 +808,16 @@ class ManagedStorage:
         *,
         grace_seconds: float = DEFAULT_ORPHAN_GRACE_SECONDS,
         now: float | None = None,
+        capture_exists: Callable[[int], bool] | None = None,
     ) -> list[str]:
         with self.reconciliation_lock():
-            return self._reconcile(
+            removed = self.reconcile_capture_deletions(capture_exists) if capture_exists else []
+            removed.extend(self._reconcile(
                 referenced_keys,
                 grace_seconds=grace_seconds,
                 now=now,
-            )
+            ))
+            return removed
 
     def _reconcile(
         self,
@@ -779,11 +956,10 @@ class ManagedStorage:
                 remove(key)
         return removed
 
-    def quarantine(self, key: str) -> str | None:
-        """Move an existing managed file to a generated quarantine key."""
+    def quarantine(self, key: str, target_key: str | None = None) -> str | None:
+        """Move an existing managed file to a generated or requested quarantine key."""
         source_parts = self._key_parts(key)
         source_fd = self._open_parent(source_parts)
-        target_key: str | None = None
         target_parts: tuple[str, ...] | None = None
         target_fd: int | None = None
         linked = False
@@ -798,8 +974,10 @@ class ManagedStorage:
                 raise StorageError("refusing to quarantine non-file media")
 
             suffix = Path(source_parts[-1]).suffix.lower() or ".bin"
-            target_key = f"quarantine/{uuid.uuid4().hex}{suffix}"
+            target_key = target_key or f"quarantine/{uuid.uuid4().hex}{suffix}"
             target_parts = self._key_parts(target_key)
+            if target_parts[0] != "quarantine" or target_parts[-1].startswith("."):
+                raise StorageError("invalid quarantine target")
             target_fd = self._open_parent(target_parts)
             os.link(
                 source_parts[-1],

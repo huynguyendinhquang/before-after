@@ -126,7 +126,14 @@ def create_app(config: dict | None = None) -> Flask:
             with storage.reconciliation_lock():
                 referenced = set(db.session.scalars(select(Capture.storage_key)))
                 referenced.update(db.session.scalars(select(Export.storage_key)))
-                removed = storage.reconcile(referenced, grace_seconds=grace_seconds)
+                removed = storage.reconcile(
+                    referenced,
+                    grace_seconds=grace_seconds,
+                    capture_exists=lambda capture_id: db.session.scalar(
+                        select(Capture.id).where(Capture.id == capture_id)
+                    )
+                    is not None,
+                )
         except StorageError as exc:
             raise click.ClickException(str(exc)) from exc
         click.echo(f"Removed {len(removed)} orphan media files.")
