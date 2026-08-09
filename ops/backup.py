@@ -104,7 +104,7 @@ def _assert_no_posix_acl(path: Path) -> None:
         raise OpsError("operational paths must not have POSIX ACLs")
 
 
-def _private_directory(path: Path, *, create: bool) -> Path:
+def _private_directory(path: Path, *, create: bool, media: bool = False) -> Path:
     path = _path(path, "directory")
     _assert_no_symlink_components(path)
     try:
@@ -112,7 +112,10 @@ def _private_directory(path: Path, *, create: bool) -> Path:
             if not path.is_dir():
                 raise OpsError("managed path must be a directory")
             mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
-            if mode & 0o077:
+            if media:
+                if mode & 0o007 or mode & 0o020 or mode & 0o070 != 0o050:
+                    raise OpsError("managed media directories must be group-readable and not writable")
+            elif mode & 0o077:
                 raise OpsError("operational directories must not be group/world accessible")
         elif create:
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -127,14 +130,18 @@ def _private_directory(path: Path, *, create: bool) -> Path:
     return path
 
 
-def _private_file(path: Path, *, label: str = "file") -> None:
+def _private_file(path: Path, *, label: str = "file", media: bool = False) -> None:
     try:
         info = os.lstat(path)
     except OSError as exc:
         raise OpsError(f"{label} is not usable") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise OpsError(f"{label} must be a regular file")
-    if info.st_mode & 0o077:
+    mode = stat.S_IMODE(info.st_mode)
+    if media:
+        if mode & 0o007 or mode & 0o020 or mode & 0o040 == 0:
+            raise OpsError(f"{label} must be group-readable and not writable")
+    elif mode & 0o077:
         raise OpsError(f"{label} must not be group/world accessible")
     _assert_no_posix_acl(path)
 
@@ -437,8 +444,13 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _copy_regular_file(source: Path, destination: Path) -> tuple[int, str]:
-    _private_file(source, label="media source")
+def _copy_regular_file(
+    source: Path,
+    destination: Path,
+    *,
+    source_media: bool = False,
+) -> tuple[int, str]:
+    _private_file(source, label="media source", media=source_media)
     _assert_no_symlink_components(destination.parent)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _assert_no_symlink_components(destination.parent, allow_missing_leaf=False)
@@ -458,22 +470,22 @@ def _copy_regular_file(source: Path, destination: Path) -> tuple[int, str]:
 
 
 def _copy_media(source_root: Path, staging_media: Path) -> list[dict[str, object]]:
-    _private_directory(source_root, create=False)
+    _private_directory(source_root, create=False, media=True)
     _ensure_private_output_directory(staging_media)
     entries: list[dict[str, object]] = []
     for directory_name in MEDIA_DIRS:
         source_directory = source_root / directory_name
         destination_directory = staging_media / directory_name
-        _private_directory(source_directory, create=False)
+        _private_directory(source_directory, create=False, media=True)
         _ensure_private_output_directory(destination_directory)
         for current, directories, files in os.walk(source_directory, topdown=True, followlinks=False):
             current_path = Path(current)
-            _private_directory(current_path, create=False)
+            _private_directory(current_path, create=False, media=True)
             for name in directories:
                 path = current_path / name
                 if os.path.islink(path):
                     raise OpsError("symlinks are not allowed in media backups")
-                _private_directory(path, create=False)
+                _private_directory(path, create=False, media=True)
             for name in files:
                 source_path = current_path / name
                 if os.path.islink(source_path):
@@ -483,7 +495,7 @@ def _copy_media(source_root: Path, staging_media: Path) -> list[dict[str, object
                 relative = source_path.relative_to(source_root)
                 relative_string = _safe_relative_path(Path("media") / relative)
                 destination = staging_media / relative
-                size, digest = _copy_regular_file(source_path, destination)
+                size, digest = _copy_regular_file(source_path, destination, source_media=True)
                 entries.append({"path": relative_string, "bytes": size, "sha256": digest})
     return sorted(entries, key=lambda item: str(item["path"]))
 
@@ -557,7 +569,7 @@ def create_backup(
     ``_storage_policy`` is an internal test seam. Production callers must use
     the mounted-filesystem and physical-device policy above.
     """
-    source = _private_directory(_path(media_root, "MEDIA_ROOT"), create=False)
+    source = _private_directory(_path(media_root, "MEDIA_ROOT"), create=False, media=True)
     destination_root = _backup_root(_path(backup_root, "BACKUP_ROOT"))
     if _path_overlap(source, destination_root):
         raise OpsError("backup root must not contain or be contained by MEDIA_ROOT")

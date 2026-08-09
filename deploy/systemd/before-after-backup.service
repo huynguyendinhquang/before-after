@@ -8,6 +8,7 @@ RequiresMountsFor=/var/lib/before-after/media /mnt/clinic-backup/before-after
 Type=oneshot
 User=before-after-backup
 Group=before-after-backup
+SupplementaryGroups=before-after-media
 WorkingDirectory=/opt/before-after
 EnvironmentFile=/etc/before-after/before-after-backup.env
 Environment="PATH=/opt/before-after/.venv/bin:/usr/local/bin:/usr/bin"

@@ -40,6 +40,12 @@ export are versioned server-side; export is restricted to Admins/Editors,
 CSRF-protected, audited, and served with `Cache-Control: no-store`. Viewer
 accounts can read Sets and previews but cannot export.
 
+Production Gunicorn, nginx, systemd, environment, backup, and isolated
+restore-check artifacts are in `deploy/`, `ops/`, and
+[`docs/deployment.md`](docs/deployment.md). The backup timer deliberately stops
+Gunicorn during the paired PostgreSQL/media copy and publishes only complete,
+checksummed generations to a second device.
+
 ### PostgreSQL acceptance gate
 
 The ordinary test run may skip database-backed Slice 1 tests when no database

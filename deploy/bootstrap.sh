@@ -46,16 +46,19 @@ ensure_user() {
 # Create identities before any install/chown operation below.
 ensure_group before-after
 ensure_group before-after-backup
+ensure_group before-after-media
 ensure_user before-after before-after "$RELEASE_DIR"
 ensure_user before-after-backup before-after-backup /var/lib/before-after-backup
+usermod --append --groups before-after-media before-after
+usermod --append --groups before-after-media before-after-backup
 if id -u www-data >/dev/null 2>&1; then
     usermod --append --groups before-after www-data
 fi
 
 install -d -o root -g root -m 0755 "$RELEASE_DIR"
-install -d -o before-after -g before-after -m 0700 "$MEDIA_ROOT_DEFAULT"
+install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT_DEFAULT"
 for media_dir in originals previews derivatives quarantine; do
-    install -d -o before-after -g before-after -m 0700 "$MEDIA_ROOT_DEFAULT/$media_dir"
+    install -d -o before-after -g before-after-media -m 2750 "$MEDIA_ROOT_DEFAULT/$media_dir"
 done
 install -d -o root -g root -m 0750 /etc/before-after
 

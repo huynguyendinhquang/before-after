@@ -1,0 +1,32 @@
+[Unit]
+Description=Before-after clinical image comparison web application
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=before-after
+Group=before-after
+SupplementaryGroups=before-after-media
+WorkingDirectory=/opt/before-after
+EnvironmentFile=/etc/before-after/before-after.env
+Environment="PATH=/opt/before-after/.venv/bin:/usr/local/bin:/usr/bin"
+RuntimeDirectory=before-after
+RuntimeDirectoryMode=0750
+UMask=0007
+ExecStart=/usr/bin/env gunicorn --workers 2 --bind unix:/run/before-after/gunicorn.sock --timeout 120 --graceful-timeout 30 --access-logfile /dev/null --error-logfile - 'app:create_app()'
+Restart=on-failure
+RestartSec=5s
+
+# The app user can read the release and write only managed media.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/before-after/media
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily before-after paired backup schedule
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=before-after-backup.service
+
+[Install]
+WantedBy=timers.target

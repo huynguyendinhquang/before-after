@@ -26,6 +26,8 @@ from app.image_policy import FORMAT_EXTENSIONS, ImagePolicyError, open_image
 
 PREVIEW_MAX_DIMENSION = 1600
 DEFAULT_ORPHAN_GRACE_SECONDS = 300
+MEDIA_DIRECTORY_MODE = 0o2750
+MEDIA_FILE_MODE = 0o640
 _ALLOWED_ROOTS = frozenset({"originals", "previews", "derivatives", "quarantine"})
 _HEX_KEY = re.compile(r"^[0-9a-f]{32}$")
 _PENDING_PREFIX = ".pending-"
@@ -92,12 +94,14 @@ class ManagedStorage:
             raise StorageError("managed storage requires POSIX dirfd primitives")
         self.root = Path(root).expanduser().absolute()
         try:
-            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.root.mkdir(parents=True, exist_ok=True, mode=MEDIA_DIRECTORY_MODE)
+            self.root.chmod(MEDIA_DIRECTORY_MODE)
             self._root_fd = os.open(self.root, self._directory_flags())
         except (OSError, TypeError, ValueError) as exc:
             raise StorageError(f"MEDIA_ROOT is not usable: {exc}") from exc
 
         try:
+            os.fchmod(self._root_fd, MEDIA_DIRECTORY_MODE)
             self._validate_directory(self._root_fd, "MEDIA_ROOT")
             for name in _ALLOWED_ROOTS:
                 self._ensure_directory(self._root_fd, name)
@@ -145,13 +149,14 @@ class ManagedStorage:
             raise StorageError(f"could not inspect {label}: {exc}") from exc
         if not stat.S_ISDIR(info.st_mode):
             raise StorageError(f"{label} must be a directory")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            raise StorageError(f"{label} must be private to the application user")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o007 or mode & 0o020 or mode & 0o070 != 0o050:
+            raise StorageError(f"{label} must be private to the application and media group")
 
     def _ensure_directory(self, parent_fd: int, name: str) -> None:
         created = False
         try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.mkdir(name, MEDIA_DIRECTORY_MODE, dir_fd=parent_fd)
             created = True
         except FileExistsError:
             pass
@@ -160,6 +165,7 @@ class ManagedStorage:
         except OSError as exc:
             raise StorageError(f"managed storage directory is unsafe: {name}") from exc
         try:
+            os.fchmod(fd, MEDIA_DIRECTORY_MODE)
             self._validate_directory(fd, name)
         finally:
             os.close(fd)
@@ -285,6 +291,7 @@ class ManagedStorage:
                 if written <= 0:
                     raise OSError("could not write pending marker")
                 view = view[written:]
+            os.fchmod(fd, MEDIA_FILE_MODE)
             os.fsync(fd)
             os.replace(
                 temporary_name,
@@ -445,6 +452,7 @@ class ManagedStorage:
             with os.fdopen(fd, "wb", closefd=False) as stream:
                 stream.write(payload)
                 stream.flush()
+                os.fchmod(stream.fileno(), MEDIA_FILE_MODE)
                 os.fsync(stream.fileno())
 
             os.link(

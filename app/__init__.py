@@ -23,7 +23,7 @@ from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
 from app.models import Capture, Export
 from app.patients import patients_bp
-from app.storage import DEFAULT_ORPHAN_GRACE_SECONDS, ManagedStorage, StorageError
+from app.storage import DEFAULT_ORPHAN_GRACE_SECONDS, MEDIA_DIRECTORY_MODE, ManagedStorage, StorageError
 
 __version__ = "0.1.0"
 
@@ -59,7 +59,10 @@ def _validate_configuration(app: Flask) -> None:
     if ".." in media_path.parts:
         raise RuntimeError("MEDIA_ROOT must not contain lexical traversal")
     try:
-        media_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        created = not media_path.exists()
+        media_path.mkdir(parents=True, exist_ok=True, mode=MEDIA_DIRECTORY_MODE)
+        if created:
+            media_path.chmod(MEDIA_DIRECTORY_MODE)
         media_path = media_path.resolve(strict=True)
     except OSError as exc:
         raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
@@ -75,8 +78,9 @@ def _validate_configuration(app: Flask) -> None:
     else:
         raise RuntimeError("MEDIA_ROOT must be outside the static web root")
     try:
-        if stat.S_IMODE(media_path.stat().st_mode) & 0o077:
-            raise RuntimeError("MEDIA_ROOT must be private to the application user")
+        mode = stat.S_IMODE(media_path.stat().st_mode)
+        if mode & 0o007 or mode & 0o020:
+            raise RuntimeError("MEDIA_ROOT must be private to the application and media group (not world-accessible or group-writable)")
     except OSError as exc:
         raise RuntimeError(f"MEDIA_ROOT is not usable: {exc}") from exc
 

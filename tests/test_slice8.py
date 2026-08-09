@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import grp
 import os
+import pwd
 from pathlib import Path
 import stat
 import subprocess
 import shutil
+import sys
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 import pytest
 
-from ops import backup as backup_module
 from ops.backup import OpsError, create_backup, prune_generations
 from ops.restore_check import (
     assert_isolated_targets,
@@ -54,9 +56,9 @@ def test_production_proxy_configuration_trusts_only_configured_hop(tmp_path: Pat
 
 
 def private_media_root(path: Path) -> Path:
-    path.mkdir(mode=0o700)
+    path.mkdir(mode=0o2750)
     for name in ("originals", "previews", "derivatives", "quarantine"):
-        (path / name).mkdir(mode=0o700)
+        (path / name).mkdir(mode=0o2750)
     return path
 
 
@@ -88,15 +90,80 @@ def fake_pg_restore(path: Path) -> Path:
     return script
 
 
+def test_managed_storage_uses_media_group_modes(tmp_path: Path) -> None:
+    from app.storage import ManagedStorage
+
+    storage = ManagedStorage(tmp_path / "media")
+    assert stat.S_IMODE(storage.root.stat().st_mode) == 0o2750
+    for name in ("originals", "previews", "derivatives", "quarantine"):
+        assert stat.S_IMODE((storage.root / name).stat().st_mode) == 0o2750
+    stored = storage.store_derivative(b"synthetic", "png")
+    assert stat.S_IMODE(storage.resolve(stored.storage_key).stat().st_mode) == 0o640
+    storage.finalize(stored)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="effective backup-user check requires root")
+def test_backup_user_can_read_media_but_cannot_modify_or_delete(tmp_path: Path) -> None:
+    try:
+        backup_user = pwd.getpwnam("before-after-backup")
+        media_group = grp.getgrnam("before-after-media")
+    except KeyError:
+        pytest.skip("deployment backup user and media group are not installed")
+    from app.storage import ManagedStorage
+
+    storage = ManagedStorage(tmp_path / "media")
+    stored = storage.store_derivative(b"synthetic", "png")
+    path = storage.resolve(stored.storage_key)
+    storage.finalize(stored)
+    for directory in (storage.root, *(storage.root / name for name in ("originals", "previews", "derivatives", "quarantine"))):
+        os.chown(directory, os.geteuid(), media_group.gr_gid)
+    os.chown(path, os.geteuid(), media_group.gr_gid)
+
+    def drop_privileges() -> None:
+        os.setgroups([media_group.gr_gid])
+        os.setgid(backup_user.pw_gid)
+        os.setuid(backup_user.pw_uid)
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from pathlib import Path
+path = Path(__import__('sys').argv[1])
+assert path.read_bytes() == b'synthetic'
+try:
+    path.write_bytes(b'changed')
+except PermissionError:
+    pass
+else:
+    raise SystemExit('backup user can modify media')
+try:
+    path.unlink()
+except PermissionError:
+    pass
+else:
+    raise SystemExit('backup user can delete media')
+""",
+            str(path),
+        ],
+        preexec_fn=drop_privileges,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+
+
 def test_backup_publishes_private_atomic_generation_and_manifest(tmp_path: Path) -> None:
     media = private_media_root(tmp_path / "media")
     original = b"synthetic original"
     (media / "originals" / "capture.bin").write_bytes(original)
     # The generated media key is intentionally opaque; the manifest contains
     # no original filename or Patient fields.
-    os.chmod(media / "originals" / "capture.bin", 0o600)
+    os.chmod(media / "originals" / "capture.bin", 0o640)
     (media / "previews" / "preview.jpg").write_bytes(b"preview")
-    os.chmod(media / "previews" / "preview.jpg", 0o600)
+    os.chmod(media / "previews" / "preview.jpg", 0o640)
     dump = fake_pg_dump(tmp_path)
     restore = fake_pg_restore(tmp_path)
     backup_root = tmp_path / "backup"
@@ -161,7 +228,7 @@ def test_backup_requires_mounted_storage_and_only_internal_policy_can_be_injecte
 def test_corrupt_copy_and_partial_generation_are_rejected(tmp_path: Path) -> None:
     media = private_media_root(tmp_path / "media")
     (media / "originals" / "capture.jpg").write_bytes(b"original")
-    os.chmod(media / "originals" / "capture.jpg", 0o600)
+    os.chmod(media / "originals" / "capture.jpg", 0o640)
     dump = fake_pg_dump(tmp_path)
     restore = fake_pg_restore(tmp_path)
     backup_root = tmp_path / "backup"
@@ -228,13 +295,19 @@ def test_restore_target_guard_rejects_production_and_backup_paths(tmp_path: Path
 def postgres_restore_fixture(tmp_path_factory: pytest.TempPathFactory):
     database_url = os.environ.get("TEST_DATABASE_URL")
     if not database_url:
-        pytest.skip("TEST_DATABASE_URL is required for Slice 8 PostgreSQL acceptance")
-    if not shutil_which("pg_dump") or not shutil_which("pg_restore"):
-        pytest.skip("pg_dump and pg_restore are required for Slice 8 restore acceptance")
+        pytest.fail("TEST_DATABASE_URL is required for Slice 8 PostgreSQL acceptance")
+    missing_clients = [
+        client for client in ("pg_dump", "pg_restore", "psql") if not shutil_which(client)
+    ]
+    if missing_clients:
+        pytest.fail(
+            "native PostgreSQL clients are required for Slice 8 acceptance: "
+            + ", ".join(missing_clients)
+        )
     try:
         import psycopg  # noqa: F401
     except ImportError:
-        pytest.skip("psycopg is required for Slice 8 restore acceptance")
+        pytest.fail("psycopg is required for Slice 8 restore acceptance")
     from alembic import command
     from alembic.config import Config
     from sqlalchemy import create_engine, text
@@ -377,7 +450,7 @@ def make_restore_database_url(source: str) -> str:
 def _synthetic_backup(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     media = private_media_root(tmp_path / "media")
     (media / "originals" / "capture.jpg").write_bytes(b"original")
-    os.chmod(media / "originals" / "capture.jpg", 0o600)
+    os.chmod(media / "originals" / "capture.jpg", 0o640)
     backup = tmp_path / "backup"
     backup.mkdir(mode=0o700)
     dump = fake_pg_dump(tmp_path)
@@ -609,6 +682,12 @@ def test_restore_failure_removes_media_and_marks_target_disposable(tmp_path: Pat
         raise OpsError("synthetic restore failure")
 
     monkeypatch.setattr(restore_module, "restore_media", fail_after_media)
+    cleanup_calls: list[str] = []
+    monkeypatch.setattr(
+        restore_module,
+        "_cleanup_restore_database",
+        lambda database_url: cleanup_calls.append(database_url),
+    )
     with pytest.raises(OpsError, match="synthetic restore failure"):
         restore_module.run_restore_check(
             backup_root=backup,
@@ -621,7 +700,60 @@ def test_restore_failure_removes_media_and_marks_target_disposable(tmp_path: Pat
         )
     assert not target.exists()
     assert not source_staging.exists()
+    assert cleanup_calls == ["postgresql://restore@127.0.0.1/restore"]
     assert (tmp_path / ".restore-media.restore-failed").is_file()
+
+
+def test_smoke_failure_cleans_database_state_and_assets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ops.restore_check as restore_module
+
+    _media, backup, generation_path, restore = _synthetic_backup(tmp_path)
+    selected = verify_generation(generation_path)
+    target = tmp_path / "restore-media"
+    source_staging = tmp_path / ".restore-source-test"
+    source_staging.mkdir(mode=0o700)
+    (source_staging / "dump").write_bytes(b"private")
+    clinical_rows = {"Patient": [1], "Capture": [1]}
+    monkeypatch.setattr(restore_module, "select_generation", lambda *_args: selected)
+    monkeypatch.setattr(restore_module, "assert_isolated_targets", lambda **_kwargs: target)
+    monkeypatch.setattr(
+        restore_module,
+        "stage_verified_generation",
+        lambda *_args, **_kwargs: (selected, source_staging),
+    )
+
+    def restore_assets(_generation, destination):
+        destination.mkdir(mode=0o700)
+        (destination / "clinical.bin").write_bytes(b"clinical")
+
+    monkeypatch.setattr(restore_module, "restore_media", restore_assets)
+    monkeypatch.setattr(restore_module, "verify_restored_media", lambda *_args: None)
+    monkeypatch.setattr(restore_module, "restore_database", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(restore_module, "migration_check", lambda **_kwargs: None)
+    monkeypatch.setattr(restore_module, "_database_media_check", lambda *_args: None)
+    monkeypatch.setattr(
+        restore_module,
+        "smoke_check",
+        lambda **_kwargs: (_ for _ in ()).throw(OpsError("injected smoke failure")),
+    )
+
+    def clean_database(_database_url: str) -> None:
+        clinical_rows.clear()
+
+    monkeypatch.setattr(restore_module, "_cleanup_restore_database", clean_database)
+    with pytest.raises(OpsError, match="injected smoke failure"):
+        restore_module.run_restore_check(
+            backup_root=backup,
+            target_database_url="postgresql://restore@127.0.0.1/restore",
+            target_media_root=target,
+            production_database_urls=("postgresql://production@127.0.0.1/clinic",),
+            production_media_roots=(_media,),
+            smoke_username="editor",
+            smoke_password="secret",
+        )
+    assert clinical_rows == {}
+    assert not target.exists()
+    assert not source_staging.exists()
 
 
 def test_runbook_uses_bootstrap_and_secret_files_not_password_arguments() -> None:

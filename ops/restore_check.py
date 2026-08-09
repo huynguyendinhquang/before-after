@@ -15,9 +15,8 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from typing import Callable, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 import uuid
 
 from ops.backup import (
@@ -31,7 +30,6 @@ from ops.backup import (
     _fsync_directory,
     POSTGRES_DUMP_MAGIC,
     _cleanup_staging,
-    _fsync_file,
     _native_postgres_url,
     _path,
     _path_overlap,
@@ -253,6 +251,80 @@ def _connection_database_identity(value: str) -> tuple[object, ...]:
             raise OpsError("PostgreSQL server address is invalid") from exc
         return ("address", server, int(port), str(database))
     raise OpsError("PostgreSQL socket connection identity is unavailable")
+
+
+def _connection_server_identity(value: str) -> tuple[object, ...]:
+    """Resolve a PostgreSQL URL to its server identity without opening its DB."""
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to establish PostgreSQL server identity") from exc
+    try:
+        with psycopg.connect(_maintenance_database_url(value), connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT inet_server_addr()::text, inet_server_port()")
+                address, port = cursor.fetchone() or (None, None)
+                try:
+                    cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
+                    system_identifier = cursor.fetchone()[0]
+                except Exception:
+                    system_identifier = None
+    except Exception as exc:
+        raise OpsError("could not establish PostgreSQL server identity") from exc
+    if port is None:
+        raise OpsError("PostgreSQL server identity is unavailable")
+    if system_identifier:
+        return ("cluster", str(system_identifier), int(port))
+    if address:
+        try:
+            import ipaddress
+
+            server = str(ipaddress.ip_address(str(address).split("/", 1)[0]))
+        except ValueError as exc:
+            raise OpsError("PostgreSQL server address is invalid") from exc
+        return ("address", server, int(port))
+    raise OpsError("PostgreSQL socket server identity is unavailable")
+
+
+def _database_name(value: str) -> str:
+    parsed = urlsplit(_native_postgres_url(value))
+    name = unquote(parsed.path.lstrip("/"))
+    if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name):
+        raise OpsError("PostgreSQL target database name is invalid")
+    return name
+
+
+def create_isolated_database(
+    target_database_url: str,
+    production_database_urls: Iterable[str],
+) -> None:
+    """Create a new target DB only after server/database identity guards."""
+    production_urls = tuple(
+        value for value in production_database_urls if isinstance(value, str) and value.strip()
+    )
+    if not production_urls:
+        raise OpsError("a production database identifier is required before target creation")
+    target_server = _connection_server_identity(target_database_url)
+    target_name = _database_name(target_database_url)
+    for production_url in production_urls:
+        production_identity = _connection_database_identity(production_url)
+        if target_server == production_identity[:3] and target_name == production_identity[3]:
+            raise OpsError("restore target database is a production database")
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to create the restore database") from exc
+    try:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_name,))
+                if cursor.fetchone() is not None:
+                    raise OpsError("restore target database already exists; choose a new isolated name")
+                cursor.execute(f'CREATE DATABASE "{target_name}"')
+    except OpsError:
+        raise
+    except Exception as exc:
+        raise OpsError("could not create isolated restore database") from exc
 
 
 def assert_isolated_targets(
@@ -663,6 +735,35 @@ def smoke_check(
         raise OpsError("restore smoke export failed")
 
 
+def ensure_smoke_account(application, username: str, password: str) -> bool:
+    """Create a disposable Editor in the restored DB only when it is absent."""
+    from sqlalchemy import select
+
+    from app.auth import AdminError, create_user
+    from app.db import db
+    from app.models import User
+
+    with application.app_context():
+        existing = db.session.scalar(select(User).where(User.username == username.casefold()))
+        if existing is not None:
+            if existing.active and existing.is_editor:
+                return False
+            raise OpsError("restore smoke account exists but is not an active Editor or Admin")
+        try:
+            create_user(
+                actor=None,
+                username=username,
+                display_name="Temporary restore smoke account",
+                password=password,
+                role="editor",
+                active=True,
+                bootstrap=True,
+            )
+        except (AdminError, ValueError) as exc:
+            raise OpsError("could not create restore smoke account") from exc
+    return True
+
+
 def _remove_private_path(path: Path) -> None:
     """Remove only the named restore artifact; never follow a symlink."""
     try:
@@ -691,18 +792,69 @@ def _remove_private_path(path: Path) -> None:
         pass
 
 
-def _mark_restore_failed(parent: Path, target: Path) -> None:
+def _remove_private_path_strict(path: Path) -> None:
+    """Remove a restore artifact and report cleanup errors to the caller."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise OpsError("could not inspect restore cleanup path") from exc
+    try:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            path.unlink()
+            return
+        for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+            current_path = Path(current)
+            for name in files:
+                file_path = current_path / name
+                if not file_path.is_symlink():
+                    os.chmod(file_path, 0o600)
+            for name in directories:
+                directory = current_path / name
+                if not directory.is_symlink():
+                    os.chmod(directory, 0o700)
+        os.chmod(path, 0o700)
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise OpsError("could not remove restore cleanup path") from exc
+
+
+def _maintenance_database_url(value: str) -> str:
+    parsed = urlsplit(_native_postgres_url(value))
+    return urlunsplit(("postgresql", parsed.netloc, "/postgres", parsed.query, parsed.fragment))
+
+
+def _cleanup_restore_database(target_database_url: str) -> None:
+    """Empty an isolated target database after a failed restore drill."""
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to clean the restore database") from exc
+    try:
+        with psycopg.connect(_native_postgres_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DROP SCHEMA IF EXISTS public CASCADE")
+                cursor.execute("CREATE SCHEMA public")
+    except Exception as exc:
+        raise OpsError("could not clean isolated restore database; target is poisoned") from exc
+
+
+def _mark_restore_failed(parent: Path, target: Path, *, poisoned: bool = False) -> None:
     marker = parent / f".{target.name}.restore-failed"
     _assert_no_symlink_components(marker)
+    message = "restore target is failed and disposable; destroy its database and retry"
+    if poisoned:
+        message = "restore target is POISONED; cleanup failed; destroy its database before retry"
     try:
         with marker.open("w", encoding="ascii") as stream:
-            stream.write("restore target is failed and disposable; destroy its database and retry\n")
+            stream.write(message + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(marker, 0o600)
         _fsync_directory(parent)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise OpsError("could not mark failed restore target") from exc
 
 
 def _read_secret_file(path: str | os.PathLike[str]) -> str:
@@ -713,6 +865,92 @@ def _read_secret_file(path: str | os.PathLike[str]) -> str:
     except (OSError, UnicodeError) as exc:
         raise OpsError("could not read restore smoke password file") from exc
     return value.rstrip("\r\n")
+
+
+def prepare_isolated_media_target(
+    target_media_root: str | os.PathLike[str],
+    restore_parent: str | os.PathLike[str],
+    *,
+    backup_root: str | os.PathLike[str] | None = None,
+    production_media_roots: Iterable[str | os.PathLike[str]] = (),
+) -> Path:
+    """Create the empty `0700` media target inside a private restore parent."""
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=True)
+    _assert_no_symlink_components(target)
+    if target == parent or not _path_overlap(target, parent):
+        raise OpsError("restore target must be inside the private restore parent")
+    if backup_root is not None and _path_overlap(target, _path(backup_root, "BACKUP_ROOT")):
+        raise OpsError("restore MEDIA_ROOT must be outside backup storage")
+    for value in production_media_roots:
+        production = _path(value, "production MEDIA_ROOT")
+        _assert_no_symlink_components(production, allow_missing_leaf=False)
+        if _path_overlap(target, production):
+            raise OpsError("restore MEDIA_ROOT is a production media destination")
+    if target.exists():
+        _private_directory(target, create=False)
+        try:
+            if any(target.iterdir()):
+                raise OpsError("restore MEDIA_ROOT must be empty and isolated")
+        except OSError as exc:
+            raise OpsError("restore MEDIA_ROOT is not usable") from exc
+    else:
+        try:
+            target.mkdir(mode=0o700)
+            os.chmod(target, 0o700)
+        except OSError as exc:
+            raise OpsError("could not create isolated restore MEDIA_ROOT") from exc
+    return target
+
+
+def cleanup_isolated_target(
+    *,
+    target_database_url: str,
+    target_media_root: str | os.PathLike[str],
+    restore_parent: str | os.PathLike[str],
+    production_database_urls: Iterable[str],
+    production_media_roots: Iterable[str | os.PathLike[str]] = (),
+    backup_root: str | os.PathLike[str] | None = None,
+) -> None:
+    """Drop a guarded isolated DB and remove its restore media."""
+    production_urls = tuple(
+        value for value in production_database_urls if isinstance(value, str) and value.strip()
+    )
+    if not production_urls:
+        raise OpsError("a production database identifier is required before cleanup")
+    target = _path(target_media_root, "restore MEDIA_ROOT")
+    parent = _private_directory(_path(restore_parent, "restore parent"), create=False)
+    _assert_no_symlink_components(target)
+    if target == parent or not _path_overlap(target, parent):
+        raise OpsError("restore target must be inside the private restore parent")
+    if backup_root is not None and _path_overlap(target, _path(backup_root, "BACKUP_ROOT")):
+        raise OpsError("restore MEDIA_ROOT must be outside backup storage")
+    for value in production_media_roots:
+        production = _path(value, "production MEDIA_ROOT")
+        _assert_no_symlink_components(production, allow_missing_leaf=False)
+        if _path_overlap(target, production):
+            raise OpsError("restore MEDIA_ROOT is a production media destination")
+
+    target_server = _connection_server_identity(target_database_url)
+    target_name = _database_name(target_database_url)
+    for production_url in production_urls:
+        production_identity = _connection_database_identity(production_url)
+        if target_server == production_identity[:3] and target_name == production_identity[3]:
+            raise OpsError("refusing to clean a production database")
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise OpsError("psycopg is required to clean the restore database") from exc
+    try:
+        with psycopg.connect(_maintenance_database_url(target_database_url), autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_name,))
+                if cursor.fetchone() is not None:
+                    cursor.execute(f'DROP DATABASE "{target_name}" WITH (FORCE)')
+    except Exception as exc:
+        raise OpsError("could not drop isolated restore database") from exc
+    _remove_private_path_strict(target)
+    _remove_private_path_strict(parent / f".{target.name}.restore-failed")
 
 
 def run_restore_check(
@@ -730,6 +968,7 @@ def run_restore_check(
     restore_parent: str | os.PathLike[str] | None = None,
     smoke_username: str | None = None,
     smoke_password: str | None = None,
+    create_smoke_account: bool = False,
 ) -> RestoreResult:
     if not isinstance(smoke_username, str) or not smoke_username:
         raise OpsError("restore smoke credentials are required")
@@ -749,7 +988,7 @@ def run_restore_check(
         _path(restore_parent, "restore parent") if restore_parent is not None else target.parent,
         create=False,
     )
-    if not _path_overlap(target, parent):
+    if target == parent or not _path_overlap(target, parent):
         raise OpsError("restore target must be inside the private restore parent")
     source_staging: Path | None = None
     completed = False
@@ -780,6 +1019,8 @@ def run_restore_check(
                 "SESSION_COOKIE_SECURE": False,
             }
         )
+        if create_smoke_account:
+            ensure_smoke_account(application, smoke_username, smoke_password)
         _database_media_check(application, target)
         smoke_check(
             target_database_url=target_database_url,
@@ -800,11 +1041,30 @@ def run_restore_check(
     except Exception as exc:
         raise OpsError("isolated restore check failed") from exc
     finally:
-        if source_staging is not None:
-            _remove_private_path(source_staging)
         if not completed:
-            _remove_private_path(target)
+            cleanup_errors: list[BaseException] = []
+            if source_staging is not None:
+                try:
+                    _remove_private_path_strict(source_staging)
+                except OpsError as exc:
+                    cleanup_errors.append(exc)
+            try:
+                _remove_private_path_strict(target)
+            except OpsError as exc:
+                cleanup_errors.append(exc)
+            try:
+                _cleanup_restore_database(target_database_url)
+            except OpsError as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                try:
+                    _mark_restore_failed(parent, target, poisoned=True)
+                except OpsError as exc:
+                    cleanup_errors.append(exc)
+                raise OpsError("restore failed and cleanup failed; target is poisoned") from cleanup_errors[0]
             _mark_restore_failed(parent, target)
+        elif source_staging is not None:
+            _remove_private_path(source_staging)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -813,8 +1073,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--generation", default=os.environ.get("BACKUP_GENERATION"))
     parser.add_argument("--target-database-url", default=os.environ.get("RESTORE_CHECK_DATABASE_URL"))
     parser.add_argument("--target-media-root", default=os.environ.get("RESTORE_CHECK_MEDIA_ROOT"))
-    parser.add_argument("--production-database-url", default=os.environ.get("DATABASE_URL"))
-    parser.add_argument("--production-media-root", default=os.environ.get("MEDIA_ROOT"))
+    parser.add_argument(
+        "--production-database-url",
+        default=os.environ.get("PRODUCTION_DATABASE_URL", os.environ.get("DATABASE_URL")),
+    )
+    parser.add_argument(
+        "--production-media-root",
+        default=os.environ.get("PRODUCTION_MEDIA_ROOT", os.environ.get("MEDIA_ROOT")),
+    )
     parser.add_argument("--source-database-url", default=os.environ.get("BACKUP_SOURCE_DATABASE_URL"))
     parser.add_argument("--pg-restore", default=os.environ.get("PG_RESTORE", "pg_restore"))
     parser.add_argument("--repo-root", default=None)
@@ -823,6 +1089,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke-username", default=os.environ.get("RESTORE_SMOKE_USERNAME"))
     parser.add_argument("--smoke-password-file", default=os.environ.get("RESTORE_SMOKE_PASSWORD_FILE"))
     parser.add_argument("--smoke-password-stdin", action="store_true")
+    parser.add_argument(
+        "--create-smoke-account",
+        action="store_true",
+        help="create an Editor in the restored target when the named account is absent",
+    )
+    parser.add_argument(
+        "--provision-target",
+        action="store_true",
+        help="create the empty 0700 media target and a new isolated PostgreSQL database first",
+    )
+    parser.add_argument(
+        "--cleanup-target",
+        action="store_true",
+        help="drop the guarded isolated database and remove its media target",
+    )
     parser.add_argument(
         "--isolated",
         action="store_true",
@@ -836,6 +1117,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.isolated:
             raise OpsError("restore-check requires --isolated")
+        production_database_urls = (
+            (args.production_database_url,) if args.production_database_url else ()
+        )
+        if args.cleanup_target:
+            if not args.target_database_url or not args.target_media_root or not args.restore_parent:
+                raise OpsError("target database, media root, and restore parent are required for cleanup")
+            cleanup_isolated_target(
+                target_database_url=args.target_database_url,
+                target_media_root=args.target_media_root,
+                restore_parent=args.restore_parent,
+                production_database_urls=production_database_urls,
+                production_media_roots=(args.production_media_root,) if args.production_media_root else (),
+                backup_root=args.backup_root,
+            )
+            print("restore target cleaned")
+            return 0
         if args.smoke_password_file:
             smoke_password = _read_secret_file(args.smoke_password_file)
         elif args.smoke_password_stdin:
@@ -844,6 +1141,22 @@ def main(argv: list[str] | None = None) -> int:
             smoke_password = os.environ["RESTORE_SMOKE_PASSWORD"]
         else:
             raise OpsError("restore smoke password file, stdin, or environment is required")
+        if args.provision_target:
+            if not args.target_database_url or not args.target_media_root:
+                raise OpsError("target database and media URLs are required to provision a restore target")
+            prepare_isolated_media_target(
+                args.target_media_root,
+                args.restore_parent or str(Path(args.target_media_root).parent),
+                backup_root=args.backup_root,
+                production_media_roots=(args.production_media_root,)
+                if args.production_media_root
+                else (),
+            )
+            create_isolated_database(
+                args.target_database_url,
+                (*production_database_urls,)
+                + ((args.source_database_url,) if args.source_database_url else ()),
+            )
         result = run_restore_check(
             backup_root=args.backup_root,
             target_database_url=args.target_database_url,
@@ -858,6 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
             restore_parent=args.restore_parent,
             smoke_username=args.smoke_username,
             smoke_password=smoke_password,
+            create_smoke_account=args.create_smoke_account,
         )
     except OpsError as exc:
         print(f"restore-check failed: {exc}", file=sys.stderr)
