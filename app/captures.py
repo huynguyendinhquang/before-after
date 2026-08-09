@@ -72,6 +72,10 @@ class ShotTypeError(ValueError):
     """Raised when an Admin Shot Type workflow cannot change state."""
 
 
+class ShotTypeConflict(ShotTypeError):
+    """Raised when a Shot Type changed before the requested transition."""
+
+
 @dataclass
 class PendingCapture:
     """A prepared Capture whose media still follows the caller's transaction."""
@@ -228,9 +232,27 @@ def _locked_shot_type(selected: ShotType) -> ShotType:
     return locked
 
 
-def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
+def _existing_capture_candidate(patient_id: int, sha256: str) -> int | None:
     return db.session.scalar(
-        select(Capture).where(Capture.patient_id == patient_id, Capture.sha256 == sha256)
+        select(Capture.id).where(Capture.patient_id == patient_id, Capture.sha256 == sha256)
+    )
+
+
+def _existing_capture(patient_id: int, sha256: str) -> Capture | None:
+    """Lock a duplicate candidate before reporting it as the stored Capture.
+
+    The key precheck avoids media work in the common case.  The second query
+    serializes with delete_capture and refreshes every scalar before returning;
+    a row deleted while the precheck was running produces a normal insert path.
+    """
+    candidate_id = _existing_capture_candidate(patient_id, sha256)
+    if candidate_id is None:
+        return None
+    return db.session.scalar(
+        select(Capture)
+        .where(Capture.id == candidate_id)
+        .with_for_update(of=Capture)
+        .execution_options(populate_existing=True)
     )
 
 
@@ -510,11 +532,12 @@ def promote_shot_type(
             select(ShotType)
             .where(ShotType.id == target_id)
             .with_for_update(of=ShotType)
+            .execution_options(populate_existing=True)
         )
         if promoted is None:
             raise ShotTypeError("Shot Type is unavailable")
         if promoted.state != "proposal" or promoted.canonical_target_id is not None:
-            raise ShotTypeError("only a Proposal can be promoted")
+            raise ShotTypeConflict("only a Proposal can be promoted")
         promoted.state = "canonical"
         append_audit(
             actor=actor,
@@ -556,12 +579,18 @@ def merge_shot_type(
                 .where(ShotType.id.in_([source_pk, target_pk]))
                 .order_by(ShotType.id)
                 .with_for_update(of=ShotType)
+                .execution_options(populate_existing=True)
             )
         }
         source_row = locked.get(source_pk)
         target_row = locked.get(target_pk)
         if source_row is None or target_row is None:
             raise ShotTypeError("Shot Type is unavailable")
+        if source_row.state == "merged":
+            if source_row.canonical_target_id == target_row.id:
+                db.session.commit()
+                return target_row
+            raise ShotTypeError("source Shot Type is already merged into another canonical Shot Type")
         if source_row.state != "proposal" or source_row.canonical_target_id is not None:
             raise ShotTypeError("source Shot Type must be an unmerged Proposal")
         if target_row.state != "canonical" or target_row.canonical_target_id is not None:
@@ -603,6 +632,7 @@ def _locked_capture(capture: Capture | int | None = None, capture_id: int | None
         select(Capture)
         .where(Capture.id == candidate)
         .with_for_update(of=Capture)
+        .execution_options(populate_existing=True)
     )
     if locked is None:
         raise CaptureError("Capture is unavailable")
@@ -1015,14 +1045,15 @@ def delete_route(capture_pk: int, patient_pk: int | None = None):
     capture = _lifecycle_capture(capture_pk)
     if patient_pk is not None and capture.patient_id != patient_pk:
         abort(404)
+    patient_id = capture.patient_id
     try:
         delete_capture(actor=current_user, capture=capture)
     except CaptureReferencedError as exc:
         flash(str(exc), "error")
         return _lifecycle_redirect(capture), 409
-    except (CaptureReconciliationError, CaptureDeleteReconciliationError) as exc:
+    except (CaptureReconciliationError, CaptureDeleteReconciliationError, StorageError) as exc:
         flash(str(exc), "error")
-        return _lifecycle_redirect(capture), 503
+        return redirect(url_for("captures.library", patient_pk=patient_id)), 503
     except CaptureError as exc:
         flash(str(exc), "error")
         return _lifecycle_redirect(capture), 400

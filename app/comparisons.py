@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
 import math
 import unicodedata
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Blueprint, abort, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
 from sqlalchemy import func, inspect, select, update
@@ -26,15 +24,7 @@ from wtforms.validators import Length, Optional
 
 from app.audit import append_audit
 from app.auth import editor_required
-from app.board import (
-    CANVAS_PRESETS,
-    CanvasRenderSpec,
-    FrameRenderSpec,
-    canvas_dimensions,
-    encode,
-    normalize_canvas_preset,
-    render_canvas,
-)
+from app.board import CANVAS_PRESETS, canvas_dimensions, normalize_canvas_preset
 from app.captures import (
     CaptureError,
     CaptureReconciliationError,
@@ -44,9 +34,8 @@ from app.captures import (
     prepare_capture,
 )
 from app.db import db
-from app.models import Capture, ComparisonSet, Export, Frame, Patient, User
-from app.image_policy import DEFAULT_MAX_PIXELS, ImagePolicyError, read_bounded
-from app.storage import ImageInspection, ManagedStorage, StorageError, StoredDerivative
+from app.models import Capture, ComparisonSet, Frame, Patient, User
+from app.storage import ImageInspection, ManagedStorage, StorageError
 
 
 comparisons_bp = Blueprint("comparisons", __name__)
@@ -87,9 +76,59 @@ class SetLifecycleError(ComparisonError):
 
 EDIT_LEASE_SECONDS = 5 * 60
 DEFAULT_RENDER_DPI = 150
-DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES = 100
-DEFAULT_PREVIEW_MAX_BYTES = 50 * 1024 * 1024
-DEFAULT_PREVIEW_MAX_PIXELS = DEFAULT_MAX_PIXELS
+
+
+# Compatibility shims keep existing callers on the old module while the
+# ownership seams live in exports.py and lifecycle.py.
+def render_spec_for_set(*args: object, **kwargs: object):
+    from app.exports import render_spec_for_set as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def render_persisted_set(*args: object, **kwargs: object):
+    from app.exports import render_persisted_set as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def render_persisted_set_versioned(*args: object, **kwargs: object):
+    from app.exports import render_persisted_set_versioned as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def create_export(*args: object, **kwargs: object):
+    from app.exports import create_export as workflow
+
+    return workflow(*args, **kwargs)
+
+
+export_comparison_set = create_export
+
+
+def duplicate_comparison_set(*args: object, **kwargs: object):
+    from app.lifecycle import duplicate_comparison_set as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def archive_comparison_set(*args: object, **kwargs: object):
+    from app.lifecycle import archive_comparison_set as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def unarchive_comparison_set(*args: object, **kwargs: object):
+    from app.lifecycle import unarchive_comparison_set as workflow
+
+    return workflow(*args, **kwargs)
+
+
+def remove_frame(*args: object, **kwargs: object):
+    from app.lifecycle import remove_frame as workflow
+
+    return workflow(*args, **kwargs)
 
 
 class ComparisonSetForm(FlaskForm):
@@ -109,11 +148,6 @@ class ComparisonSetForm(FlaskForm):
 class FrameForm(CaptureUploadForm):
     capture_id = IntegerField("Existing Capture", validators=[Optional()])
     submit = SubmitField("Add Frame")
-
-
-class DuplicateSetForm(FlaskForm):
-    name = StringField("Duplicate name", validators=[Length(max=200)])
-    submit = SubmitField("Duplicate Set")
 
 
 def _require_editor(actor: User) -> None:
@@ -195,7 +229,7 @@ def _locked_comparison_set(comparison_set: ComparisonSet) -> ComparisonSet | Non
     return db.session.scalar(
         select(ComparisonSet)
         .where(ComparisonSet.id == set_id)
-        .execution_options(autoflush=False)
+        .execution_options(autoflush=False, populate_existing=True)
         .with_for_update(of=ComparisonSet)
     )
 
@@ -563,193 +597,6 @@ def create_comparison_set(
     return comparison_set
 
 
-def _set_id(value: ComparisonSet | int | None) -> int:
-    if isinstance(value, ComparisonSet):
-        state = inspect(value)
-        value = state.identity[0] if state.identity else value.id
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise SetLifecycleError("Comparison Set is unavailable")
-    return value
-
-
-def duplicate_comparison_set(
-    *,
-    actor: User,
-    comparison_set: ComparisonSet | int | None = None,
-    set_id: int | None = None,
-    name: str | None = None,
-    expected_version: object | None = None,
-) -> ComparisonSet:
-    """Duplicate a Set snapshot after checking its expected persisted version."""
-    _require_editor(actor)
-    if comparison_set is not None and set_id is not None:
-        raise SetLifecycleError("choose one Comparison Set")
-    source_id = _set_id(comparison_set if comparison_set is not None else set_id)
-    duplicate_name = _name(name)
-    try:
-        source = db.session.scalar(
-            select(ComparisonSet)
-            .where(ComparisonSet.id == source_id)
-            .with_for_update(of=ComparisonSet)
-        )
-        if source is None or source.archived_at is not None:
-            raise SetLifecycleError("Comparison Set is unavailable")
-        expected = source.version if expected_version is None else _version(expected_version)
-        if source.version != expected:
-            raise StaleVersionError("Set has changed; reload before duplicating")
-        patient = _locked_patient(source.patient)
-        source.patient = patient
-        active_name = db.session.scalar(
-            select(ComparisonSet.id).where(
-                ComparisonSet.patient_id == source.patient_id,
-                ComparisonSet.archived_at.is_(None),
-                func.lower(ComparisonSet.name) == duplicate_name.lower(),
-            )
-        )
-        if active_name is not None:
-            raise SetLifecycleError("An active Set with this name already exists for the Patient")
-        frames = list(
-            db.session.scalars(
-                select(Frame)
-                .where(Frame.comparison_set_id == source.id)
-                .order_by(Frame.position, Frame.id)
-                .with_for_update(of=Frame)
-            )
-        )
-        duplicate = ComparisonSet(
-            patient_id=source.patient_id,
-            name=duplicate_name,
-            canvas_width_mm=source.canvas_width_mm,
-            canvas_height_mm=source.canvas_height_mm,
-            preset_key=source.preset_key,
-            frame_ratio=source.frame_ratio,
-            columns=source.columns,
-            show_patient_id=source.show_patient_id,
-            show_patient_name=source.show_patient_name,
-            show_birth_year=source.show_birth_year,
-            date_label_default=source.date_label_default,
-            version=1,
-            lock_holder_id=None,
-            lock_expires_at=None,
-            archived_at=None,
-            created_by_id=actor.id,
-            updated_by_id=actor.id,
-        )
-        db.session.add(duplicate)
-        db.session.flush()
-        for source_frame in frames:
-            db.session.add(
-                Frame(
-                    comparison_set_id=duplicate.id,
-                    capture_id=source_frame.capture_id,
-                    position=source_frame.position,
-                    visible=source_frame.visible,
-                    label=source_frame.label,
-                    date_visible_override=source_frame.date_visible_override,
-                    zoom=source_frame.zoom,
-                    pan_x=source_frame.pan_x,
-                    pan_y=source_frame.pan_y,
-                )
-            )
-        db.session.flush()
-        append_audit(
-            actor=actor,
-            action="comparison_set.duplicate",
-            entity_type="comparison_set",
-            entity_id=duplicate.id,
-            details={"source_id": source.id, "frame_count": len(frames)},
-        )
-        db.session.commit()
-        return duplicate
-    except Exception:
-        db.session.rollback()
-        raise
-
-
-def _locked_set(set_id: int) -> ComparisonSet:
-    locked = db.session.scalar(
-        select(ComparisonSet)
-        .where(ComparisonSet.id == set_id)
-        .with_for_update(of=ComparisonSet)
-    )
-    if locked is None:
-        raise SetLifecycleError("Comparison Set is unavailable")
-    patient = db.session.scalar(
-        select(Patient)
-        .where(Patient.id == locked.patient_id)
-        .with_for_update(of=Patient)
-        .execution_options(populate_existing=True)
-    )
-    if patient is None or patient.archived_at is not None:
-        raise SetLifecycleError("Patient is unavailable")
-    locked.patient = patient
-    return locked
-
-
-def archive_comparison_set(
-    *,
-    actor: User,
-    comparison_set: ComparisonSet | int | None = None,
-    set_id: int | None = None,
-) -> ComparisonSet:
-    """Archive a Set without deleting its Frames or Capture references."""
-    _require_editor(actor)
-    if comparison_set is not None and set_id is not None:
-        raise SetLifecycleError("choose one Comparison Set")
-    try:
-        locked = _locked_set(_set_id(comparison_set if comparison_set is not None else set_id))
-        if locked.archived_at is None:
-            locked.archived_at = _server_now()
-            locked.archived_by_id = actor.id
-            locked.lock_holder_id = None
-            locked.lock_expires_at = None
-            locked.updated_by_id = actor.id
-            locked.version += 1
-            append_audit(actor=actor, action="comparison_set.archive", entity_type="comparison_set", entity_id=locked.id)
-        db.session.commit()
-        return locked
-    except Exception:
-        db.session.rollback()
-        raise
-
-
-def unarchive_comparison_set(
-    *,
-    actor: User,
-    comparison_set: ComparisonSet | int | None = None,
-    set_id: int | None = None,
-) -> ComparisonSet:
-    """Restore an archived Set when its active name remains unique."""
-    _require_editor(actor)
-    if comparison_set is not None and set_id is not None:
-        raise SetLifecycleError("choose one Comparison Set")
-    try:
-        locked = _locked_set(_set_id(comparison_set if comparison_set is not None else set_id))
-        if locked.patient is None or locked.patient.archived_at is not None:
-            raise SetLifecycleError("Patient is unavailable")
-        if locked.archived_at is not None:
-            duplicate = db.session.scalar(
-                select(ComparisonSet.id).where(
-                    ComparisonSet.id != locked.id,
-                    ComparisonSet.patient_id == locked.patient_id,
-                    ComparisonSet.archived_at.is_(None),
-                    func.lower(ComparisonSet.name) == locked.name.lower(),
-                )
-            )
-            if duplicate is not None:
-                raise SetLifecycleError("An active Set with this name already exists for the Patient")
-            locked.archived_at = None
-            locked.archived_by_id = None
-            locked.updated_by_id = actor.id
-            locked.version += 1
-            append_audit(actor=actor, action="comparison_set.unarchive", entity_type="comparison_set", entity_id=locked.id)
-        db.session.commit()
-        return locked
-    except Exception:
-        db.session.rollback()
-        raise
-
-
 def list_comparison_sets(patient: Patient, *, include_archived: bool = False) -> list[ComparisonSet]:
     patient = _active_patient(patient)
     statement = select(ComparisonSet).where(ComparisonSet.patient_id == patient.id)
@@ -1012,62 +859,6 @@ def add_frame(
     return frame
 
 
-def remove_frame(
-    *,
-    actor: User,
-    comparison_set: ComparisonSet,
-    frame_id: int,
-    expected_version: object,
-) -> Frame:
-    """Remove one Frame only under the Set's active lease and version."""
-    _require_editor(actor)
-    try:
-        locked_set, expected = _write_guard(
-            actor=actor,
-            comparison_set=comparison_set,
-            expected_version=expected_version,
-        )
-        if isinstance(frame_id, bool) or not isinstance(frame_id, int) or frame_id <= 0:
-            raise ComparisonError("Frame is unavailable")
-        frame = db.session.scalar(
-            select(Frame)
-            .where(Frame.id == frame_id, Frame.comparison_set_id == locked_set.id)
-            .with_for_update(of=Frame)
-        )
-        if frame is None:
-            raise ComparisonError("Frame is unavailable")
-        remaining = list(
-            db.session.scalars(
-                select(Frame)
-                .where(Frame.comparison_set_id == locked_set.id, Frame.id != frame.id)
-                .order_by(Frame.position, Frame.id)
-                .with_for_update(of=Frame)
-            )
-        )
-        db.session.delete(frame)
-        db.session.flush()
-        offset = max((item.position for item in remaining), default=-1) + len(remaining) + 1
-        for index, item in enumerate(remaining):
-            item.position = offset + index
-        db.session.flush()
-        for index, item in enumerate(remaining):
-            item.position = index
-        locked_set.version = expected + 1
-        locked_set.updated_by_id = actor.id
-        append_audit(
-            actor=actor,
-            action="frame.remove",
-            entity_type="frame",
-            entity_id=frame.id,
-            details={"comparison_set_id": locked_set.id, "version": expected + 1},
-        )
-        db.session.commit()
-        return frame
-    except Exception:
-        db.session.rollback()
-        raise
-
-
 def reorder_frames(
     *,
     actor: User,
@@ -1326,312 +1117,6 @@ def update_frame(
         raise
 
 
-def _preview_limit(name: str, default: int) -> int:
-    value = current_app.config.get(name, default)
-    if isinstance(value, bool):
-        raise ComparisonError(f"{name} must be a positive integer")
-    try:
-        value = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ComparisonError(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise ComparisonError(f"{name} must be a positive integer")
-    return value
-
-
-def _materialize_render_spec(
-    comparison_set: ComparisonSet,
-    *,
-    expected_version: object | None = None,
-) -> tuple[CanvasRenderSpec, int]:
-    """Read one locked Set snapshot and its visible media into a render spec."""
-    active = _active_set(comparison_set)
-    set_id = active.id
-    expected = _version(expected_version) if expected_version is not None else None
-    max_frames = _preview_limit(
-        "COMPARISON_PREVIEW_MAX_VISIBLE_FRAMES",
-        DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES,
-    )
-    max_bytes = _preview_limit("COMPARISON_PREVIEW_MAX_BYTES", DEFAULT_PREVIEW_MAX_BYTES)
-    max_pixels = _preview_limit("COMPARISON_PREVIEW_MAX_PIXELS", DEFAULT_PREVIEW_MAX_PIXELS)
-    storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
-    session = db.session.session_factory()
-    try:
-        with session.begin():
-            locked = session.scalar(
-                select(ComparisonSet)
-                .where(ComparisonSet.id == set_id)
-                .with_for_update(of=ComparisonSet)
-            )
-            if locked is None or locked.archived_at is not None:
-                raise ComparisonError("Comparison Set is unavailable")
-            version = int(locked.version)
-            if expected is not None and version != expected:
-                raise StaleVersionError("Set has changed; reload before previewing")
-            patient = locked.patient
-            if patient is None or patient.archived_at is not None:
-                raise ComparisonError("Patient is unavailable")
-
-            # Hidden Frames never need media access.  Check both bounds before
-            # opening any image so a large Set cannot exhaust process memory.
-            visible_frames = list(
-                session.scalars(
-                    select(Frame)
-                    .where(
-                        Frame.comparison_set_id == locked.id,
-                        Frame.visible.is_(True),
-                    )
-                    .order_by(Frame.position, Frame.id)
-                )
-            )
-            if len(visible_frames) > max_frames:
-                raise PreviewLimitError("Preview contains too many visible Frames")
-            total_bytes = 0
-            total_pixels = 0
-            for frame in visible_frames:
-                try:
-                    total_bytes += int(frame.capture.byte_count)
-                    width = frame.capture.width
-                    height = frame.capture.height
-                    if (
-                        isinstance(width, bool)
-                        or not isinstance(width, int)
-                        or width <= 0
-                        or isinstance(height, bool)
-                        or not isinstance(height, int)
-                        or height <= 0
-                    ):
-                        raise ValueError
-                    total_pixels += width * height
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ComparisonError("Capture media metadata is invalid") from exc
-            if total_bytes > max_bytes:
-                raise PreviewLimitError("Preview media exceeds its byte limit")
-            if total_pixels > max_pixels:
-                raise PreviewLimitError("Preview decoded pixels exceed their limit")
-
-            frames: list[FrameRenderSpec] = []
-            for frame in visible_frames:
-                try:
-                    with storage.open_read(frame.capture.storage_key) as source:
-                        image_bytes = read_bounded(source, max_bytes=int(frame.capture.byte_count))
-                except (ImagePolicyError, OSError, StorageError) as exc:
-                    raise ComparisonError("Capture media is unavailable") from exc
-                show_date = (
-                    frame.date_visible_override
-                    if frame.date_visible_override is not None
-                    else locked.date_label_default
-                )
-                frames.append(
-                    FrameRenderSpec(
-                        id=frame.id,
-                        image=image_bytes,
-                        visible=True,
-                        label=frame.label or "",
-                        date_label=frame.capture.capture_date.isoformat() if show_date else None,
-                        zoom=frame.zoom,
-                        pan_x=frame.pan_x,
-                        pan_y=frame.pan_y,
-                    )
-                )
-
-            # The Set row lock blocks all editor mutations.  Recheck anyway so
-            # an unexpected writer cannot make a mixed snapshot look current.
-            current_version = session.scalar(
-                select(ComparisonSet.version).where(ComparisonSet.id == locked.id)
-            )
-            if current_version != version:
-                raise StaleVersionError("Set changed while preparing preview")
-            spec = CanvasRenderSpec(
-                width_mm=float(locked.canvas_width_mm),
-                height_mm=float(locked.canvas_height_mm),
-                frame_ratio=float(locked.frame_ratio),
-                columns=int(locked.columns),
-                frames=frames,
-                title=locked.name,
-                patient_id=patient.patient_id,
-                patient_name=patient.name,
-                birth_year=patient.birth_year,
-                show_patient_id=bool(locked.show_patient_id),
-                show_patient_name=bool(locked.show_patient_name),
-                show_birth_year=bool(locked.show_birth_year),
-                version=version,
-            )
-        return spec, version
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-def render_spec_for_set(comparison_set: ComparisonSet, *, expected_version: object | None = None) -> CanvasRenderSpec:
-    """Build render data from one persisted Set version without exposing media paths."""
-    spec, _ = _materialize_render_spec(comparison_set, expected_version=expected_version)
-    return spec
-
-
-def render_persisted_set(
-    comparison_set: ComparisonSet,
-    *,
-    expected_version: object | None = None,
-    dpi: float = DEFAULT_RENDER_DPI,
-) -> bytes:
-    return render_persisted_set_versioned(
-        comparison_set,
-        expected_version=expected_version,
-        dpi=dpi,
-    )[0]
-
-
-def _render_spec_bytes(
-    spec: CanvasRenderSpec,
-    output_format: str = "png",
-    *,
-    dpi: float = DEFAULT_RENDER_DPI,
-) -> bytes:
-    """Render and encode one immutable Set snapshot for preview or export."""
-    image = render_canvas(spec, dpi=dpi)
-    try:
-        return encode(
-            image,
-            output_format,
-            dpi=dpi,
-            physical_size_mm=(spec.width_mm, spec.height_mm),
-        )
-    finally:
-        image.close()
-
-
-def render_persisted_set_versioned(
-    comparison_set: ComparisonSet,
-    *,
-    expected_version: object | None = None,
-    dpi: float = DEFAULT_RENDER_DPI,
-) -> tuple[bytes, int]:
-    """Render a materialized snapshot and return its exact persisted version."""
-    spec, version = _materialize_render_spec(comparison_set, expected_version=expected_version)
-    return _render_spec_bytes(spec, "png", dpi=dpi), version
-
-
-def _export_format(value: object) -> str:
-    if not isinstance(value, str):
-        raise ComparisonError("Export format must be PNG or PDF")
-    normalized = value.strip().lower().lstrip(".")
-    if normalized not in {"png", "pdf"}:
-        raise ComparisonError("Export format must be PNG or PDF")
-    return normalized.upper()
-
-
-def _reconcile_export(storage_key: str) -> Export | None:
-    """Read committed export state in a new session after an unclear commit."""
-    db.session.rollback()
-    session = db.session.session_factory()
-    try:
-        exported = session.scalar(select(Export).where(Export.storage_key == storage_key))
-        if exported is not None:
-            session.expunge(exported)
-        return exported
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-def _settle_export_attempt(
-    managed: ManagedStorage,
-    stored: StoredDerivative | None,
-    committed: Export,
-) -> None:
-    if stored is None:
-        return
-    if committed.storage_key == stored.storage_key:
-        try:
-            managed.finalize(stored)
-        except StorageError:
-            # The row is durable; reconciliation can remove this marker later.
-            pass
-    else:
-        managed.discard(stored)
-
-
-def create_export(
-    *,
-    actor: User,
-    comparison_set: ComparisonSet,
-    output_format: object,
-    expected_version: object,
-    storage: ManagedStorage | None = None,
-    dpi: float = DEFAULT_RENDER_DPI,
-) -> Export:
-    """Render one requested Set version, persist its derivative, and audit it."""
-    _require_editor(actor)
-    format_name = _export_format(output_format)
-    expected = _version(expected_version)
-    spec, version = _materialize_render_spec(
-        comparison_set,
-        expected_version=expected,
-    )
-    payload = _render_spec_bytes(spec, format_name, dpi=dpi)
-    managed = storage or ManagedStorage(current_app.config["MEDIA_ROOT"])
-    stored: StoredDerivative | None = None
-    try:
-        stored = managed.store_derivative(payload, format_name)
-        exported = Export(
-            comparison_set_id=comparison_set.id,
-            format=format_name,
-            storage_key=stored.storage_key,
-            byte_count=len(payload),
-            sha256=hashlib.sha256(payload).hexdigest(),
-            rendered_version=version,
-            created_by_id=actor.id,
-        )
-        db.session.add(exported)
-        db.session.flush()
-        append_audit(
-            actor=actor,
-            action="export.create",
-            entity_type="export",
-            entity_id=exported.id,
-            details={
-                "format": format_name,
-                "byte_count": len(payload),
-                "sha256": exported.sha256,
-                "rendered_version": version,
-            },
-        )
-        db.session.commit()
-    except Exception as exc:
-        db.session.rollback()
-        if stored is None:
-            raise
-        try:
-            committed = _reconcile_export(stored.storage_key)
-        except Exception as reconciliation_exc:
-            managed.preserve(stored)
-            raise ExportReconciliationError(
-                "Export save status could not be confirmed; pending derivative was preserved for reconciliation"
-            ) from reconciliation_exc
-        if committed is not None:
-            _settle_export_attempt(managed, stored, committed)
-            return committed
-        managed.discard(stored)
-        raise
-
-    if stored is not None:
-        try:
-            managed.finalize(stored)
-        except StorageError:
-            # A committed export remains recoverable through reconciliation.
-            pass
-    return exported
-
-
-# Descriptive alias for callers that name the operation rather than the row.
-export_comparison_set = create_export
-
-
 def _route_patient(patient_pk: int) -> Patient:
     patient = db.session.get(Patient, patient_pk)
     if patient is None or patient.archived_at is not None:
@@ -1722,68 +1207,6 @@ def detail(set_pk: int, patient_pk: int | None = None):
         frame_form=FrameForm(),
         **_detail_flags(comparison_set),
     )
-
-
-def _lifecycle_set(set_pk: int, patient_pk: int | None = None) -> ComparisonSet:
-    comparison_set = db.session.get(ComparisonSet, set_pk)
-    if (
-        comparison_set is None
-        or comparison_set.patient is None
-        or comparison_set.patient.archived_at is not None
-        or (patient_pk is not None and comparison_set.patient_id != patient_pk)
-    ):
-        abort(404)
-    return comparison_set
-
-
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/duplicate")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/duplicate")
-@editor_required
-def duplicate_route(set_pk: int, patient_pk: int | None = None):
-    comparison_set = _route_set(set_pk, patient_pk)
-    form = DuplicateSetForm()
-    if not form.validate_on_submit():
-        return redirect(url_for("comparisons.detail", set_pk=set_pk)), 400
-    try:
-        duplicate = duplicate_comparison_set(
-            actor=current_user,
-            comparison_set=comparison_set,
-            name=form.name.data,
-            expected_version=request.form.get("version"),
-        )
-    except (SetLifecycleError, StaleVersionError, IntegrityError) as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("comparisons.detail", set_pk=set_pk)), 409
-    flash("Comparison Set duplicated.", "success")
-    return redirect(url_for("comparisons.detail", set_pk=duplicate.id))
-
-
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/archive")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/archive")
-@editor_required
-def archive_route(set_pk: int, patient_pk: int | None = None):
-    comparison_set = _lifecycle_set(set_pk, patient_pk)
-    try:
-        archive_comparison_set(actor=current_user, comparison_set=comparison_set)
-    except SetLifecycleError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id)), 400
-    flash("Comparison Set archived.", "success")
-    return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id))
-
-
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/unarchive")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/unarchive")
-@editor_required
-def unarchive_route(set_pk: int, patient_pk: int | None = None):
-    comparison_set = _lifecycle_set(set_pk, patient_pk)
-    try:
-        unarchive_comparison_set(actor=current_user, comparison_set=comparison_set)
-    except (SetLifecycleError, IntegrityError) as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id, archived=1)), 409
-    flash("Comparison Set restored.", "success")
-    return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id))
 
 
 def _detail_context(
@@ -1900,35 +1323,6 @@ def _request_payload() -> dict[str, object]:
         except (TypeError, ValueError, OverflowError):
             pass
     return payload
-
-
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/frames/<int:frame_id>/remove")
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/frames/<int:frame_id>/delete")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/frames/<int:frame_id>/remove")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/frames/<int:frame_id>/delete")
-@editor_required
-def remove_frame_route(set_pk: int, frame_id: int, patient_pk: int | None = None):
-    comparison_set = _route_set(set_pk, patient_pk)
-    try:
-        payload = _request_payload()
-        removed = remove_frame(
-            actor=current_user,
-            comparison_set=comparison_set,
-            frame_id=frame_id,
-            expected_version=payload.get("version", payload.get("expected_version")),
-        )
-    except (StaleVersionError, EditLeaseError) as exc:
-        return jsonify(error=str(exc)), 409
-    except ComparisonError as exc:
-        return jsonify(error=str(exc)), 400
-    version = db.session.scalar(
-        select(ComparisonSet.version).where(ComparisonSet.id == set_pk)
-    )
-    if request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
-        return jsonify(frame_id=removed.id, version=version)
-    response = redirect(url_for("comparisons.detail", set_pk=set_pk))
-    response.headers["X-Comparison-Set-Version"] = str(version)
-    return response
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/save")
@@ -2071,139 +1465,6 @@ def lease_release(set_pk: int, patient_pk: int | None = None):
     except ComparisonError as exc:
         return jsonify(error=str(exc)), 400
     return jsonify(released=True, version=expected)
-
-
-@comparisons_bp.get("/comparison-sets/<int:set_pk>/preview")
-@comparisons_bp.get("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/preview")
-@comparisons_bp.get("/api/comparison-sets/<int:set_pk>/preview")
-@login_required
-def preview(set_pk: int, patient_pk: int | None = None):
-    comparison_set = _route_set(set_pk, patient_pk)
-    raw_version = request.args.get("version")
-    try:
-        expected = _version(raw_version) if raw_version is not None else None
-        payload, version = render_persisted_set_versioned(
-            comparison_set,
-            expected_version=expected,
-            dpi=float(current_app.config.get("BOARD_RENDER_DPI", DEFAULT_RENDER_DPI)),
-        )
-    except StaleVersionError as exc:
-        return jsonify(error=str(exc)), 409
-    except PreviewLimitError as exc:
-        return jsonify(error=str(exc)), 413
-    except (ComparisonError, StorageError, ValueError) as exc:
-        return jsonify(error=str(exc)), 400
-    response = send_file(
-        io.BytesIO(payload),
-        mimetype="image/png",
-        download_name=f"comparison-set-{comparison_set.id}-v{version}.png",
-        max_age=0,
-        conditional=False,
-    )
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Comparison-Set-Version"] = str(version)
-    return response
-
-
-def _export_payload(exported: Export) -> bytes:
-    storage: ManagedStorage | None = None
-    try:
-        byte_count = exported.byte_count
-        digest = exported.sha256
-        if (
-            isinstance(byte_count, bool)
-            or not isinstance(byte_count, int)
-            or byte_count <= 0
-            or not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise StorageError("export metadata is invalid")
-        storage = ManagedStorage(current_app.config["MEDIA_ROOT"])
-        with storage.open_read(exported.storage_key) as handle:
-            payload = read_bounded(handle, max_bytes=byte_count)
-        if len(payload) != byte_count or hashlib.sha256(payload).hexdigest() != digest:
-            raise StorageError("export integrity check failed")
-        return payload
-    except (ImagePolicyError, OSError, StorageError, TypeError, ValueError, OverflowError):
-        if storage is not None:
-            try:
-                storage.quarantine(exported.storage_key)
-            except StorageError:
-                pass
-        abort(410)
-
-
-def _export_response(exported: Export):
-    # Exports inherit the same active Patient/Set visibility contract as the
-    # owning Set routes; archived owners are never downloadable.
-    if open_comparison_set(exported.comparison_set_id) is None:
-        abort(404)
-    payload = _export_payload(exported)
-    try:
-        format_name = exported.format
-        if not isinstance(format_name, str):
-            raise ValueError
-        suffix = format_name.lower()
-        if suffix not in {"png", "pdf"}:
-            raise ValueError
-    except (TypeError, ValueError):
-        abort(500)
-    mimetype = "image/png" if suffix == "png" else "application/pdf"
-    response = send_file(
-        io.BytesIO(payload),
-        mimetype=mimetype,
-        download_name=f"comparison-set-{exported.comparison_set_id}-v{exported.rendered_version}.{suffix}",
-        max_age=0,
-        conditional=False,
-    )
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Comparison-Set-Version"] = str(exported.rendered_version)
-    response.headers["X-Export-ID"] = str(exported.id)
-    response.headers["X-Export-SHA256"] = exported.sha256
-    return response
-
-
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/export")
-@comparisons_bp.post("/comparison-sets/<int:set_pk>/export/<output_format>")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/export")
-@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/export/<output_format>")
-@editor_required
-def export_route(
-    set_pk: int,
-    output_format: str | None = None,
-    patient_pk: int | None = None,
-):
-    comparison_set = _route_set(set_pk, patient_pk)
-    try:
-        payload = _request_payload()
-        exported = create_export(
-            actor=current_user,
-            comparison_set=comparison_set,
-            output_format=output_format or payload.get("format"),
-            expected_version=payload.get("version", payload.get("expected_version")),
-            dpi=float(current_app.config.get("BOARD_RENDER_DPI", DEFAULT_RENDER_DPI)),
-        )
-    except StaleVersionError as exc:
-        return jsonify(error=str(exc)), 409
-    except ExportReconciliationError as exc:
-        return jsonify(error=str(exc)), 503
-    except PreviewLimitError as exc:
-        return jsonify(error=str(exc)), 413
-    except (ComparisonError, StorageError, ValueError, IntegrityError) as exc:
-        return jsonify(error=str(exc)), 400
-    return _export_response(exported)
-
-
-@comparisons_bp.get("/exports/<int:export_pk>")
-@login_required
-def export_download(export_pk: int):
-    exported = db.session.get(Export, export_pk)
-    if exported is None:
-        abort(404)
-    return _export_response(exported)
 
 
 @comparisons_bp.post("/comparison-sets/<int:set_pk>/reorder")

@@ -16,6 +16,8 @@ from app.admin import admin_bp
 from app.auth import auth_bp, login_manager, register_cli
 from app.captures import captures_bp
 from app.comparisons import comparisons_bp
+from app.exports import exports_bp
+from app.lifecycle import lifecycle_bp
 from app.db import db, normalize_database_url
 from app.image_policy import configured_request_limit
 from app.models import Capture, Export
@@ -110,6 +112,8 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(patients_bp)
     app.register_blueprint(captures_bp)
     app.register_blueprint(comparisons_bp)
+    app.register_blueprint(exports_bp)
+    app.register_blueprint(lifecycle_bp)
     register_cli(app)
 
     @app.cli.command("reconcile-media")

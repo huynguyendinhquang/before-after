@@ -14,7 +14,7 @@
   {% endif %}
 
   {% if can_edit %}
-  <form id="canvas-editor" method="post" action="{{ url_for('comparisons.save', set_pk=comparison_set.id) }}" data-heartbeat-url="{{ url_for('comparisons.lease_heartbeat', set_pk=comparison_set.id) }}" data-preview-url="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}">
+  <form id="canvas-editor" method="post" action="{{ url_for('comparisons.save', set_pk=comparison_set.id) }}" data-heartbeat-url="{{ url_for('comparisons.lease_heartbeat', set_pk=comparison_set.id) }}" data-preview-url="{{ url_for('exports.preview', set_pk=comparison_set.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
     <label for="set-title">Set title</label>
@@ -77,7 +77,7 @@
     <span id="save-status" class="muted" role="status"></span>
   </form>
   {% for frame in comparison_set.frames %}
-    <form id="remove-frame-{{ frame.id }}" method="post" action="{{ url_for('comparisons.remove_frame_route', set_pk=comparison_set.id, frame_id=frame.id) }}" hidden>
+    <form id="remove-frame-{{ frame.id }}" method="post" action="{{ url_for('lifecycle.remove_frame_route', set_pk=comparison_set.id, frame_id=frame.id) }}" hidden>
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="version" value="{{ comparison_set.version }}">
     </form>
@@ -105,7 +105,7 @@
   {% endif %}
 
   <h2>Server preview</h2>
-  <img id="server-preview" src="{{ url_for('comparisons.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Persisted Comparison Set preview" style="max-width:100%;height:auto">
+  <img id="server-preview" src="{{ url_for('exports.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Persisted Comparison Set preview" style="max-width:100%;height:auto">
 
   <hr>
   <h2>Add Frame</h2>
@@ -158,7 +158,7 @@
   {% endif %}
   {% if current_user.is_editor %}
   <h2>Export</h2>
-  <form method="post" action="{{ url_for('comparisons.export_route', set_pk=comparison_set.id) }}">
+  <form method="post" action="{{ url_for('exports.export_route', set_pk=comparison_set.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="version" value="{{ comparison_set.version }}" data-version-token>
     <label for="export-format">Format</label>
