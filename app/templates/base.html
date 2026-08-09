@@ -33,6 +33,7 @@
         <span>{{ current_user.display_name }}</span>
         <a href="{{ url_for('patients.index') }}">Patients</a>
         {% if current_user.is_editor %}<a href="{{ url_for('patients.new') }}">New Patient</a>{% endif %}
+        {% if current_user.role == 'admin' %}<a href="{{ url_for('admin.users') }}">Admin</a>{% endif %}
         <form method="post" action="{{ url_for('auth.logout') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit">Log out</button>

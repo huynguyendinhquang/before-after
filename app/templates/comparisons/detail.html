@@ -49,7 +49,7 @@
         {% for frame in comparison_set.frames %}
           <tr data-frame-id="{{ frame.id }}">
             <td>{{ loop.index }}</td>
-            <td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="120"></td>
+            <td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id, set_id=comparison_set.id) }}" alt="Frame {{ loop.index }}" width="120"></td>
             <td>{{ frame.capture.capture_date }}</td>
             <td>{{ frame.capture.shot_type.name }}</td>
             <td><input class="frame-visible" type="checkbox"{% if frame.visible %} checked{% endif %} aria-label="Frame {{ loop.index }} visible"></td>
@@ -145,7 +145,7 @@
     <h2>Frames</h2>
     {% if comparison_set.frames %}
       <table><thead><tr><th>Position</th><th>Preview</th><th>Capture Date</th><th>Shot Type</th><th>Label</th><th>Visible</th></tr></thead><tbody>
-      {% for frame in comparison_set.frames %}<tr><td>{{ loop.index }}</td><td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id) }}" alt="Frame {{ loop.index }}" width="140"></td><td>{{ frame.capture.capture_date }}</td><td>{{ frame.capture.shot_type.name }}</td><td>{{ frame.label or '—' }}</td><td>{{ 'yes' if frame.visible else 'no' }}</td></tr>{% endfor %}
+      {% for frame in comparison_set.frames %}<tr><td>{{ loop.index }}</td><td><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id, set_id=comparison_set.id) }}" alt="Frame {{ loop.index }}" width="140"></td><td>{{ frame.capture.capture_date }}</td><td>{{ frame.capture.shot_type.name }}</td><td>{{ frame.label or '—' }}</td><td>{{ 'yes' if frame.visible else 'no' }}</td></tr>{% endfor %}
       </tbody></table>
     {% else %}<p class="muted">No Frames in this Set yet.</p>{% endif %}
   {% endif %}

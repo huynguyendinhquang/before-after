@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Admin — Audit{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Audit events</h1>
+  <p><a href="{{ url_for('admin.users') }}">Users</a> · <a href="{{ url_for('admin.shot_types') }}">Shot Types</a></p>
+  <table>
+    <thead><tr><th>Time</th><th>Action</th><th>Entity</th><th>ID</th><th>Safe details</th></tr></thead>
+    <tbody>
+    {% for row in rows %}
+      <tr><td>{{ row.created_at }}</td><td>{{ row.action }}</td><td>{{ row.entity_type }}</td><td>{{ row.entity_id }}</td><td>{{ row.details }}</td></tr>
+    {% else %}<tr><td colspan="5">No audit events.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

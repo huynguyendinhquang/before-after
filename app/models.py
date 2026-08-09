@@ -401,4 +401,8 @@ class AuditEvent(db.Model):
     details = db.Column(db.JSON, nullable=False, server_default="{}")
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=db.func.now())
 
+    __table_args__ = (
+        db.Index("ix_audit_events_created_id", "created_at", "id"),
+    )
+
     actor = db.relationship("User", foreign_keys=[actor_id], lazy="joined")

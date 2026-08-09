@@ -76,6 +76,10 @@ def editor_required(view):
     return roles_required("admin", "editor")(view)
 
 
+def admin_required(view):
+    return roles_required("admin")(view)
+
+
 @login_manager.user_loader
 def load_user(user_id: str) -> User | None:
     try:

@@ -10,6 +10,10 @@
     <dd>Confirmed by {{ patient.consent_confirmed_by.display_name }} at {{ patient.consent_confirmed_at }}</dd>
   </dl>
   {% if current_user.is_editor %}
+    <form method="post" action="{{ url_for('patients.archive_route', patient_pk=patient.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Archive Patient</button>
+    </form>
     <form method="post" action="{{ url_for('patients.confirm_consent', patient_pk=patient.id) }}">
       {{ consent_form.hidden_tag() }}
       {{ consent_form.consent_confirmed() }} {{ consent_form.consent_confirmed.label.text }}

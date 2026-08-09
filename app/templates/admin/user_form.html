@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Admin — {{ heading }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>{{ heading }}</h1>
+  <form method="post">
+    {{ form.hidden_tag() }}
+    <label>{{ form.username.label }} {{ form.username() }}</label>
+    {% for error in form.username.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label>{{ form.display_name.label }} {{ form.display_name() }}</label>
+    {% for error in form.display_name.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label>{{ form.password.label }} {{ form.password() }}</label>
+    <p class="muted">Leave blank when editing to keep the current password.</p>
+    <label>{{ form.role.label }} {{ form.role() }}</label>
+    {% for error in form.role.errors %}<div class="error">{{ error }}</div>{% endfor %}
+    <label>{{ form.active() }} {{ form.active.label.text }}</label>
+    {{ form.submit() }}
+  </form>
+  <p><a href="{{ url_for('admin.users') }}">Back to users</a></p>
+</section>
+{% endblock %}

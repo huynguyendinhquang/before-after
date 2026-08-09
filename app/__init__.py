@@ -12,6 +12,7 @@ from flask_login import current_user
 from flask_wtf.csrf import CSRFError, CSRFProtect
 from sqlalchemy import select
 
+from app.admin import admin_bp
 from app.auth import auth_bp, login_manager, register_cli
 from app.captures import captures_bp
 from app.comparisons import comparisons_bp
@@ -105,6 +106,7 @@ def create_app(config: dict | None = None) -> Flask:
     login_manager.init_app(app)
     csrf.init_app(app)
     app.register_blueprint(auth_bp)
+    app.register_blueprint(admin_bp)
     app.register_blueprint(patients_bp)
     app.register_blueprint(captures_bp)
     app.register_blueprint(comparisons_bp)
@@ -144,7 +146,7 @@ def create_app(config: dict | None = None) -> Flask:
     @app.after_request
     def no_store_authenticated_patient_pages(response):
         if current_user.is_authenticated and request.path.startswith(
-            ("/patients", "/captures", "/shot-types", "/comparison-sets", "/exports")
+            ("/admin", "/patients", "/captures", "/shot-types", "/comparison-sets", "/exports")
         ):
             response.headers["Cache-Control"] = "no-store"
         return response

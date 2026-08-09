@@ -7,4 +7,5 @@ if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
 fi
 
 export DATABASE_URL="$TEST_DATABASE_URL"
-python -m pytest tests/test_slice1.py tests/test_slice2.py tests/test_slice3.py tests/test_slice4.py tests/test_slice5.py "$@"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+"$PYTHON_BIN" -m pytest tests/test_slice1.py tests/test_slice2.py tests/test_slice3.py tests/test_slice4.py tests/test_slice5.py tests/test_slice6.py "$@"

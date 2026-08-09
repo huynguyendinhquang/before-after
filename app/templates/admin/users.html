@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Admin — Users{% endblock %}
+{% block content %}
+<section class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+    <h1>User management</h1>
+    <a class="button" href="{{ url_for('admin.new_user') }}">New user</a>
+  </div>
+  <p><a href="{{ url_for('admin.shot_types') }}">Shot Types</a> · <a href="{{ url_for('admin.audit') }}">Audit</a></p>
+  <table>
+    <thead><tr><th>Username</th><th>Role</th><th>Active</th><th>Actions</th></tr></thead>
+    <tbody>
+    {% for user in users %}
+      <tr>
+        <td>{{ user.username }}</td>
+        <td>{{ user.role }}</td>
+        <td>{{ 'yes' if user.active else 'no' }}</td>
+        <td>
+          <a href="{{ url_for('admin.edit_user', user_pk=user.id) }}">Edit</a>
+          {% if user.active %}
+          <form method="post" action="{{ url_for('admin.disable_user_route', user_pk=user.id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">Disable</button>
+          </form>
+          {% else %}
+          <form method="post" action="{{ url_for('admin.enable_user_route', user_pk=user.id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">Enable</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

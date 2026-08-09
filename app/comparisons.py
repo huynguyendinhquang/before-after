@@ -81,6 +81,10 @@ class ExportReconciliationError(ComparisonError):
     """Raised when the database outcome of an export cannot be confirmed."""
 
 
+class SetLifecycleError(ComparisonError):
+    """Raised when a Set archive or duplicate cannot be applied."""
+
+
 EDIT_LEASE_SECONDS = 5 * 60
 DEFAULT_RENDER_DPI = 150
 DEFAULT_PREVIEW_MAX_VISIBLE_FRAMES = 100
@@ -105,6 +109,11 @@ class ComparisonSetForm(FlaskForm):
 class FrameForm(CaptureUploadForm):
     capture_id = IntegerField("Existing Capture", validators=[Optional()])
     submit = SubmitField("Add Frame")
+
+
+class DuplicateSetForm(FlaskForm):
+    name = StringField("Duplicate name", validators=[Length(max=200)])
+    submit = SubmitField("Duplicate Set")
 
 
 def _require_editor(actor: User) -> None:
@@ -540,18 +549,186 @@ def create_comparison_set(
     return comparison_set
 
 
-def list_comparison_sets(patient: Patient) -> list[ComparisonSet]:
-    patient = _active_patient(patient)
-    return list(
-        db.session.scalars(
+def _set_id(value: ComparisonSet | int | None) -> int:
+    if isinstance(value, ComparisonSet):
+        state = inspect(value)
+        value = state.identity[0] if state.identity else value.id
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SetLifecycleError("Comparison Set is unavailable")
+    return value
+
+
+def duplicate_comparison_set(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet | int | None = None,
+    set_id: int | None = None,
+    name: str | None = None,
+) -> ComparisonSet:
+    """Duplicate a Set in one transaction while retaining Capture references."""
+    _require_editor(actor)
+    if comparison_set is not None and set_id is not None:
+        raise SetLifecycleError("choose one Comparison Set")
+    source_id = _set_id(comparison_set if comparison_set is not None else set_id)
+    duplicate_name = _name(name)
+    try:
+        source = db.session.scalar(
             select(ComparisonSet)
-            .where(
-                ComparisonSet.patient_id == patient.id,
-                ComparisonSet.archived_at.is_(None),
-            )
-            .order_by(ComparisonSet.name, ComparisonSet.id)
+            .where(ComparisonSet.id == source_id)
+            .with_for_update(of=ComparisonSet)
         )
+        if source is None or source.archived_at is not None:
+            raise SetLifecycleError("Comparison Set is unavailable")
+        if source.patient is None or source.patient.archived_at is not None:
+            raise SetLifecycleError("Patient is unavailable")
+        active_name = db.session.scalar(
+            select(ComparisonSet.id).where(
+                ComparisonSet.patient_id == source.patient_id,
+                ComparisonSet.archived_at.is_(None),
+                func.lower(ComparisonSet.name) == duplicate_name.lower(),
+            )
+        )
+        if active_name is not None:
+            raise SetLifecycleError("An active Set with this name already exists for the Patient")
+        frames = list(
+            db.session.scalars(
+                select(Frame)
+                .where(Frame.comparison_set_id == source.id)
+                .order_by(Frame.position, Frame.id)
+                .with_for_update(of=Frame)
+            )
+        )
+        duplicate = ComparisonSet(
+            patient_id=source.patient_id,
+            name=duplicate_name,
+            canvas_width_mm=source.canvas_width_mm,
+            canvas_height_mm=source.canvas_height_mm,
+            preset_key=source.preset_key,
+            frame_ratio=source.frame_ratio,
+            columns=source.columns,
+            show_patient_id=source.show_patient_id,
+            show_patient_name=source.show_patient_name,
+            show_birth_year=source.show_birth_year,
+            date_label_default=source.date_label_default,
+            version=1,
+            lock_holder_id=None,
+            lock_expires_at=None,
+            archived_at=None,
+            created_by_id=actor.id,
+            updated_by_id=actor.id,
+        )
+        db.session.add(duplicate)
+        db.session.flush()
+        for source_frame in frames:
+            db.session.add(
+                Frame(
+                    comparison_set_id=duplicate.id,
+                    capture_id=source_frame.capture_id,
+                    position=source_frame.position,
+                    visible=source_frame.visible,
+                    label=source_frame.label,
+                    date_visible_override=source_frame.date_visible_override,
+                    zoom=source_frame.zoom,
+                    pan_x=source_frame.pan_x,
+                    pan_y=source_frame.pan_y,
+                )
+            )
+        db.session.flush()
+        append_audit(
+            actor=actor,
+            action="comparison_set.duplicate",
+            entity_type="comparison_set",
+            entity_id=duplicate.id,
+            details={"source_id": source.id, "frame_count": len(frames)},
+        )
+        db.session.commit()
+        return duplicate
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def _locked_set(set_id: int) -> ComparisonSet:
+    locked = db.session.scalar(
+        select(ComparisonSet)
+        .where(ComparisonSet.id == set_id)
+        .with_for_update(of=ComparisonSet)
     )
+    if locked is None:
+        raise SetLifecycleError("Comparison Set is unavailable")
+    return locked
+
+
+def archive_comparison_set(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet | int | None = None,
+    set_id: int | None = None,
+) -> ComparisonSet:
+    """Archive a Set without deleting its Frames or Capture references."""
+    _require_editor(actor)
+    if comparison_set is not None and set_id is not None:
+        raise SetLifecycleError("choose one Comparison Set")
+    try:
+        locked = _locked_set(_set_id(comparison_set if comparison_set is not None else set_id))
+        if locked.archived_at is None:
+            locked.archived_at = _server_now()
+            locked.archived_by_id = actor.id
+            locked.lock_holder_id = None
+            locked.lock_expires_at = None
+            locked.updated_by_id = actor.id
+            locked.version += 1
+            append_audit(actor=actor, action="comparison_set.archive", entity_type="comparison_set", entity_id=locked.id)
+        db.session.commit()
+        return locked
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def unarchive_comparison_set(
+    *,
+    actor: User,
+    comparison_set: ComparisonSet | int | None = None,
+    set_id: int | None = None,
+) -> ComparisonSet:
+    """Restore an archived Set when its active name remains unique."""
+    _require_editor(actor)
+    if comparison_set is not None and set_id is not None:
+        raise SetLifecycleError("choose one Comparison Set")
+    try:
+        locked = _locked_set(_set_id(comparison_set if comparison_set is not None else set_id))
+        if locked.patient is None or locked.patient.archived_at is not None:
+            raise SetLifecycleError("Patient is unavailable")
+        if locked.archived_at is not None:
+            duplicate = db.session.scalar(
+                select(ComparisonSet.id).where(
+                    ComparisonSet.id != locked.id,
+                    ComparisonSet.patient_id == locked.patient_id,
+                    ComparisonSet.archived_at.is_(None),
+                    func.lower(ComparisonSet.name) == locked.name.lower(),
+                )
+            )
+            if duplicate is not None:
+                raise SetLifecycleError("An active Set with this name already exists for the Patient")
+            locked.archived_at = None
+            locked.archived_by_id = None
+            locked.updated_by_id = actor.id
+            locked.version += 1
+            append_audit(actor=actor, action="comparison_set.unarchive", entity_type="comparison_set", entity_id=locked.id)
+        db.session.commit()
+        return locked
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def list_comparison_sets(patient: Patient, *, include_archived: bool = False) -> list[ComparisonSet]:
+    patient = _active_patient(patient)
+    statement = select(ComparisonSet).where(ComparisonSet.patient_id == patient.id)
+    if not include_archived:
+        statement = statement.where(ComparisonSet.archived_at.is_(None))
+    return list(db.session.scalars(statement.order_by(ComparisonSet.name, ComparisonSet.id)))
 
 
 def open_comparison_set(set_id: int, patient: Patient | None = None) -> ComparisonSet | None:
@@ -1404,10 +1581,12 @@ def _detail_flags(comparison_set: ComparisonSet) -> dict[str, bool]:
 @login_required
 def index(patient_pk: int):
     patient = _route_patient(patient_pk)
+    include_archived = current_user.is_editor and request.args.get("archived") == "1"
     return render_template(
         "comparisons/index.html",
         patient=patient,
-        comparison_sets=list_comparison_sets(patient),
+        comparison_sets=list_comparison_sets(patient, include_archived=include_archived),
+        include_archived=include_archived,
     )
 
 
@@ -1463,6 +1642,67 @@ def detail(set_pk: int, patient_pk: int | None = None):
         frame_form=FrameForm(),
         **_detail_flags(comparison_set),
     )
+
+
+def _lifecycle_set(set_pk: int, patient_pk: int | None = None) -> ComparisonSet:
+    comparison_set = db.session.get(ComparisonSet, set_pk)
+    if (
+        comparison_set is None
+        or comparison_set.patient is None
+        or comparison_set.patient.archived_at is not None
+        or (patient_pk is not None and comparison_set.patient_id != patient_pk)
+    ):
+        abort(404)
+    return comparison_set
+
+
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/duplicate")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/duplicate")
+@editor_required
+def duplicate_route(set_pk: int, patient_pk: int | None = None):
+    comparison_set = _route_set(set_pk, patient_pk)
+    form = DuplicateSetForm()
+    if not form.validate_on_submit():
+        return redirect(url_for("comparisons.detail", set_pk=set_pk)), 400
+    try:
+        duplicate = duplicate_comparison_set(
+            actor=current_user,
+            comparison_set=comparison_set,
+            name=form.name.data,
+        )
+    except (SetLifecycleError, IntegrityError) as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("comparisons.detail", set_pk=set_pk)), 409
+    flash("Comparison Set duplicated.", "success")
+    return redirect(url_for("comparisons.detail", set_pk=duplicate.id))
+
+
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/archive")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/archive")
+@editor_required
+def archive_route(set_pk: int, patient_pk: int | None = None):
+    comparison_set = _lifecycle_set(set_pk, patient_pk)
+    try:
+        archive_comparison_set(actor=current_user, comparison_set=comparison_set)
+    except SetLifecycleError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id)), 400
+    flash("Comparison Set archived.", "success")
+    return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id))
+
+
+@comparisons_bp.post("/comparison-sets/<int:set_pk>/unarchive")
+@comparisons_bp.post("/patients/<int:patient_pk>/comparison-sets/<int:set_pk>/unarchive")
+@editor_required
+def unarchive_route(set_pk: int, patient_pk: int | None = None):
+    comparison_set = _lifecycle_set(set_pk, patient_pk)
+    try:
+        unarchive_comparison_set(actor=current_user, comparison_set=comparison_set)
+    except (SetLifecycleError, IntegrityError) as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id, archived=1)), 409
+    flash("Comparison Set restored.", "success")
+    return redirect(url_for("comparisons.index", patient_pk=comparison_set.patient_id))
 
 
 def _detail_context(

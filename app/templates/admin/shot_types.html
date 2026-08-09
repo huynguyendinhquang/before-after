@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Admin — Shot Types{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Shot Types</h1>
+  <p><a href="{{ url_for('admin.users') }}">Users</a> · <a href="{{ url_for('admin.audit') }}">Audit</a></p>
+  <table>
+    <thead><tr><th>Name</th><th>State</th><th>Action</th></tr></thead>
+    <tbody>
+    {% for shot_type in shot_types %}
+      <tr>
+        <td>{{ shot_type.name }}</td><td>{{ shot_type.state }}</td><td>
+        {% if shot_type.state == 'proposal' %}
+          <form method="post" action="{{ url_for('admin.promote_shot_type_route', shot_type_pk=shot_type.id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">Promote</button>
+          </form>
+          {% if canonical_shot_types %}
+          <form method="post" action="{{ url_for('admin.merge_shot_type_route', shot_type_pk=shot_type.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label>Merge into
+              <select name="target_id">
+                {% for canonical in canonical_shot_types if canonical.id != shot_type.id %}<option value="{{ canonical.id }}">{{ canonical.name }}</option>{% endfor %}
+              </select>
+            </label>
+            <button type="submit">Merge</button>
+          </form>
+          {% endif %}
+        {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import unicodedata
 
 from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, send_file, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
-from sqlalchemy import func, inspect, select
+from sqlalchemy import func, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from wtforms import BooleanField, FileField, StringField, SubmitField
 from wtforms.validators import DataRequired, Length, ValidationError
@@ -18,7 +18,7 @@ from app.audit import append_audit
 from app.auth import editor_required
 from app.db import db
 from app.image_policy import FORMAT_EXTENSIONS, mimetype_for_format, read_bounded
-from app.models import Capture, Patient, ShotType, User
+from app.models import Capture, ComparisonSet, Frame, Patient, ShotType, User
 from app.storage import ImageInspection, ManagedStorage, StorageError, StoredMedia
 
 
@@ -58,6 +58,18 @@ class ConsentRequired(CaptureError):
 
 class CaptureReconciliationError(CaptureError):
     """Raised when a failed commit cannot be verified safely."""
+
+
+class CaptureReferencedError(CaptureError):
+    """Raised when a Capture is still referenced by a Frame."""
+
+
+class CaptureDeleteReconciliationError(CaptureError):
+    """Raised when Capture deletion outcome or media restoration is unknown."""
+
+
+class ShotTypeError(ValueError):
+    """Raised when an Admin Shot Type workflow cannot change state."""
 
 
 @dataclass
@@ -415,6 +427,304 @@ def create_capture(
     return pending.capture
 
 
+def _database_now() -> datetime:
+    value = db.session.scalar(select(func.clock_timestamp()))
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _capture_id(value: Capture | int | None) -> int:
+    if isinstance(value, Capture):
+        state = inspect(value)
+        value = state.identity[0] if state.identity else value.id
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CaptureError("Capture is unavailable")
+    return value
+
+
+def _require_admin(actor: User) -> None:
+    if actor is None or not actor.active or actor.role != "admin":
+        raise PermissionError("only an Admin can manage Shot Types")
+
+
+def _lock_current_admin(actor: User) -> None:
+    current = db.session.scalar(
+        select(User.id)
+        .where(User.id == actor.id, User.active.is_(True), User.role == "admin")
+        .with_for_update(of=User)
+    )
+    if current is None:
+        raise PermissionError("only an Admin can manage Shot Types")
+
+
+def _shot_type_id(value: ShotType | int | None, field: str) -> int:
+    if isinstance(value, ShotType):
+        state = inspect(value)
+        value = state.identity[0] if state.identity else value.id
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ShotTypeError(f"{field} is unavailable")
+    return value
+
+
+def promote_shot_type(
+    *,
+    actor: User,
+    shot_type: ShotType | int | None = None,
+    shot_type_id: int | None = None,
+) -> ShotType:
+    """Promote one Editor proposal into a canonical Shot Type atomically."""
+    _require_admin(actor)
+    if shot_type is not None and shot_type_id is not None:
+        raise ShotTypeError("choose one Shot Type")
+    target_id = _shot_type_id(shot_type if shot_type is not None else shot_type_id, "Shot Type")
+    try:
+        _lock_current_admin(actor)
+        promoted = db.session.scalar(
+            select(ShotType)
+            .where(ShotType.id == target_id)
+            .with_for_update(of=ShotType)
+        )
+        if promoted is None:
+            raise ShotTypeError("Shot Type is unavailable")
+        if promoted.state != "proposal" or promoted.canonical_target_id is not None:
+            raise ShotTypeError("only a Proposal can be promoted")
+        promoted.state = "canonical"
+        append_audit(
+            actor=actor,
+            action="shot_type.promote",
+            entity_type="shot_type",
+            entity_id=promoted.id,
+        )
+        db.session.commit()
+        return promoted
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def merge_shot_type(
+    *,
+    actor: User,
+    source: ShotType | int | None = None,
+    target: ShotType | int | None = None,
+    source_id: int | None = None,
+    target_id: int | None = None,
+) -> ShotType:
+    """Merge a Proposal into a canonical Shot Type and repoint Captures."""
+    _require_admin(actor)
+    if source is not None and source_id is not None:
+        raise ShotTypeError("choose one source Shot Type")
+    if target is not None and target_id is not None:
+        raise ShotTypeError("choose one target Shot Type")
+    source_pk = _shot_type_id(source if source is not None else source_id, "source Shot Type")
+    target_pk = _shot_type_id(target if target is not None else target_id, "target Shot Type")
+    if source_pk == target_pk:
+        raise ShotTypeError("a Shot Type cannot merge into itself")
+    try:
+        _lock_current_admin(actor)
+        locked = {
+            item.id: item
+            for item in db.session.scalars(
+                select(ShotType)
+                .where(ShotType.id.in_([source_pk, target_pk]))
+                .order_by(ShotType.id)
+                .with_for_update(of=ShotType)
+            )
+        }
+        source_row = locked.get(source_pk)
+        target_row = locked.get(target_pk)
+        if source_row is None or target_row is None:
+            raise ShotTypeError("Shot Type is unavailable")
+        if source_row.state != "proposal" or source_row.canonical_target_id is not None:
+            raise ShotTypeError("source Shot Type must be an unmerged Proposal")
+        if target_row.state != "canonical" or target_row.canonical_target_id is not None:
+            raise ShotTypeError("target Shot Type must be canonical")
+        capture_ids = list(
+            db.session.scalars(
+                select(Capture.id)
+                .where(Capture.shot_type_id == source_row.id)
+                .with_for_update(of=Capture)
+            )
+        )
+        if capture_ids:
+            db.session.execute(
+                update(Capture)
+                .where(Capture.shot_type_id == source_row.id)
+                .values(shot_type_id=target_row.id, updated_by_id=actor.id)
+            )
+        source_row.state = "merged"
+        source_row.canonical_target_id = target_row.id
+        append_audit(
+            actor=actor,
+            action="shot_type.merge",
+            entity_type="shot_type",
+            entity_id=source_row.id,
+            details={"target_id": target_row.id, "capture_count": len(capture_ids)},
+        )
+        db.session.commit()
+        return source_row
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def _locked_capture(capture: Capture | int | None = None, capture_id: int | None = None) -> Capture:
+    if capture is not None and capture_id is not None:
+        raise CaptureError("choose one Capture")
+    candidate = _capture_id(capture if capture is not None else capture_id)
+    locked = db.session.scalar(
+        select(Capture)
+        .where(Capture.id == candidate)
+        .with_for_update(of=Capture)
+    )
+    if locked is None:
+        raise CaptureError("Capture is unavailable")
+    return locked
+
+
+def archive_capture(
+    *,
+    actor: User,
+    capture: Capture | int | None = None,
+    capture_id: int | None = None,
+) -> Capture:
+    """Hide a Capture while retaining all existing Frame references."""
+    if not actor.is_editor:
+        raise PermissionError("only an Editor or Admin can archive Captures")
+    try:
+        locked = _locked_capture(capture, capture_id)
+        if locked.archived_at is None:
+            locked.archived_at = _database_now()
+            locked.archived_by_id = actor.id
+            locked.updated_by_id = actor.id
+            append_audit(actor=actor, action="capture.archive", entity_type="capture", entity_id=locked.id)
+        db.session.commit()
+        return locked
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def unarchive_capture(
+    *,
+    actor: User,
+    capture: Capture | int | None = None,
+    capture_id: int | None = None,
+) -> Capture:
+    """Restore a Capture to normal Library selection."""
+    if not actor.is_editor:
+        raise PermissionError("only an Editor or Admin can unarchive Captures")
+    try:
+        locked = _locked_capture(capture, capture_id)
+        if locked.patient is None or locked.patient.archived_at is not None:
+            raise CaptureError("Patient is unavailable")
+        if locked.archived_at is not None:
+            locked.archived_at = None
+            locked.archived_by_id = None
+            locked.updated_by_id = actor.id
+            append_audit(actor=actor, action="capture.unarchive", entity_type="capture", entity_id=locked.id)
+        db.session.commit()
+        return locked
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def _capture_exists(capture_id: int) -> bool:
+    session = db.session.session_factory()
+    try:
+        return session.scalar(select(Capture.id).where(Capture.id == capture_id)) is not None
+    finally:
+        session.close()
+
+
+def delete_capture(
+    *,
+    actor: User,
+    capture: Capture | int | None = None,
+    capture_id: int | None = None,
+    storage: ManagedStorage | None = None,
+) -> Capture:
+    """Delete an unreferenced Capture after quarantining its media."""
+    if not actor.is_editor:
+        raise PermissionError("only an Editor or Admin can delete Captures")
+    managed = storage or _storage()
+    quarantined: list[tuple[str, str]] = []
+    locked: Capture | None = None
+    try:
+        with managed.reconciliation_lock():
+            locked = _locked_capture(capture, capture_id)
+            referenced = db.session.scalar(
+                select(Frame.id).where(Frame.capture_id == locked.id).limit(1)
+            )
+            if referenced is not None:
+                raise CaptureReferencedError("Capture is still referenced by a Comparison Set")
+            media_keys = [locked.storage_key]
+            try:
+                media_keys.append(ManagedStorage.preview_key(locked.storage_key))
+            except StorageError:
+                pass
+            for media_key in media_keys:
+                quarantined_key = managed.quarantine(media_key)
+                if quarantined_key is not None:
+                    quarantined.append((quarantined_key, media_key))
+            capture_id_value = locked.id
+            db.session.delete(locked)
+            db.session.flush()
+            append_audit(
+                actor=actor,
+                action="capture.delete",
+                entity_type="capture",
+                entity_id=capture_id_value,
+            )
+            try:
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                try:
+                    still_exists = _capture_exists(capture_id_value)
+                except Exception as reconcile_exc:
+                    raise CaptureDeleteReconciliationError(
+                        "Capture deletion outcome could not be confirmed; quarantined media was preserved"
+                    ) from reconcile_exc
+                if still_exists:
+                    try:
+                        for quarantined_key, media_key in reversed(quarantined):
+                            managed.restore(quarantined_key, media_key)
+                    except Exception as restore_exc:
+                        raise CaptureDeleteReconciliationError(
+                            "Capture deletion failed and media restoration could not be confirmed"
+                        ) from restore_exc
+                    quarantined.clear()
+                    raise
+                for quarantined_key, _media_key in quarantined:
+                    try:
+                        managed.cleanup(quarantined_key)
+                    except StorageError:
+                        pass
+                return locked
+            for quarantined_key, _media_key in quarantined:
+                try:
+                    managed.cleanup(quarantined_key)
+                except StorageError:
+                    pass
+            return locked
+    except CaptureDeleteReconciliationError:
+        raise
+    except Exception:
+        db.session.rollback()
+        if quarantined:
+            try:
+                for quarantined_key, media_key in reversed(quarantined):
+                    managed.restore(quarantined_key, media_key)
+            except Exception as restore_exc:
+                raise CaptureDeleteReconciliationError(
+                    "Capture deletion failed and media restoration could not be confirmed"
+                ) from restore_exc
+        raise
+
+
 def search_shot_types(query: str = "", limit: int = 20) -> list[ShotType]:
     value = query.strip()
     statement = select(ShotType).where(ShotType.state != "merged")
@@ -427,14 +737,11 @@ def search_shot_types(query: str = "", limit: int = 20) -> list[ShotType]:
     )
 
 
-def list_captures(patient: Patient) -> list[Capture]:
-    return list(
-        db.session.scalars(
-            select(Capture)
-            .where(Capture.patient_id == patient.id, Capture.archived_at.is_(None))
-            .order_by(Capture.capture_date, Capture.id)
-        )
-    )
+def list_captures(patient: Patient, *, include_archived: bool = False) -> list[Capture]:
+    statement = select(Capture).where(Capture.patient_id == patient.id)
+    if not include_archived:
+        statement = statement.where(Capture.archived_at.is_(None))
+    return list(db.session.scalars(statement.order_by(Capture.capture_date, Capture.id)))
 
 
 def _active_patient(patient_pk: int) -> Patient:
@@ -472,10 +779,12 @@ def shot_types():
 @login_required
 def library(patient_pk: int):
     patient = _active_patient(patient_pk)
+    include_archived = current_user.is_editor and request.args.get("archived") == "1"
     return render_template(
         "captures/library.html",
         patient=patient,
-        captures=list_captures(patient),
+        captures=list_captures(patient, include_archived=include_archived),
+        include_archived=include_archived,
     )
 
 
@@ -551,10 +860,41 @@ def inspect_upload(patient_pk: int):
     )
 
 
+def _media_capture(capture_pk: int) -> Capture:
+    capture = db.session.get(Capture, capture_pk)
+    if capture is None:
+        abort(404)
+    if capture.archived_at is None and capture.patient is not None and capture.patient.archived_at is None:
+        return capture
+    if (
+        request.args.get("archived") == "1"
+        and current_user.is_editor
+        and capture.patient is not None
+        and capture.patient.archived_at is None
+    ):
+        return capture
+    set_id = request.args.get("set_id", type=int)
+    if set_id is None:
+        abort(404)
+    referenced = db.session.scalar(
+        select(Frame.id)
+        .join(ComparisonSet, ComparisonSet.id == Frame.comparison_set_id)
+        .where(
+            Frame.capture_id == capture.id,
+            ComparisonSet.id == set_id,
+            ComparisonSet.archived_at.is_(None),
+            ComparisonSet.patient_id == capture.patient_id,
+        )
+    )
+    if referenced is None or capture.patient is None or capture.patient.archived_at is not None:
+        abort(404)
+    return capture
+
+
 @captures_bp.get("/captures/<int:capture_pk>/preview")
 @login_required
 def preview(capture_pk: int):
-    capture = _active_capture(capture_pk)
+    capture = _media_capture(capture_pk)
     try:
         handle = _storage().open_read(ManagedStorage.preview_key(capture.storage_key))
     except StorageError:
@@ -574,7 +914,7 @@ def preview(capture_pk: int):
 @captures_bp.get("/captures/<int:capture_pk>/original")
 @login_required
 def original(capture_pk: int):
-    capture = _active_capture(capture_pk)
+    capture = _media_capture(capture_pk)
     try:
         handle = _storage().open_read(capture.storage_key)
     except StorageError:
@@ -589,3 +929,68 @@ def original(capture_pk: int):
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
+
+
+def _lifecycle_capture(capture_pk: int) -> Capture:
+    capture = db.session.get(Capture, capture_pk)
+    if capture is None or capture.patient is None or capture.patient.archived_at is not None:
+        abort(404)
+    return capture
+
+
+def _lifecycle_redirect(capture: Capture):
+    return redirect(url_for("captures.library", patient_pk=capture.patient_id))
+
+
+@captures_bp.post("/captures/<int:capture_pk>/archive")
+@captures_bp.post("/patients/<int:patient_pk>/captures/<int:capture_pk>/archive")
+@editor_required
+def archive_route(capture_pk: int, patient_pk: int | None = None):
+    capture = _lifecycle_capture(capture_pk)
+    if patient_pk is not None and capture.patient_id != patient_pk:
+        abort(404)
+    try:
+        archive_capture(actor=current_user, capture=capture)
+    except CaptureError as exc:
+        flash(str(exc), "error")
+        return _lifecycle_redirect(capture), 400
+    flash("Capture archived.", "success")
+    return _lifecycle_redirect(capture)
+
+
+@captures_bp.post("/captures/<int:capture_pk>/unarchive")
+@captures_bp.post("/patients/<int:patient_pk>/captures/<int:capture_pk>/unarchive")
+@editor_required
+def unarchive_route(capture_pk: int, patient_pk: int | None = None):
+    capture = _lifecycle_capture(capture_pk)
+    if patient_pk is not None and capture.patient_id != patient_pk:
+        abort(404)
+    try:
+        unarchive_capture(actor=current_user, capture=capture)
+    except CaptureError as exc:
+        flash(str(exc), "error")
+        return _lifecycle_redirect(capture), 400
+    flash("Capture restored.", "success")
+    return _lifecycle_redirect(capture)
+
+
+@captures_bp.post("/captures/<int:capture_pk>/delete")
+@captures_bp.post("/patients/<int:patient_pk>/captures/<int:capture_pk>/delete")
+@editor_required
+def delete_route(capture_pk: int, patient_pk: int | None = None):
+    capture = _lifecycle_capture(capture_pk)
+    if patient_pk is not None and capture.patient_id != patient_pk:
+        abort(404)
+    try:
+        delete_capture(actor=current_user, capture=capture)
+    except CaptureReferencedError as exc:
+        flash(str(exc), "error")
+        return _lifecycle_redirect(capture), 409
+    except (CaptureReconciliationError, CaptureDeleteReconciliationError) as exc:
+        flash(str(exc), "error")
+        return _lifecycle_redirect(capture), 503
+    except CaptureError as exc:
+        flash(str(exc), "error")
+        return _lifecycle_redirect(capture), 400
+    flash("Capture deleted.", "success")
+    return _lifecycle_redirect(capture)

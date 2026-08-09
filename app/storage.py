@@ -835,6 +835,54 @@ class ManagedStorage:
                 os.close(target_fd)
             os.close(source_fd)
 
+    def restore(self, quarantined_key: str, destination_key: str) -> None:
+        """Restore one quarantined regular file to its original managed key."""
+        source_parts = self._key_parts(quarantined_key)
+        target_parts = self._key_parts(destination_key)
+        source_fd = self._open_parent(source_parts)
+        target_fd: int | None = None
+        linked = False
+        source_unlinked = False
+        try:
+            try:
+                info = os.lstat(source_parts[-1], dir_fd=source_fd)
+            except FileNotFoundError as exc:
+                raise StorageError("quarantined media is missing") from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise StorageError("refusing to restore non-file media")
+            target_fd = self._open_parent(target_parts)
+            try:
+                os.lstat(target_parts[-1], dir_fd=target_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                raise StorageError("destination media already exists")
+            os.link(
+                source_parts[-1],
+                target_parts[-1],
+                src_dir_fd=source_fd,
+                dst_dir_fd=target_fd,
+                follow_symlinks=False,
+            )
+            linked = True
+            self._fsync_directory(target_fd)
+            os.unlink(source_parts[-1], dir_fd=source_fd)
+            source_unlinked = True
+            self._fsync_directory(source_fd)
+        except StorageError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise StorageError(f"could not restore quarantined media: {exc}") from exc
+        finally:
+            if linked and not source_unlinked and target_fd is not None:
+                try:
+                    os.unlink(target_parts[-1], dir_fd=target_fd)
+                except (FileNotFoundError, OSError):
+                    pass
+            if target_fd is not None:
+                os.close(target_fd)
+            os.close(source_fd)
+
     @staticmethod
     def preview_key(original_key: str) -> str:
         relative = PurePosixPath(original_key)
