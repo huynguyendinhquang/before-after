@@ -10,6 +10,7 @@ import click
 from flask import Flask, redirect, request, url_for
 from flask_login import current_user
 from flask_wtf.csrf import CSRFError, CSRFProtect
+from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import select
 
 from app.admin import admin_bp
@@ -34,6 +35,18 @@ def _required_text(config: dict, key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"{key} is required")
     return value.strip()
+
+
+def _trusted_proxy_count(value: object) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer") from exc
+    if count < 0 or count > 10:
+        raise RuntimeError("TRUSTED_PROXY_COUNT must be a non-negative integer")
+    return count
 
 
 def _validate_configuration(app: Flask) -> None:
@@ -72,6 +85,7 @@ def _validate_configuration(app: Flask) -> None:
         SQLALCHEMY_DATABASE_URI=database_url,
         MEDIA_ROOT=str(media_path.resolve()),
         SECRET_KEY=secret_key,
+        TRUSTED_PROXY_COUNT=_trusted_proxy_count(app.config.get("TRUSTED_PROXY_COUNT", 0)),
     )
     if app.config.get("APP_ENV") != "development":
         app.config["DEBUG"] = False
@@ -92,6 +106,7 @@ def create_app(config: dict | None = None) -> Flask:
         PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
         WTF_CSRF_ENABLED=True,
         DEBUG=False,
+        TRUSTED_PROXY_COUNT=int(os.environ.get("TRUSTED_PROXY_COUNT", "0")),
     )
     if config:
         app.config.from_mapping(config)
@@ -103,6 +118,15 @@ def create_app(config: dict | None = None) -> Flask:
     elif app.config.get("APP_ENV") not in {"development", "test"} and not app.config.get("TESTING"):
         app.config["SESSION_COOKIE_SECURE"] = True
     _validate_configuration(app)
+    if app.config["TRUSTED_PROXY_COUNT"]:
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=app.config["TRUSTED_PROXY_COUNT"],
+            x_proto=app.config["TRUSTED_PROXY_COUNT"],
+            x_host=app.config["TRUSTED_PROXY_COUNT"],
+            x_port=app.config["TRUSTED_PROXY_COUNT"],
+            x_prefix=0,
+        )
 
     db.init_app(app)
     login_manager.init_app(app)

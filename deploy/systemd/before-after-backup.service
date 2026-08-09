@@ -1,0 +1,30 @@
+[Unit]
+Description=Paired PostgreSQL and media backup for before-after
+After=network-online.target postgresql.service before-after.service
+Wants=network-online.target
+RequiresMountsFor=/var/lib/before-after/media /mnt/clinic-backup/before-after
+
+[Service]
+Type=oneshot
+User=before-after-backup
+Group=before-after-backup
+WorkingDirectory=/opt/before-after
+EnvironmentFile=/etc/before-after/before-after-backup.env
+Environment="PATH=/opt/before-after/.venv/bin:/usr/local/bin:/usr/bin"
+UMask=0077
+# Only these two service-manager commands run with the system privileges needed
+# to make the paired snapshot consistent. The backup process remains unprivileged.
+ExecStartPre=+/usr/bin/systemctl stop before-after.service
+ExecStart=/usr/bin/env bash /opt/before-after/ops/backup.sh
+ExecStopPost=+/usr/bin/systemctl start before-after.service
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/before-after/media /opt/before-after
+ReadWritePaths=/mnt/clinic-backup/before-after
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
