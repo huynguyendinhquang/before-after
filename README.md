@@ -19,6 +19,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### One-command local demo
+
+To evaluate the workflow without dealing with login setup, run:
+
+```bash
+./scripts/run-demo.sh
+```
+
+The script starts a dedicated PostgreSQL 16 container, migrates and seeds only
+synthetic images, auto-logs in as a local Demo Admin, and binds the app to
+`127.0.0.1:8765`. Demo Mode refuses to run outside `APP_ENV=development`.
+
 ### Web UI (recommended)
 
 The Slice 1 app requires PostgreSQL and three runtime settings:

@@ -20,6 +20,7 @@ from app.comparisons import comparisons_bp
 from app.exports import exports_bp
 from app.lifecycle import lifecycle_bp
 from app.db import db, postgres_route
+from app.demo import register_demo
 from app.image_policy import configured_request_limit
 from app.models import Capture, Export
 from app.patients import patients_bp
@@ -112,6 +113,8 @@ def create_app(config: dict | None = None) -> Flask:
         WTF_CSRF_ENABLED=True,
         DEBUG=False,
         TRUSTED_PROXY_COUNT=int(os.environ.get("TRUSTED_PROXY_COUNT", "0")),
+        DEMO_AUTO_LOGIN=os.environ.get("DEMO_AUTO_LOGIN", "0") == "1",
+        DEMO_USERNAME=os.environ.get("DEMO_USERNAME", "demo"),
     )
     if config:
         app.config.from_mapping(config)
@@ -144,6 +147,7 @@ def create_app(config: dict | None = None) -> Flask:
     app.register_blueprint(exports_bp)
     app.register_blueprint(lifecycle_bp)
     register_cli(app)
+    register_demo(app)
 
     @app.cli.command("reconcile-media")
     @click.option(
