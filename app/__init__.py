@@ -54,16 +54,13 @@ def _validate_configuration(app: Flask) -> None:
     route = postgres_route(database_url)
     if route._password is not None:
         environment = sanitized_postgres_environment(database_url, base=os.environ)
-        for key in tuple(os.environ):
-            if key.startswith("PG") or key == "DATABASE_URL":
-                os.environ.pop(key, None)
-        os.environ.update(
-            {
-                key: value
-                for key, value in environment.items()
-                if key.startswith("PG") or key == "DATABASE_URL"
-            }
-        )
+        passfile = environment.get("PGPASSFILE")
+        if passfile:
+            engine_options = dict(app.config.get("SQLALCHEMY_ENGINE_OPTIONS") or {})
+            connect_args = dict(engine_options.get("connect_args") or {})
+            connect_args["passfile"] = passfile
+            engine_options["connect_args"] = connect_args
+            app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_options
     database_url = route.sqlalchemy_url
     media_root = _required_text(app.config, "MEDIA_ROOT")
     secret_key = _required_text(app.config, "SECRET_KEY")
