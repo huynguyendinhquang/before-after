@@ -12,6 +12,7 @@ fi
 
 # Save gate-owned inputs before constructing the hermetic pytest environment.
 test_database_url="$TEST_DATABASE_URL"
+source_passfile="${PGPASSFILE:-}"
 configured_build_sha="${BUILD_SHA:-}"
 configured_artifact_dir="${FIXED_GATE_ARTIFACT_DIR:-}"
 if [[ -n "${FIXED_GATE_ARTIFACT:-}${FIXED_GATE_OUTPUT:-}" || ( -n "${FIXED_GATE_DAC_PROOF:-}" && "$FIXED_GATE_DAC_PROOF" != "1" ) ]]; then
@@ -31,7 +32,6 @@ for native_client in pg_dump pg_restore psql; do
   fi
 done
 
-export DATABASE_URL="$test_database_url"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
@@ -44,6 +44,44 @@ if [[ -n "$configured_build_sha" && ! "$configured_build_sha" =~ ^[0-9a-f]{40}$ 
   echo "BUILD_SHA must be a lowercase 40-character commit SHA" >&2
   exit 2
 fi
+
+# Canonicalize the route before starting pytest. The raw input may contain a
+# password, but no child process receives it; libpq gets a protected passfile.
+path_value="${PATH:-/usr/bin:/bin}"
+mapfile -t route_data < <(
+  printf '%s' "$test_database_url" |
+    env -i PATH="$path_value" PYTHONPATH="$repo_root" "$PYTHON_BIN" -c '
+import sys
+from app.db import _pgpass_line, postgres_route
+route = postgres_route(sys.stdin.read())
+print(route.sqlalchemy_url)
+if route._password is None:
+    print("0")
+else:
+    print("1")
+    print(_pgpass_line(route))
+'
+)
+if [[ "${#route_data[@]}" -lt 2 || -z "${route_data[0]}" ]]; then
+  echo "fixed PostgreSQL gate could not canonicalize TEST_DATABASE_URL" >&2
+  exit 2
+fi
+test_database_url="${route_data[0]}"
+gate_pgpass=$(mktemp /tmp/before-after-fixed-gate-pgpass.XXXXXX)
+chmod 600 -- "$gate_pgpass"
+cleanup_pgpass() { rm -f -- "$gate_pgpass"; }
+trap cleanup_pgpass EXIT
+if [[ "${route_data[1]}" == 1 ]]; then
+  printf '%s\n' "${route_data[2]}" >"$gate_pgpass"
+elif [[ -n "$source_passfile" && -f "$source_passfile" && ! -L "$source_passfile" ]]; then
+  cp -- "$source_passfile" "$gate_pgpass"
+  chmod 600 -- "$gate_pgpass"
+else
+  echo "fixed PostgreSQL gate requires a password or protected PGPASSFILE" >&2
+  exit 2
+fi
+export DATABASE_URL="$test_database_url"
+export PGPASSFILE="$gate_pgpass"
 
 old_umask=$(umask)
 umask 077
@@ -114,6 +152,7 @@ env -i \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   TEST_DATABASE_URL="$test_database_url" \
   DATABASE_URL="$test_database_url" \
+  PGPASSFILE="$gate_pgpass" \
   DAC_PROOF_MARKER="$dac_proof" \
   "$PYTHON_BIN" -m pytest \
   tests/test_slice0.py tests/test_slice1.py tests/test_slice2.py tests/test_slice3.py \

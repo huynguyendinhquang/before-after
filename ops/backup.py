@@ -366,11 +366,18 @@ def _pgpass_escape(value: str) -> str:
 @contextmanager
 def _postgres_environment(value: str, *, base: dict[str, str] | None = None) -> Iterator[dict[str, str]]:
     try:
-        settings = dict(postgres_route(value).environment())
-        environment = sanitized_postgres_environment(value, base=base)
+        route = postgres_route(value)
+        settings = dict(route.environment())
+        environment = sanitized_postgres_environment(
+            value,
+            base=base,
+            include_database_url=False,
+            create_passfile=False,
+        )
     except RuntimeError as exc:
         raise OpsError(str(exc)) from exc
-    password = settings.pop("PGPASSWORD", None)
+    password = route._password
+    existing_passfile = environment.get("PGPASSFILE")
     passfile: Path | None = None
     if password is not None:
         escaped_user = _pgpass_escape(settings.get("PGUSER") or "*")
@@ -391,6 +398,8 @@ def _postgres_environment(value: str, *, base: dict[str, str] | None = None) -> 
                 except OSError:
                     pass
             raise OpsError("could not create protected PostgreSQL password file") from exc
+    elif existing_passfile:
+        environment["PGPASSFILE"] = existing_passfile
     try:
         yield environment
     finally:

@@ -19,7 +19,7 @@ from app.captures import captures_bp
 from app.comparisons import comparisons_bp
 from app.exports import exports_bp
 from app.lifecycle import lifecycle_bp
-from app.db import db, normalize_database_url
+from app.db import db, postgres_route, sanitized_postgres_environment
 from app.image_policy import configured_request_limit
 from app.models import Capture, Export
 from app.patients import patients_bp
@@ -51,7 +51,20 @@ def _trusted_proxy_count(value: object) -> int:
 
 def _validate_configuration(app: Flask) -> None:
     database_url = app.config.get("DATABASE_URL") or app.config.get("SQLALCHEMY_DATABASE_URI")
-    database_url = normalize_database_url(database_url)
+    route = postgres_route(database_url)
+    if route._password is not None:
+        environment = sanitized_postgres_environment(database_url, base=os.environ)
+        for key in tuple(os.environ):
+            if key.startswith("PG") or key == "DATABASE_URL":
+                os.environ.pop(key, None)
+        os.environ.update(
+            {
+                key: value
+                for key, value in environment.items()
+                if key.startswith("PG") or key == "DATABASE_URL"
+            }
+        )
+    database_url = route.sqlalchemy_url
     media_root = _required_text(app.config, "MEDIA_ROOT")
     secret_key = _required_text(app.config, "SECRET_KEY")
 

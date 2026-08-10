@@ -122,9 +122,12 @@ def test_web_socket_group_does_not_expose_app_environment() -> None:
     environment = (root / "deploy/before-after.env.example").read_text(encoding="ascii")
 
     assert "ensure_group before-after-web" in bootstrap
-    assert "usermod --append --groups before-after-media,before-after-web before-after" in bootstrap
+    assert "usermod --groups \"$groups\" \"$name\"" in bootstrap
+    assert "set_exact_groups before-after \"$media_gid,$web_gid\"" in bootstrap
+    assert "set_exact_groups before-after-backup \"$media_gid\"" in bootstrap
     assert "usermod --remove --groups before-after,before-after-media www-data" in bootstrap
     assert "usermod --append --groups before-after-web www-data" in bootstrap
+    assert "gpasswd --delete www-data \"$secret_group\"" in bootstrap
     assert "Group=before-after-web" in service
     assert "SupplementaryGroups=before-after before-after-media" in service
     assert "root:before-after" in environment
@@ -140,6 +143,24 @@ def test_media_permission_verify_checks_root_identity_and_mode(tmp_path: Path) -
     os.chmod(media, 0o750)
     with pytest.raises(permissions.PermissionError, match="MEDIA_ROOT.*mode"):
         permissions.run(str(media), owner, group, mutate=False, require_backup_lock=False)
+
+
+def test_media_permission_normalization_restores_managed_sgid_roots(tmp_path: Path) -> None:
+    import deploy.media_permissions as permissions
+
+    media = private_media_root(tmp_path / "media")
+    owner = pwd.getpwuid(os.geteuid()).pw_name
+    group = grp.getgrgid(os.getegid()).gr_name
+    for name in ("originals", "previews", "derivatives", "quarantine"):
+        os.chmod(media / name, 0o750)
+        nested = media / name / "nested"
+        nested.mkdir(mode=0o750)
+        os.chmod(nested, 0o750)
+    permissions.run(str(media), owner, group, mutate=True, require_backup_lock=False)
+    assert stat.S_IMODE(media.stat().st_mode) == 0o2750
+    for name in ("originals", "previews", "derivatives", "quarantine"):
+        assert stat.S_IMODE((media / name).stat().st_mode) == 0o2750
+        assert stat.S_IMODE((media / name / "nested").stat().st_mode) == 0o750
 
 
 def test_media_permission_patterns_keep_crash_left_markers_private(tmp_path: Path) -> None:
@@ -159,15 +180,18 @@ def test_media_permission_patterns_keep_crash_left_markers_private(tmp_path: Pat
             assert stat.S_IMODE(entry.stat().st_mode) == 0o600
 
 
-def test_backup_role_sql_is_dedicated_and_read_only() -> None:
+def test_backup_role_sql_is_database_scoped_and_read_only() -> None:
     root = Path(__file__).resolve().parents[1]
     environment = (root / "deploy/before-after-backup.env.example").read_text(encoding="ascii")
     sql = (root / "deploy/postgres-backup-role.sql").read_text(encoding="ascii")
+    helper = (root / "deploy/bootstrap-postgres-backup-role.sh").read_text(encoding="ascii")
     assert "before_after_backup:" in environment
-    assert "GRANT pg_read_all_data TO before_after_backup" in sql
+    assert "GRANT pg_read_all_data TO before_after_backup" not in sql
     assert "GRANT CONNECT" in sql and "GRANT SELECT ON ALL SEQUENCES" in sql
     assert "GRANT INSERT" not in sql and "GRANT UPDATE" not in sql and "GRANT DELETE" not in sql
-    assert "NOCREATEDB NOCREATEROLE" in sql
+    assert "NOCREATEDB" in sql and "NOCREATEROLE" in sql and "NOINHERIT" in sql
+    assert "ALTER DEFAULT PRIVILEGES" in sql
+    assert "NOT datistemplate" in helper and "is_target" in helper
 
 
 def test_inherited_backup_lock_fd_is_upgraded_and_contention_fails(
@@ -1253,7 +1277,7 @@ def test_native_client_argv_contains_no_database_url_or_password(tmp_path: Path)
     dump.write_text(
         "#!/usr/bin/env python3\n"
         "import json,os,pathlib,sys\n"
-        f"pathlib.Path({str(dump_record)!r}).write_text(json.dumps({{'argv':sys.argv[1:], 'passfile':pathlib.Path(os.environ['PGPASSFILE']).read_text()}}))\n"
+        f"pathlib.Path({str(dump_record)!r}).write_text(json.dumps({{'argv':sys.argv[1:], 'env':dict(os.environ), 'passfile':pathlib.Path(os.environ['PGPASSFILE']).read_text()}}))\n"
         "pathlib.Path(sys.argv[sys.argv.index('--file')+1]).write_bytes(b'PGDMP synthetic dump')\n",
         encoding="ascii",
     )
@@ -1262,7 +1286,7 @@ def test_native_client_argv_contains_no_database_url_or_password(tmp_path: Path)
     restore.write_text(
         "#!/usr/bin/env python3\n"
         "import json,os,pathlib,sys\n"
-        f"pathlib.Path({str(restore_record)!r}).write_text(json.dumps({{'argv':sys.argv[1:], 'passfile':pathlib.Path(os.environ['PGPASSFILE']).read_text()}}))\n",
+        f"pathlib.Path({str(restore_record)!r}).write_text(json.dumps({{'argv':sys.argv[1:], 'env':dict(os.environ), 'passfile':pathlib.Path(os.environ['PGPASSFILE']).read_text()}}))\n",
         encoding="ascii",
     )
     restore.chmod(0o700)
@@ -1279,6 +1303,9 @@ def test_native_client_argv_contains_no_database_url_or_password(tmp_path: Path)
         assert all("super-secret" not in argument for argument in payload["argv"])
         assert all("DATABASE_URL" not in argument for argument in payload["argv"])
         assert "--dbname" not in payload["argv"]
+        assert all("super-secret" not in value for value in payload["env"].values())
+        assert "DATABASE_URL" not in payload["env"]
+        assert "PGPASSWORD" not in payload["env"]
         assert "super-secret" in payload["passfile"]
 
 
@@ -1763,6 +1790,71 @@ def test_postgres_route_rejects_invalid_authority_port(port: int) -> None:
 
     with pytest.raises(RuntimeError, match="invalid port"):
         postgres_route(f"postgresql://user:password@127.0.0.1:{port}/clinic")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "%2Fvar%2Frun%2Fpostgresql",
+        "%5Ctmp%5Cpostgres",
+        "%00socket",
+        "%0Ahost",
+        "foo%3Abar",
+        "..",
+    ],
+)
+def test_postgres_route_rejects_encoded_authority_socket_syntax(host: str) -> None:
+    from app.db import postgres_route
+
+    with pytest.raises(RuntimeError, match="authority host"):
+        postgres_route(f"postgresql://user:password@{host}/clinic")
+
+
+def test_postgres_route_uses_query_socket_route_across_consumers() -> None:
+    from sqlalchemy.engine import make_url
+
+    from app.db import postgres_route
+    from ops.backup import _native_postgres_url, _postgres_settings
+
+    value = "postgresql:///clinic?host=%2Fvar%2Frun%2Fpostgresql&port=5433"
+    route = postgres_route(value)
+    parsed = make_url(route.sqlalchemy_url)
+    assert parsed.host is None and parsed.query["host"] == "/var/run/postgresql"
+    assert parsed.query["port"] == "5433"
+    assert _native_postgres_url(value) == route.sqlalchemy_url
+    settings = _postgres_settings(value)
+    assert settings["PGHOST"] == "/var/run/postgresql"
+    assert settings["PGPORT"] == "5433"
+    assert "PGPASSWORD" not in settings
+
+
+def test_postgres_route_rejects_relative_or_traversing_query_socket_hosts() -> None:
+    from app.db import postgres_route
+
+    for host in ("var/run/postgresql", "/var/../run/postgresql"):
+        with pytest.raises(RuntimeError, match="query host"):
+            postgres_route(f"postgresql:///clinic?host={host}")
+
+
+def test_create_app_strips_raw_database_password_before_engine_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import create_app
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:child-secret@127.0.0.1/clinic")
+    monkeypatch.delenv("PGPASSFILE", raising=False)
+    application = create_app(
+        {
+            "TESTING": True,
+            "DATABASE_URL": "postgresql://user:child-secret@127.0.0.1/clinic",
+            "MEDIA_ROOT": str(tmp_path / "media"),
+            "SECRET_KEY": "create-app-route-test",
+        }
+    )
+    assert "child-secret" not in application.config["DATABASE_URL"]
+    assert "child-secret" not in os.environ["DATABASE_URL"]
+    assert "child-secret" not in os.environ["PGPASSFILE"]
+    assert Path(os.environ["PGPASSFILE"]).read_text(encoding="ascii").endswith("child-secret\n")
 
 
 def test_postgres_route_is_single_and_clears_inherited_routing(monkeypatch: pytest.MonkeyPatch) -> None:

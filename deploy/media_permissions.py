@@ -435,6 +435,7 @@ def _freeze_directory_tree(
     *,
     root_path: Path,
     root: bool,
+    top_level: bool = False,
     seen: set[tuple[int, int]],
     files: list[_FileRecord],
     directories: list[_DirectoryRecord],
@@ -470,6 +471,7 @@ def _freeze_directory_tree(
                     child_fd,
                     root_path=root_path,
                     root=False,
+                    top_level=root,
                     seen=seen,
                     files=files,
                     directories=directories,
@@ -494,7 +496,7 @@ def _freeze_directory_tree(
         _DirectoryRecord(
             fd=fd,
             identity=identity,
-            mode=ROOT_MODE if root else DIRECTORY_MODE,
+            mode=ROOT_MODE if root or top_level else DIRECTORY_MODE,
         )
     )
 
@@ -548,7 +550,7 @@ def _walk_directory(
                     os.fstat(child_fd),
                     uid=uid,
                     gid=gid,
-                    mode=ROOT_MODE if root else DIRECTORY_MODE,
+                    mode=ROOT_MODE if root and name in MANAGED_DIRECTORIES else DIRECTORY_MODE,
                     label=name,
                     mutate=mutate,
                 )

@@ -29,20 +29,58 @@ if [[ "$#" -ne 0 ]]; then
     exit 2
 fi
 
+fail_bootstrap() {
+    echo "bootstrap: $*" >&2
+    exit 1
+}
+
 ensure_group() {
-    local name=$1
-    if ! getent group "$name" >/dev/null; then
+    local name=$1 record gid group_name
+    if ! record=$(getent group "$name"); then
         groupadd --system "$name"
+        record=$(getent group "$name") || fail_bootstrap "group creation did not persist: $name"
     fi
+    IFS=: read -r group_name _ gid _ <<< "$record"
+    [[ "$group_name" == "$name" && "$gid" != 0 ]] || fail_bootstrap "unsafe group identity: $name"
+}
+
+validate_user_identity() {
+    local name=$1 expected_group=$2 expected_home=$3 record account uid gid home shell
+    record=$(getent passwd "$name") || fail_bootstrap "user is missing: $name"
+    IFS=: read -r account _ uid gid _ home shell <<< "$record"
+    [[ "$account" == "$name" ]] || fail_bootstrap "user identity is an alias: $name"
+    [[ "$uid" != 0 ]] || fail_bootstrap "user must not be root: $name"
+    [[ "$gid" == "$(getent group "$expected_group" | cut -d: -f3)" ]] || fail_bootstrap "user has the wrong primary group: $name"
+    [[ "$home" == "$expected_home" ]] || fail_bootstrap "user has the wrong home: $name"
+    [[ "$shell" == /usr/sbin/nologin ]] || fail_bootstrap "user has an interactive shell: $name"
+    while IFS=: read -r account _ other_uid _ _ _ _; do
+        if [[ "$other_uid" == "$uid" && "$account" != "$name" ]]; then
+            fail_bootstrap "user UID is aliased by $account: $name"
+        fi
+    done < <(getent passwd)
 }
 
 ensure_user() {
     local name=$1 group=$2 home=$3
-    if ! id -u "$name" >/dev/null 2>&1; then
+    if ! getent passwd "$name" >/dev/null; then
         useradd --system --home-dir "$home" --gid "$group" --shell /usr/sbin/nologin "$name"
     else
-        usermod --gid "$group" --shell /usr/sbin/nologin "$name"
+        usermod --gid "$group" --home "$home" --shell /usr/sbin/nologin "$name"
     fi
+    validate_user_identity "$name" "$group" "$home"
+}
+
+set_exact_groups() {
+    local name=$1 groups=$2
+    # --groups replaces supplementary memberships; it is intentionally not --append.
+    usermod --groups "$groups" "$name"
+}
+
+validate_exact_groups() {
+    local name=$1 expected=$2 actual
+    actual=$(id -G "$name" | tr ' ' '\n' | sort -n | paste -sd, -)
+    expected=$(printf '%s\n' "$expected" | tr ',' '\n' | sort -n | paste -sd, -)
+    [[ "$actual" == "$expected" ]] || fail_bootstrap "unexpected supplementary groups for $name"
 }
 
 validate_app_environment() {
@@ -81,7 +119,7 @@ if [[ "$MEDIA_ROOT" != /* ]]; then
     echo "bootstrap: MEDIA_ROOT must be absolute" >&2
     exit 1
 fi
-if [[ ! -x "$(command -v "$PYTHON_BIN" || true)" ]]; then
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     echo "bootstrap: Python is required for descriptor-based media setup" >&2
     exit 1
 fi
@@ -99,12 +137,39 @@ ensure_group before-after-media
 ensure_group before-after-web
 ensure_user before-after before-after "$RELEASE_DIR"
 ensure_user before-after-backup before-after-backup /var/lib/before-after-backup
-usermod --append --groups before-after-media,before-after-web before-after
-usermod --append --groups before-after-media before-after-backup
+media_gid=$(getent group before-after-media | cut -d: -f3)
+web_gid=$(getent group before-after-web | cut -d: -f3)
+app_gid=$(getent group before-after | cut -d: -f3)
+backup_gid=$(getent group before-after-backup | cut -d: -f3)
+if [[ "$app_gid" == "$media_gid" || "$app_gid" == "$web_gid" || "$backup_gid" == "$media_gid" || "$backup_gid" == "$web_gid" || "$media_gid" == "$web_gid" ]]; then
+    fail_bootstrap "managed groups are aliased"
+fi
+set_exact_groups before-after "$media_gid,$web_gid"
+set_exact_groups before-after-backup "$media_gid"
+validate_exact_groups before-after "$app_gid,$media_gid,$web_gid"
+validate_exact_groups before-after-backup "$backup_gid,$media_gid"
+if id -nG before-after-backup | grep -Eq '(^| )(before-after|before-after-web|before-after-secrets|secrets)( |$)'; then
+    fail_bootstrap "backup user remains in a secret or web group"
+fi
 if id -u www-data >/dev/null 2>&1; then
-    # www-data must not inherit the app's secret-bearing group or media DAC.
+    # www-data keeps unrelated distro groups, but never app secret/media groups.
+    www_primary_gid=$(id -g www-data)
+    if [[ "$www_primary_gid" == "$app_gid" || "$www_primary_gid" == "$media_gid" ]]; then
+        fail_bootstrap "www-data has a protected application primary group"
+    fi
     usermod --remove --groups before-after,before-after-media www-data
+    for secret_group in before-after-secrets before-after-secret secrets; do
+        if getent group "$secret_group" >/dev/null && id -nG www-data | grep -Eq "(^| )${secret_group}( |$)"; then
+            gpasswd --delete www-data "$secret_group"
+        fi
+    done
     usermod --append --groups before-after-web www-data
+    if id -nG www-data | grep -Eq '(^| )(before-after|before-after-media|before-after-secrets|before-after-secret|secrets)( |$)'; then
+        fail_bootstrap "www-data remains in a protected application group"
+    fi
+    if ! id -nG www-data | grep -Eq '(^| )before-after-web( |$)'; then
+        fail_bootstrap "www-data was not added to before-after-web"
+    fi
 fi
 
 enforce_media_group() {
@@ -117,7 +182,7 @@ enforce_media_group() {
         [[ -z "$member" ]] && continue
         case "$member" in
             before-after|before-after-backup) ;;
-            *) gpasswd --delete "$member" before-after-media >/dev/null 2>&1 || true ;;
+            *) gpasswd --delete "$member" before-after-media >/dev/null 2>&1 ;;
         esac
     done
     while IFS=: read -r name _ _ primary_gid _; do
@@ -140,24 +205,63 @@ fi
 
 cd "$RELEASE_DIR"
 run_as_app() {
-    # Start with an allowlist so root's ambient PG service/routing variables
-    # cannot redirect Alembic or create-admin away from the protected file.
+    # Never source "$1" in the child: canonicalize and protect credentials first.
     local program=$1
     shift
-    runuser --user before-after -- env -i \
+    local -a route_data
+    mapfile -t route_data < <(
+        printf '%s' "$DATABASE_URL" |
+            env -i PATH="$VENV/bin:/usr/local/bin:/usr/bin:/bin" PYTHONPATH="$RELEASE_DIR" \
+            "$VENV/bin/python" -c '
+import sys
+from app.db import _pgpass_line, postgres_route
+route = postgres_route(sys.stdin.read())
+print(route.sqlalchemy_url)
+if route._password is None:
+    print("0")
+else:
+    print("1")
+    print(_pgpass_line(route))
+'
+    )
+    if [[ "${#route_data[@]}" -lt 2 || -z "${route_data[0]}" ]]; then
+        echo "bootstrap: could not canonicalize DATABASE_URL" >&2
+        exit 1
+    fi
+    local canonical_url=${route_data[0]}
+    local passfile=${PGPASSFILE:-}
+    local temporary_passfile=
+    if [[ "${route_data[1]}" == 1 ]]; then
+        temporary_passfile=$(mktemp "${TMPDIR:-/tmp}/before-after-app-pgpass.XXXXXX")
+        chmod 0600 -- "$temporary_passfile"
+        printf '%s\n' "${route_data[2]}" >"$temporary_passfile"
+        chown before-after:before-after "$temporary_passfile"
+        passfile=$temporary_passfile
+    elif [[ -z "$passfile" || ! -f "$passfile" || -L "$passfile" ]]; then
+        echo "bootstrap: PGPASSFILE is required when DATABASE_URL has no password" >&2
+        exit 1
+    fi
+    local status
+    if runuser --user before-after -- env -i \
         PATH="$VENV/bin:/usr/local/bin:/usr/bin:/bin" \
         HOME="$RELEASE_DIR" \
+        APP_ENV="$APP_ENV" \
+        DATABASE_URL="$canonical_url" \
+        MEDIA_ROOT="$MEDIA_ROOT" \
+        SECRET_KEY="${SECRET_KEY}" \
+        TRUSTED_PROXY_COUNT="$TRUSTED_PROXY_COUNT" \
+        PGPASSFILE="$passfile" \
         /bin/bash -c '
-            set -a
-            source "$1"
-            set +a
-            : "${DATABASE_URL:?DATABASE_URL is required in app environment}"
-            : "${SECRET_KEY:?SECRET_KEY is required in app environment}"
-            export APP_ENV="${APP_ENV:-production}"
-            export MEDIA_ROOT="${MEDIA_ROOT:-/var/lib/before-after/media}"
-            export TRUSTED_PROXY_COUNT="${TRUSTED_PROXY_COUNT:-1}"
-            exec "$4" "${@:5}"
-        ' bash "$APP_ENV_FILE" "$VENV" "$RELEASE_DIR" "$program" "$@"
+            exec "$1" "${@:2}"
+        ' bash "$program" "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    if [[ -n "$temporary_passfile" ]]; then
+        rm -f -- "$temporary_passfile"
+    fi
+    return "$status"
 }
 
 run_as_app "$VENV/bin/alembic" -c "$RELEASE_DIR/alembic.ini" upgrade head

@@ -53,7 +53,12 @@ sudo /opt/before-after/.venv/bin/pip install --requirement /opt/before-after/req
 sudo install -o root -g before-after -m 0640 \
   /opt/before-after/deploy/before-after.env.example \
   /etc/before-after/before-after.env
+sudo install -o before-after -g before-after -m 0600 /dev/null \
+  /etc/before-after/before-after.pgpass
 sudoedit /etc/before-after/before-after.env
+# Add the protected libpq entry to before-after.pgpass:
+# 127.0.0.1:5432:before_after:before_after:<database-password>
+sudoedit /etc/before-after/before-after.pgpass
 sudo /opt/before-after/deploy/bootstrap.sh
 
 sudo install -o root -g root -m 0644 \
@@ -64,9 +69,11 @@ sudo systemctl enable --now before-after.service
 ```
 
 `bootstrap.sh` changes to the release directory, verifies that the app env is
-regular, root-owned, mode `0640`, and group `before-after`, then loads only
-that trusted file and runs Alembic and the interactive `create-admin` command
-as `before-after`. It does not put the database password in an argument.
+regular, root-owned, mode `0640`, and group `before-after`, then passes only a
+credential-free URL and protected PGPASSFILE to Alembic and the interactive
+`create-admin` command as `before-after`. It never puts the database password
+in a child environment, argument, or `PGPASSWORD`; do not `source "$1"` in a
+child process.
 Generate `SECRET_KEY` without logging or committing it:
 
 ```bash
@@ -97,7 +104,12 @@ sudo install -d -o before-after-backup -g before-after-backup -m 0700 \
 sudo install -o root -g before-after-backup -m 0640 \
   /opt/before-after/deploy/before-after-backup.env.example \
   /etc/before-after/before-after-backup.env
+sudo install -o before-after-backup -g before-after-backup -m 0600 /dev/null \
+  /etc/before-after/before-after-backup.pgpass
 sudoedit /etc/before-after/before-after-backup.env
+# Add the protected libpq entry to before-after-backup.pgpass:
+# 127.0.0.1:5432:before_after:before_after_backup:<backup-password>
+sudoedit /etc/before-after/before-after-backup.pgpass
 # Create the dedicated read-only PostgreSQL role as an administrator. The
 # helper reads the password from a mode-0600 file, not from argv.
 export BACKUP_DB_PASSWORD_FILE=/var/lib/postgresql/before-after-backup.password
@@ -123,9 +135,11 @@ sudo systemctl start before-after-backup.service
 ```
 
 The backup service runs as `before-after-backup` and connects with the
-`before_after_backup` PostgreSQL LOGIN role. That role inherits only
-`pg_read_all_data` plus required CONNECT/schema/sequence reads; it has no
-write, ownership, role-management, or database-creation privileges. Verify
+`before_after_backup` PostgreSQL LOGIN role through its protected PGPASSFILE.
+That role is scoped to the production database and receives only CONNECT,
+public-schema USAGE, and SELECT on current tables/sequences plus matching
+future defaults; it has no write, ownership, role-management, or
+database-creation privileges. Verify
 with `pg_dump` and explicitly test that DELETE and DDL fail before enabling
 production backups. Only its `ExecStartPre`/`ExecStopPost` commands stop and
 start the app; the Python backup process never runs as root. Gunicorn holds a shared flock on the
@@ -237,6 +251,9 @@ sudoedit /etc/before-after/restore-check.env
 sudo install -o root -g root -m 0600 /dev/null \
   /var/lib/before-after/restore-drills/smoke.password
 sudoedit /var/lib/before-after/restore-drills/smoke.password
+sudo install -o root -g root -m 0600 /dev/null \
+  /etc/before-after/restore-check.pgpass
+sudoedit /etc/before-after/restore-check.pgpass
 ```
 
 Set `RESTORE_CHECK_DATABASE_URL` to the new database name,
