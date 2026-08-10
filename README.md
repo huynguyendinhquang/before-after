@@ -1,98 +1,26 @@
-# before-after
+# Before / After — Decision Archive
 
-Small open-source replacement for CorelDRAW **PowerCLIP** case boards.
+The `main` branch is intentionally documentation-only. It preserves the product, domain, architecture, safety, and delivery decisions made while exploring the clinic image-comparison MVP.
 
-Typical use (Viengut-style medical sheet):
+The complete working implementation is preserved on branch [`v1`](https://github.com/huynguyendinhquang/before-after/tree/v1), snapshot commit [`00f42d7`](https://github.com/huynguyendinhquang/before-after/commit/00f42d7).
 
-- title: `Name - Year - ID - City`
-- structured Frames for clinical photos + X-rays
-- each image is clipped into its Frame with a persisted cover crop
-- optional Capture Date and Frame labels
-- export **PNG** / **PDF**
+## Current decisions
 
-## Quick start
+- Deploy as a clinic-LAN modular monolith.
+- Model the workflow as Patient → Capture Library → Comparison Set → Frame.
+- Preserve immutable original Captures; crop, pan, zoom, labels, and visibility belong to each Frame placement.
+- Use structured equal-size grids and server-owned PNG/PDF rendering.
+- Treat Capture Date as editable clinical metadata, with EXIF only as a suggestion.
+- Keep the three frontend directions as prototypes on `v1`; no frontend variant has been accepted as the final product UI.
+- Do not continue implementation directly on `main`. Start from `v1` or create a new implementation branch after revisiting these decisions.
 
-```bash
-cd before-after
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+## Documents
 
-### Web UI (recommended)
-
-The Slice 1 app requires PostgreSQL and three runtime settings:
-
-```bash
-export DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_after
-export MEDIA_ROOT=/var/lib/before-after/media
-export SECRET_KEY='replace-with-a-random-secret'
-export APP_ENV=development  # local HTTP development exception for Secure cookies
-alembic upgrade head
-flask --app app:create_app create-admin
-flask --app app:create_app run
-# open http://127.0.0.1:5000/login
-```
-
-Production keeps `SESSION_COOKIE_SECURE` enabled and must run behind HTTPS
-(the HTTPS deployment is part of Slice 8). Comparison Set preview and PNG/PDF
-export are versioned server-side; export is restricted to Admins/Editors,
-CSRF-protected, audited, and served with `Cache-Control: no-store`. Viewer
-accounts can read Sets and previews but cannot export.
-
-### PostgreSQL acceptance gate
-
-The ordinary test run may skip database-backed Slice 1 tests when no database
-URL is configured. The mandatory gate requires a disposable clean PostgreSQL
-database, runs the Alembic migration from the test fixture, and fails loudly
-when `TEST_DATABASE_URL` is missing:
-
-```bash
-export TEST_DATABASE_URL=postgresql+psycopg://user:password@127.0.0.1/before_after_test
-./scripts/test-postgres.sh
-```
-
-## Comparison Set preview and export
-
-Open a persisted Comparison Set in the web UI. The server preview and the
-Editor/Admin export form use the same versioned Canvas render specification;
-choose PNG or PDF and submit the current Set version. Export derivatives are
-stored outside the static web root and linked to an audited `Export` record.
-
-## Structured Canvas layout
-
-Canvas presets include 16:9, 16:10, A4 landscape, A4 portrait, and custom mm.
-The Set stores a shared Frame ratio, column count, order, visibility, labels,
-and normalized crop state. Hidden Frames are retained in the Set but excluded
-from preview/export.
-
-## Layout matching your Corel board
-
-A three-column structured grid mirrors the common foot-case sheet:
-
-```
-+------------+--------+--------+--------+
-|            | clin 1 | clin 2 | clin 3 |
-|  portrait  +--------+--------+--------+
-|            |   xray 1   |   xray 2    |
-+------------+------------+-------------+
-```
-
-## Design notes
-
-| CorelDRAW | this app |
-|-----------|----------|
-| Rectangle + PowerCLIP | structured Frame + normalized cover crop |
-| Manual arrange | persisted Canvas/grid/order state |
-| Export bitmap/PDF | audited Pillow PNG/PDF derivative |
-
-### Build path (suggested evolution)
-
-1. **Now** — persisted Comparison Sets + local web UI + audited export
-2. **Next** — lifecycle and administration workflows
-3. **Later** — multi-page cases, HIS integration, guided capture
-
-## Requirements
-
-- Python 3.10+
-- Pillow, Flask (see `requirements.txt`)
+- [MVP specification](docs/mvp-spec.md)
+- [Domain model](docs/agents/domain.md)
+- [Architecture landscape](docs/architecture-landscape.md)
+- [LAN modular-monolith ADR](docs/adr/0001-lan-modular-monolith.md)
+- [Implementation archive ADR](docs/adr/0002-v1-archive-and-docs-main.md)
+- [Image policy](docs/image-policy.md)
+- [Implementation plan](docs/implementation-plan.md)
+- [Deployment notes](docs/deployment.md)
