@@ -1,0 +1,241 @@
+{# PROTOTYPE — Three comparison-editor layouts, switchable with ?prototype=frontend&variant=. #}
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype {{ prototype_variant }} — {{ comparison_set.name }}</title>
+  <style>
+    :root {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #17212b;
+      background: #e9edf1;
+      font-size: 14px;
+      --blue: #176b87;
+      --blue-dark: #0d3f52;
+      --blue-soft: #e4f2f5;
+      --ink: #17212b;
+      --muted: #66727e;
+      --line: #d9e0e5;
+      --surface: #fff;
+      --green: #14775a;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 1080px; }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+    .icon-button { width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--ink); }
+    .primary { border: 0; border-radius: 7px; padding: 9px 14px; color: #fff; background: var(--blue); font-weight: 650; }
+    .secondary { border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; color: var(--ink); background: #fff; font-weight: 600; }
+    .quiet { color: var(--muted); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 99px; color: #126148; background: #e5f4ed; font-size: 12px; font-weight: 650; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #1b9a72; }
+    .thumb { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; background: #d9dee2; }
+    .canvas-image { display: block; max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 12px 36px #17212b2b; background: #fff; }
+    .proto-note { position: fixed; top: 10px; left: 50%; z-index: 50; transform: translateX(-50%); padding: 5px 10px; border-radius: 99px; background: #f7cf52; color: #3d330e; font-size: 11px; font-weight: 800; letter-spacing: .03em; }
+    .switcher { position: fixed; z-index: 60; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; padding: 5px; color: #fff; background: #111820; border-radius: 12px; box-shadow: 0 8px 30px #0005; }
+    .switcher button { width: 38px; height: 34px; border: 0; border-radius: 8px; color: #fff; background: transparent; font-size: 18px; }
+    .switcher button:hover { background: #ffffff18; }
+    .switcher strong { min-width: 190px; padding: 0 12px; text-align: center; font-size: 13px; }
+
+    /* A — Desktop studio: tools surround the output canvas. */
+    .studio { height: 100vh; display: grid; grid-template: 58px 1fr / 72px 242px minmax(480px, 1fr) 292px; background: #dfe5e9; }
+    .studio-top { grid-column: 1 / -1; display: flex; align-items: center; gap: 18px; padding: 0 18px; color: #fff; background: #143b4a; }
+    .studio-brand { font-size: 16px; font-weight: 750; }
+    .studio-patient { flex: 1; display: flex; align-items: center; gap: 9px; color: #d9e8ed; }
+    .studio-patient strong { color: #fff; }
+    .studio-status { color: #b9d9cd; font-size: 12px; }
+    .studio-tools { padding: 14px 10px; color: #dbe8ec; background: #1b4b5d; }
+    .tool { display: grid; place-items: center; gap: 4px; width: 52px; min-height: 50px; margin-bottom: 8px; border: 0; border-radius: 8px; color: inherit; background: transparent; font-size: 10px; }
+    .tool b { font-size: 20px; font-weight: 500; }
+    .tool.active { color: #123c4c; background: #d9eef3; }
+    .studio-library, .studio-inspector { overflow: auto; background: #f8fafb; }
+    .studio-library { border-right: 1px solid #cdd6dc; }
+    .panel-heading { position: sticky; top: 0; z-index: 2; padding: 17px 16px 12px; background: inherit; border-bottom: 1px solid var(--line); }
+    .panel-heading h2 { margin: 0 0 4px; font-size: 14px; }
+    .capture-list { padding: 10px; }
+    .capture-card { display: grid; grid-template-columns: 66px 1fr; gap: 9px; margin-bottom: 8px; padding: 6px; border: 1px solid transparent; border-radius: 8px; background: #fff; text-align: left; width: 100%; }
+    .capture-card:hover, .capture-card.selected { border-color: #49a0ba; box-shadow: 0 0 0 2px #bce2ec; }
+    .capture-card img { width: 66px; height: 54px; border-radius: 5px; object-fit: cover; }
+    .capture-card strong { display: block; margin: 4px 0; font-size: 12px; }
+    .capture-card span { color: var(--muted); font-size: 11px; }
+    .studio-work { min-width: 0; display: grid; grid-template-rows: 44px minmax(0,1fr) 116px; }
+    .canvas-bar { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-bottom: 1px solid #c8d1d7; background: #f4f6f7; }
+    .zoom-controls { display: flex; gap: 5px; align-items: center; }
+    .canvas-stage { display: grid; place-items: center; min-height: 0; padding: 28px; overflow: hidden; background-color: #cfd6da; background-image: linear-gradient(45deg,#c7cfd4 25%,transparent 25%),linear-gradient(-45deg,#c7cfd4 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#c7cfd4 75%),linear-gradient(-45deg,transparent 75%,#c7cfd4 75%); background-size: 20px 20px; background-position: 0 0,0 10px,10px -10px,-10px 0; }
+    .filmstrip { display: flex; gap: 9px; padding: 11px 14px 22px; overflow: auto; border-top: 1px solid #bdc8ce; background: #eef2f4; }
+    .frame-chip { position: relative; flex: 0 0 105px; border: 2px solid transparent; border-radius: 7px; padding: 4px; background: #fff; }
+    .frame-chip.active { border-color: var(--blue); }
+    .frame-chip img { height: 58px; }
+    .frame-chip span { display: block; padding-top: 4px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .studio-inspector { border-left: 1px solid #cdd6dc; }
+    .inspector-body { padding: 15px; }
+    .inspector-body h3 { margin: 20px 0 8px; font-size: 12px; }
+    .inspector-body h3:first-child { margin-top: 0; }
+    .field { margin: 0 0 12px; }
+    .field label { display: flex; justify-content: space-between; margin-bottom: 5px; color: #45515b; font-size: 12px; font-weight: 650; }
+    .field input[type=text], .field select { width: 100%; padding: 8px; border: 1px solid #bcc7ce; border-radius: 6px; background: #fff; }
+    .field input[type=range] { width: 100%; accent-color: var(--blue); }
+    .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px solid #e5eaed; }
+    .toggle { width: 33px; height: 19px; padding: 2px; border-radius: 99px; background: var(--blue); }
+    .toggle::after { content: ""; display: block; width: 15px; height: 15px; margin-left: 14px; border-radius: 50%; background: #fff; }
+
+    /* B — Case review: patient story first, images dominate. */
+    .review { min-height: 100vh; color: #202829; background: #f6f7f5; }
+    .review-header { display: flex; align-items: center; gap: 20px; height: 68px; padding: 0 32px; border-bottom: 1px solid #d9ddda; background: #fff; }
+    .review-logo { font-size: 17px; font-weight: 800; color: #244b45; }
+    .review-nav { display: flex; gap: 22px; color: #53615e; }
+    .review-nav b { color: #244b45; }
+    .review-user { margin-left: auto; }
+    .case-head { display: flex; align-items: flex-start; justify-content: space-between; padding: 28px 36px 24px; background: #e6efeb; }
+    .case-head h1 { margin: 0 0 7px; font-family: Georgia, serif; font-size: 28px; font-weight: 600; color: #183d37; }
+    .case-meta { display: flex; gap: 22px; color: #475c57; }
+    .review-actions { display: flex; gap: 8px; }
+    .review-grid { display: grid; grid-template-columns: 260px minmax(600px,1fr) 280px; gap: 22px; max-width: 1500px; margin: 0 auto; padding: 24px 32px 70px; }
+    .timeline h2, .review-side h2 { margin: 0 0 14px; font-size: 14px; }
+    .visit { position: relative; display: grid; grid-template-columns: 52px 1fr; gap: 10px; margin-left: 6px; padding: 0 0 18px 18px; border-left: 1px solid #b8c8c2; }
+    .visit::before { content: ""; position: absolute; top: 4px; left: -5px; width: 9px; height: 9px; border-radius: 50%; background: #418273; box-shadow: 0 0 0 4px #e9f0ed; }
+    .visit img { width: 52px; height: 48px; object-fit: cover; border-radius: 5px; }
+    .visit strong { display: block; font-size: 12px; }
+    .visit span { color: var(--muted); font-size: 11px; }
+    .review-canvas { align-self: start; }
+    .review-canvas-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .review-canvas-top h2 { margin: 0; font-size: 14px; }
+    .paper { display: grid; place-items: center; min-height: 560px; padding: 30px; border: 1px solid #d8ddda; background: #e3e7e4; }
+    .review-side { align-self: start; padding: 18px; border: 1px solid #d8ddda; border-radius: 9px; background: #fff; }
+    .review-side section { padding: 15px 0; border-top: 1px solid #e5e9e6; }
+    .review-side section:first-of-type { padding-top: 0; border-top: 0; }
+    .review-side dl { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin: 0; }
+    .review-side dt { color: var(--muted); }
+    .review-side dd { margin: 0; font-weight: 650; }
+    .review-side textarea { width: 100%; min-height: 92px; padding: 9px; resize: vertical; border: 1px solid #bdc7c2; border-radius: 6px; }
+    .review-side .primary { width: 100%; background: #296e5e; }
+
+    /* C — Guided workflow: fewer decisions at once. */
+    .guided { min-height: 100vh; background: #f4f6f9; }
+    .guided-header { height: 64px; display: flex; align-items: center; padding: 0 26px; color: #fff; background: #252c3a; }
+    .guided-header strong { font-size: 16px; }
+    .guided-header .quiet { margin-left: auto; color: #c6cbd4; }
+    .steps { display: flex; justify-content: center; gap: 0; padding: 20px 30px; border-bottom: 1px solid #dbe0e7; background: #fff; }
+    .step { display: flex; align-items: center; color: #7a8492; font-weight: 650; }
+    .step:not(:last-child)::after { content: ""; width: 70px; height: 1px; margin: 0 12px; background: #cdd3db; }
+    .step i { display: grid; place-items: center; width: 29px; height: 29px; margin-right: 8px; border: 1px solid #c5ccd5; border-radius: 50%; font-style: normal; }
+    .step.done { color: #236b59; }
+    .step.done i { color: #fff; border-color: #236b59; background: #236b59; }
+    .step.active { color: #273f7a; }
+    .step.active i { color: #fff; border-color: #3c5fa8; background: #3c5fa8; }
+    .guided-main { display: grid; grid-template-columns: minmax(650px,1fr) 320px; gap: 20px; max-width: 1450px; margin: 0 auto; padding: 22px 28px 80px; }
+    .guided-work { overflow: hidden; border: 1px solid #d9dfe7; border-radius: 10px; background: #fff; }
+    .guided-title { display: flex; align-items: center; padding: 14px 17px; border-bottom: 1px solid #e1e5eb; }
+    .guided-title h1 { margin: 0; font-size: 17px; }
+    .guided-title span { margin-left: 10px; }
+    .guided-title .secondary { margin-left: auto; }
+    .guided-stage { display: grid; place-items: center; height: 535px; padding: 26px; background: #e8ebef; }
+    .guided-frames { display: flex; gap: 10px; padding: 13px 16px; overflow: auto; border-top: 1px solid #d9dfe7; }
+    .guided-frame { flex: 0 0 132px; display: grid; grid-template-columns: 44px 1fr; gap: 7px; padding: 5px; border: 1px solid #d7dde5; border-radius: 7px; background: #fff; }
+    .guided-frame:first-child { border-color: #5474b4; box-shadow: 0 0 0 2px #d9e2f5; }
+    .guided-frame img { width: 44px; height: 42px; border-radius: 4px; object-fit: cover; }
+    .guided-frame strong, .guided-frame span { display: block; font-size: 10px; }
+    .guided-frame span { color: var(--muted); }
+    .task-panel { align-self: start; overflow: hidden; border: 1px solid #d9dfe7; border-radius: 10px; background: #fff; }
+    .task-panel header { padding: 18px; color: var(--ink); background: #fff; }
+    .task-panel h2 { margin: 0 0 5px; font-size: 17px; }
+    .task-panel header p { margin: 0; color: var(--muted); font-size: 12px; }
+    .task { display: grid; grid-template-columns: 26px 1fr; gap: 10px; padding: 14px 18px; border-top: 1px solid #e4e8ed; }
+    .task i { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; color: #fff; background: #2b8069; font-style: normal; font-size: 12px; }
+    .task.active i { background: #4569b0; }
+    .task strong { display: block; font-size: 13px; }
+    .task small { color: var(--muted); }
+    .task-controls { padding: 16px 18px; border-top: 1px solid #e4e8ed; background: #f8f9fb; }
+    .task-controls label { display: block; margin: 0 0 6px; font-size: 12px; font-weight: 650; }
+    .task-controls select { width: 100%; margin-bottom: 12px; padding: 9px; border: 1px solid #c5ccd6; border-radius: 6px; background: #fff; }
+    .task-controls .primary { width: 100%; background: #3e61a7; }
+  </style>
+</head>
+<body>
+  <div class="proto-note">PROTOTYPE — không lưu thay đổi</div>
+
+  {% if prototype_variant == 'A' %}
+  <main class="studio">
+    <header class="studio-top">
+      <div class="studio-brand">Before / After</div>
+      <div class="studio-patient"><span>‹ Bệnh nhân</span><strong>{{ patient.patient_id }} · {{ patient.name }}</strong><span>{{ patient.birth_year }}</span></div>
+      <div class="studio-status">● Đã lưu · phiên bản {{ comparison_set.version }}</div>
+      <button class="secondary">Xuất PNG / PDF</button>
+    </header>
+    <nav class="studio-tools" aria-label="Công cụ">
+      <button class="tool active"><b>↖</b>Chọn</button><button class="tool"><b>✋</b>Di chuyển</button><button class="tool"><b>⌕</b>Thu phóng</button><button class="tool"><b>⊞</b>Thêm ảnh</button><button class="tool"><b>▦</b>Bố cục</button>
+    </nav>
+    <aside class="studio-library">
+      <div class="panel-heading"><h2>Thư viện ảnh</h2><div class="quiet">{{ captures|length }} ảnh của bệnh nhân</div></div>
+      <div class="capture-list">
+      {% for capture in captures %}
+        <button class="capture-card{% if loop.first %} selected{% endif %}"><img src="{{ url_for('captures.preview', capture_pk=capture.id, set_id=comparison_set.id) }}" alt=""><span><strong>{{ capture.capture_date }}</strong>{{ capture.shot_type.name }}<br>Giữ và kéo vào canvas</span></button>
+      {% endfor %}
+      </div>
+    </aside>
+    <section class="studio-work">
+      <div class="canvas-bar"><span><strong>{{ comparison_set.name }}</strong> · A4 ngang</span><div class="zoom-controls"><button class="icon-button">−</button><span>72%</span><button class="icon-button">+</button><button class="icon-button">⊡</button></div></div>
+      <div class="canvas-stage"><img class="canvas-image" src="{{ url_for('exports.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Bản xem trước"></div>
+      <div class="filmstrip">
+      {% for frame in comparison_set.frames %}<button class="frame-chip{% if loop.first %} active{% endif %}"><img class="thumb" src="{{ url_for('captures.preview', capture_pk=frame.capture.id, set_id=comparison_set.id) }}" alt=""><span>{{ loop.index }}. {{ frame.label or frame.capture.capture_date }}</span></button>{% endfor %}
+      </div>
+    </section>
+    <aside class="studio-inspector">
+      <div class="panel-heading"><h2>Điều chỉnh Frame 1</h2><div class="quiet">Ảnh gốc không bị thay đổi</div></div>
+      <div class="inspector-body">
+        <h3>NỘI DUNG</h3><div class="field"><label>Nhãn ảnh</label><input type="text" value="{{ comparison_set.frames[0].label if comparison_set.frames else 'Visit 1' }}"></div>
+        <div class="toggle-row"><span>Hiện ngày chụp</span><span class="toggle"></span></div><div class="toggle-row"><span>Hiện Frame</span><span class="toggle"></span></div>
+        <h3>CẮT ẢNH</h3><div class="field"><label>Thu phóng <span>1.20×</span></label><input type="range" min="1" max="5" step=".01" value="1.2"></div><div class="field"><label>Trái / phải <span>0</span></label><input type="range" min="-1" max="1" step=".01" value="0"></div><div class="field"><label>Lên / xuống <span>0</span></label><input type="range" min="-1" max="1" step=".01" value="0"></div>
+        <h3>CANVAS</h3><div class="field"><label>Số cột</label><select><option>2 cột</option><option>3 cột</option></select></div><button class="primary" style="width:100%">Lưu thay đổi</button>
+      </div>
+    </aside>
+  </main>
+
+  {% elif prototype_variant == 'B' %}
+  <main class="review">
+    <header class="review-header"><div class="review-logo">Before / After Clinic</div><nav class="review-nav"><b>Bệnh nhân</b><span>Ảnh chụp</span><span>Bộ so sánh</span></nav><span class="review-user">Demo Admin ▾</span></header>
+    <section class="case-head"><div><h1>{{ comparison_set.name }}</h1><div class="case-meta"><strong>{{ patient.name }}</strong><span>Mã: {{ patient.patient_id }}</span><span>Năm sinh: {{ patient.birth_year }}</span><span class="badge"><i class="dot"></i>Đã xác nhận đồng thuận</span></div></div><div class="review-actions"><button class="secondary">Chỉnh bố cục</button><button class="primary" style="background:#296e5e">Xuất hồ sơ</button></div></section>
+    <div class="review-grid">
+      <aside class="timeline"><h2>Dòng thời gian chụp</h2>{% for frame in comparison_set.frames %}<div class="visit"><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id, set_id=comparison_set.id) }}" alt=""><div><strong>{{ frame.capture.capture_date }}</strong><span>{{ frame.capture.shot_type.name }}<br>{{ frame.label or 'Không có nhãn' }}</span></div></div>{% endfor %}<button class="secondary" style="width:100%">＋ Thêm lần chụp</button></aside>
+      <section class="review-canvas"><div class="review-canvas-top"><h2>So sánh tiến triển</h2><span class="quiet">Cập nhật lần cuối hôm nay · 10:42</span></div><div class="paper"><img class="canvas-image" src="{{ url_for('exports.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Bản so sánh"></div></section>
+      <aside class="review-side"><h2>Tóm tắt bộ ảnh</h2><section><dl><dt>Số ảnh</dt><dd>{{ comparison_set.frames|length }}</dd><dt>Bố cục</dt><dd>{{ comparison_set.columns }} cột</dd><dt>Khổ giấy</dt><dd>A4 ngang</dd><dt>Tỷ lệ Frame</dt><dd>{{ comparison_set.frame_ratio }}</dd></dl></section><section><h2>Ghi chú nội bộ</h2><textarea placeholder="Nhập nhận xét cho bộ ảnh…"></textarea></section><section><span class="badge"><i class="dot"></i>Sẵn sàng xuất</span><p class="quiet">Tất cả ảnh đều có ngày chụp và loại ảnh.</p><button class="primary">Xuất PNG / PDF</button></section></aside>
+    </div>
+  </main>
+
+  {% else %}
+  <main class="guided">
+    <header class="guided-header"><strong>Before / After</strong><span class="quiet">{{ patient.patient_id }} · {{ patient.name }}</span></header>
+    <nav class="steps" aria-label="Tiến trình"><span class="step done"><i>✓</i>Chọn bệnh nhân</span><span class="step done"><i>✓</i>Thêm ảnh</span><span class="step active"><i>3</i>Sắp xếp</span><span class="step"><i>4</i>Kiểm tra</span><span class="step"><i>5</i>Xuất file</span></nav>
+    <div class="guided-main">
+      <section class="guided-work"><div class="guided-title"><h1>{{ comparison_set.name }}</h1><span class="badge"><i class="dot"></i>Tự động lưu</span><button class="secondary">Xem toàn màn hình</button></div><div class="guided-stage"><img class="canvas-image" src="{{ url_for('exports.preview', set_pk=comparison_set.id) }}?version={{ comparison_set.version }}" alt="Bản so sánh"></div><div class="guided-frames">{% for frame in comparison_set.frames %}<button class="guided-frame"><img src="{{ url_for('captures.preview', capture_pk=frame.capture.id, set_id=comparison_set.id) }}" alt=""><span><strong>Ảnh {{ loop.index }}</strong>{{ frame.capture.capture_date }}</span></button>{% endfor %}<button class="guided-frame" style="place-items:center">＋ Thêm ảnh</button></div></section>
+      <aside class="task-panel"><header><h2>Bước 3: Sắp xếp ảnh</h2><p>Hoàn thành từng mục để tiếp tục xuất file.</p></header><div class="task"><i>✓</i><div><strong>Đã chọn 4 ảnh</strong><small>Đủ ảnh cho bố cục hiện tại</small></div></div><div class="task active"><i>3</i><div><strong>Chọn bố cục</strong><small>Ảnh được xếp theo ngày chụp</small></div></div><div class="task"><i>4</i><div><strong>Kiểm tra nhãn và crop</strong><small>Điều chỉnh từng Frame nếu cần</small></div></div><div class="task-controls"><label>Bố cục</label><select><option>2 × 2 — bốn ảnh</option><option>1 × 4 — dòng thời gian</option></select><label>Ngày chụp</label><select><option>Hiển thị dưới mỗi ảnh</option><option>Ẩn</option></select><button class="primary">Tiếp tục kiểm tra →</button></div></aside>
+    </div>
+  </main>
+  {% endif %}
+
+  {% set variant_names = {'A': 'Studio chỉnh ảnh', 'B': 'Hồ sơ tiến triển', 'C': 'Quy trình hướng dẫn'} %}
+  <div class="switcher" aria-label="Chọn phương án prototype"><button type="button" data-direction="-1" aria-label="Phương án trước">←</button><strong>{{ prototype_variant }} — {{ variant_names[prototype_variant] }}</strong><button type="button" data-direction="1" aria-label="Phương án sau">→</button></div>
+  <script>
+    (() => {
+      const variants = ["A", "B", "C"];
+      const current = "{{ prototype_variant }}";
+      const move = direction => {
+        const url = new URL(window.location.href);
+        url.searchParams.set("variant", variants[(variants.indexOf(current) + direction + variants.length) % variants.length]);
+        window.location.assign(url);
+      };
+      document.querySelectorAll("[data-direction]").forEach(button => button.addEventListener("click", () => move(Number(button.dataset.direction))));
+      document.addEventListener("keydown", event => {
+        if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable) return;
+        if (event.key === "ArrowLeft") move(-1);
+        if (event.key === "ArrowRight") move(1);
+      });
+      document.querySelectorAll(".capture-card, .frame-chip, .guided-frame").forEach(button => button.addEventListener("click", () => {
+        button.parentElement.querySelectorAll(".selected, .active").forEach(item => item.classList.remove("selected", "active"));
+        button.classList.add(button.classList.contains("capture-card") ? "selected" : "active");
+      }));
+    })();
+  </script>
+</body>
+</html>

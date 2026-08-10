@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-from flask import Blueprint, abort, flash, jsonify, redirect, render_template, request, url_for
+from flask import Blueprint, abort, current_app, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 from flask_wtf import FlaskForm
 from sqlalchemy import func, inspect, select, update
@@ -1199,11 +1199,23 @@ def new(patient_pk: int):
 @login_required
 def detail(set_pk: int, patient_pk: int | None = None):
     comparison_set = _route_set(set_pk, patient_pk)
+    captures = list_captures(comparison_set.patient)
+    if current_app.config.get("APP_ENV") == "development" and request.args.get("prototype") == "frontend":
+        variant = request.args.get("variant", "A").upper()
+        if variant not in {"A", "B", "C"}:
+            variant = "A"
+        return render_template(
+            "comparisons/detail_frontend_prototype.html",
+            comparison_set=comparison_set,
+            patient=comparison_set.patient,
+            captures=captures,
+            prototype_variant=variant,
+        )
     return render_template(
         "comparisons/detail.html",
         comparison_set=comparison_set,
         patient=comparison_set.patient,
-        captures=list_captures(comparison_set.patient),
+        captures=captures,
         frame_form=FrameForm(),
         **_detail_flags(comparison_set),
     )
