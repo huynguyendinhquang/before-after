@@ -34,6 +34,12 @@ flask --app app:create_app run
 # open http://127.0.0.1:5000/login
 ```
 
+`normalize_database_url` preserves the password in this normal in-process
+Flask/Alembic path, so the documented raw `DATABASE_URL` works without a
+`PGPASSFILE`. Native backup/restore child processes use a separate
+credential-free URL and a protected `PGPASSFILE`; they never receive the raw
+URL or password in argv/environment.
+
 Production keeps `SESSION_COOKIE_SECURE` enabled and must run behind HTTPS
 (the HTTPS deployment is part of Slice 8). Comparison Set preview and PNG/PDF
 export are versioned server-side; export is restricted to Admins/Editors,

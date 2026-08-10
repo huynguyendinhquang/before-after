@@ -6,9 +6,16 @@ set -euo pipefail
 DATABASE_NAME="${DATABASE_NAME:-before_after}"
 APP_OWNER="${APP_OWNER:-before_after}"
 PASSWORD_FILE="${BACKUP_DB_PASSWORD_FILE:-}"
+BACKUP_DB_HOST="${BACKUP_DB_HOST:-127.0.0.1}"
+BACKUP_DB_PORT="${BACKUP_DB_PORT:-5432}"
+BACKUP_HBA_SOURCE_CIDR="${BACKUP_HBA_SOURCE_CIDR:-127.0.0.1/32}"
+SECOND_DATABASE="${BACKUP_HBA_SECOND_DATABASE:-}"
 PSQL="${PSQL:-psql}"
+PG_DUMP="${PG_DUMP:-pg_dump}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SQL_TEMPLATE="$SCRIPT_DIR/postgres-backup-role.sql"
+HBA_VERIFIER="$SCRIPT_DIR/verify-postgres-backup-role.py"
 
 valid_identifier() {
     [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
@@ -30,8 +37,20 @@ if [[ ! -f "$SQL_TEMPLATE" || -L "$SQL_TEMPLATE" ]]; then
     echo "bootstrap-postgres-backup-role: SQL template is missing" >&2
     exit 2
 fi
+if [[ ! -f "$HBA_VERIFIER" || -L "$HBA_VERIFIER" ]]; then
+    echo "bootstrap-postgres-backup-role: HBA verifier is missing" >&2
+    exit 2
+fi
 if ! command -v "$PSQL" >/dev/null 2>&1; then
     echo "bootstrap-postgres-backup-role: psql is unavailable" >&2
+    exit 2
+fi
+if ! command -v "$PG_DUMP" >/dev/null 2>&1; then
+    echo "bootstrap-postgres-backup-role: pg_dump is unavailable" >&2
+    exit 2
+fi
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "bootstrap-postgres-backup-role: Python is unavailable" >&2
     exit 2
 fi
 
@@ -43,9 +62,8 @@ fi
 escaped_password=${password//\'/\'\'}
 
 # Ask the administrator connection for every non-template database that allows
-# connections. Each database gets its own revoke/check transaction; PUBLIC
-# CONNECT therefore never grants the backup role access to another database's
-# tables or schema.
+# connections. Each database gets its own role-specific revoke/check transaction;
+# actual database denial is proved separately by the ordered pg_hba rules.
 mapfile -t database_names < <(
     "$PSQL" --no-psqlrc --tuples-only --no-align --dbname "$DATABASE_NAME" \
         --set=ON_ERROR_STOP=1 \
@@ -53,6 +71,18 @@ mapfile -t database_names < <(
 )
 if [[ "${#database_names[@]}" -eq 0 ]]; then
     echo "bootstrap-postgres-backup-role: administrator cannot enumerate databases" >&2
+    exit 1
+fi
+
+if [[ -z "$SECOND_DATABASE" ]]; then
+    for database in "${database_names[@]}"; do
+        [[ -n "$database" && "$database" != "$DATABASE_NAME" ]] || continue
+        SECOND_DATABASE="$database"
+        break
+    done
+fi
+if [[ -z "$SECOND_DATABASE" || "$SECOND_DATABASE" == "$DATABASE_NAME" ]] || ! valid_identifier "$SECOND_DATABASE"; then
+    echo "bootstrap-postgres-backup-role: a distinct second database is required for HBA proof" >&2
     exit 1
 fi
 
@@ -87,3 +117,14 @@ trap cleanup EXIT
 printf "ALTER ROLE before_after_backup PASSWORD '%s';\n" "$escaped_password" >"$sql_file"
 "$PSQL" --no-psqlrc --dbname "$DATABASE_NAME" \
     --set=ON_ERROR_STOP=1 --file "$sql_file"
+
+"$PYTHON_BIN" "$HBA_VERIFIER" \
+    --production-database "$DATABASE_NAME" \
+    --second-database "$SECOND_DATABASE" \
+    --password-file "$PASSWORD_FILE" \
+    --host "$BACKUP_DB_HOST" \
+    --port "$BACKUP_DB_PORT" \
+    --source-cidr "$BACKUP_HBA_SOURCE_CIDR" \
+    --admin-database "$DATABASE_NAME" \
+    --psql "$PSQL" \
+    --pg-dump "$PG_DUMP"

@@ -45,8 +45,9 @@ if [[ -n "$configured_build_sha" && ! "$configured_build_sha" =~ ^[0-9a-f]{40}$ 
   exit 2
 fi
 
-# Canonicalize the route before starting pytest. The raw input may contain a
-# password, but no child process receives it; libpq gets a protected passfile.
+# Canonicalize the route before starting the ops/HBA children. The normal
+# in-process acceptance tests also retain the credentialed URL so Alembic can
+# prove its documented raw DATABASE_URL path.
 path_value="${PATH:-/usr/bin:/bin}"
 mapfile -t route_data < <(
   printf '%s' "$test_database_url" |
@@ -54,6 +55,7 @@ mapfile -t route_data < <(
 import sys
 from app.db import _pgpass_line, postgres_route
 route = postgres_route(sys.stdin.read())
+print(route.credential_free_url)
 print(route.sqlalchemy_url)
 if route._password is None:
     print("0")
@@ -67,12 +69,13 @@ if [[ "${#route_data[@]}" -lt 2 || -z "${route_data[0]}" ]]; then
   exit 2
 fi
 test_database_url="${route_data[0]}"
+normal_test_database_url="${route_data[1]}"
 gate_pgpass=$(mktemp /tmp/before-after-fixed-gate-pgpass.XXXXXX)
 chmod 600 -- "$gate_pgpass"
 cleanup_pgpass() { rm -f -- "$gate_pgpass"; }
 trap cleanup_pgpass EXIT
-if [[ "${route_data[1]}" == 1 ]]; then
-  printf '%s\n' "${route_data[2]}" >"$gate_pgpass"
+if [[ "${route_data[2]}" == 1 ]]; then
+  printf '%s\n' "${route_data[3]}" >"$gate_pgpass"
 elif [[ -n "$source_passfile" && -f "$source_passfile" && ! -L "$source_passfile" ]]; then
   cp -- "$source_passfile" "$gate_pgpass"
   chmod 600 -- "$gate_pgpass"
@@ -138,9 +141,18 @@ umask "$old_umask"
 DAC_PROOF_MARKER="$dac_proof" ./scripts/test-dac.sh
 export DAC_PROOF_MARKER="$dac_proof"
 
+if [[ -n "${POSTGRES_HBA_DOCKER_CONTAINER:-}" ]]; then
+  POSTGRES_HBA_DOCKER_CONTAINER="$POSTGRES_HBA_DOCKER_CONTAINER" \
+    TEST_DATABASE_URL="$test_database_url" \
+    PYTHON_BIN="$PYTHON_BIN" \
+    ./scripts/test-postgres-hba.sh
+fi
+
 # Build a clean allowlist rather than trying to remember every pytest/Python
 # injection variable. In particular no FIXED_GATE_*, BUILD_SHA, EVIDENCE_*,
-# PYTEST_PLUGINS, PYTHONPATH, or ambient PG* variable reaches pytest.
+# PYTEST_PLUGINS, PYTHONPATH, or ambient PG* variable reaches pytest. The
+# credentialed URL is intentional here: these are normal in-process Flask and
+# Alembic tests, not ops child processes.
 PATH_VALUE="${PATH:-/usr/bin:/bin}"
 HOME_VALUE="${HOME:-/tmp}"
 env -i \
@@ -150,8 +162,8 @@ env -i \
   LC_ALL="${LC_ALL:-C}" \
   PYTHONNOUSERSITE=1 \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  TEST_DATABASE_URL="$test_database_url" \
-  DATABASE_URL="$test_database_url" \
+  TEST_DATABASE_URL="$normal_test_database_url" \
+  DATABASE_URL="$normal_test_database_url" \
   PGPASSFILE="$gate_pgpass" \
   DAC_PROOF_MARKER="$dac_proof" \
   "$PYTHON_BIN" -m pytest \

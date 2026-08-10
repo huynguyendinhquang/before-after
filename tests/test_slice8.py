@@ -192,6 +192,22 @@ def test_backup_role_sql_is_database_scoped_and_read_only() -> None:
     assert "NOCREATEDB" in sql and "NOCREATEROLE" in sql and "NOINHERIT" in sql
     assert "ALTER DEFAULT PRIVILEGES" in sql
     assert "NOT datistemplate" in helper and "is_target" in helper
+    assert "default_transaction_read_only" in sql
+    assert "REVOKE TEMPORARY ON DATABASE" not in sql
+    assert "REVOKE CREATE ON SCHEMA" not in sql
+
+
+def test_backup_role_hba_template_is_ordered_and_database_scoped() -> None:
+    root = Path(__file__).resolve().parents[1]
+    template = (root / "deploy/postgres-backup-role.pg_hba.conf.template").read_text(encoding="ascii")
+    rules = [line.split() for line in template.splitlines() if line and not line.startswith("#")]
+    assert rules == [
+        ["local", "__PRODUCTION_DATABASE__", "before_after_backup", "scram-sha-256"],
+        ["local", "all", "before_after_backup", "reject"],
+        ["host", "__PRODUCTION_DATABASE__", "before_after_backup", "__BACKUP_SERVICE_CIDR__", "scram-sha-256"],
+        ["host", "all", "before_after_backup", "0.0.0.0/0", "reject"],
+        ["host", "all", "before_after_backup", "::/0", "reject"],
+    ]
 
 
 def test_inherited_backup_lock_fd_is_upgraded_and_contention_fails(
@@ -986,6 +1002,22 @@ def shutil_which(command: str) -> str | None:
     import shutil
 
     return shutil.which(command)
+
+
+@pytest.mark.postgres
+def test_alembic_upgrade_accepts_raw_database_url_without_pgpassfile(
+    postgres_restore_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    raw_url = postgres_restore_fixture["database_url"]
+    if "://" not in raw_url or "@" not in raw_url.split("://", 1)[1]:
+        pytest.fail("the PostgreSQL raw-URL certification test requires a password URL")
+    monkeypatch.setenv("DATABASE_URL", raw_url)
+    monkeypatch.delenv("PGPASSFILE", raising=False)
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.upgrade(config, "head")
 
 
 @pytest.mark.postgres
@@ -1836,7 +1868,7 @@ def test_postgres_route_rejects_relative_or_traversing_query_socket_hosts() -> N
             postgres_route(f"postgresql:///clinic?host={host}")
 
 
-def test_create_app_strips_raw_database_password_before_engine_use(
+def test_create_app_and_normalize_preserve_raw_database_password_for_in_process_use(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from app import create_app
@@ -1851,10 +1883,24 @@ def test_create_app_strips_raw_database_password_before_engine_use(
             "SECRET_KEY": "create-app-route-test",
         }
     )
-    assert "child-secret" not in application.config["DATABASE_URL"]
-    assert "child-secret" not in os.environ["DATABASE_URL"]
-    assert "child-secret" not in os.environ["PGPASSFILE"]
-    assert Path(os.environ["PGPASSFILE"]).read_text(encoding="ascii").endswith("child-secret\n")
+    assert "child-secret" in application.config["DATABASE_URL"]
+    assert os.environ["DATABASE_URL"] == "postgresql://user:child-secret@127.0.0.1/clinic"
+    assert "PGPASSFILE" not in os.environ
+
+
+def test_ops_child_environment_uses_credential_free_url_and_pgpassfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.db import credential_free_database_url, ops_postgres_environment
+
+    raw = "postgresql://user:child-secret@127.0.0.1/clinic"
+    monkeypatch.delenv("PGPASSFILE", raising=False)
+    environment = ops_postgres_environment(raw, base={"DATABASE_URL": raw, "PGSERVICE": "wrong"})
+    assert credential_free_database_url(raw) == environment["DATABASE_URL"]
+    assert "child-secret" not in environment["DATABASE_URL"]
+    assert "PGSERVICE" not in environment
+    assert "PGPASSWORD" not in environment
+    assert Path(environment["PGPASSFILE"]).read_text(encoding="ascii").endswith("child-secret\n")
 
 
 def test_postgres_route_is_single_and_clears_inherited_routing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1876,7 +1922,7 @@ def test_postgres_route_is_single_and_clears_inherited_routing(monkeypatch: pyte
     assert environment["PGTARGETSESSIONATTRS"] == kwargs["target_session_attrs"] == "any"
     assert "PGSERVICE" not in environment
     assert "PGSERVICEFILE" not in environment
-    assert environment["DATABASE_URL"] == route.sqlalchemy_url
+    assert environment["DATABASE_URL"] == route.credential_free_url
 
     for ambiguous in (
         "postgresql://user:secret@db-one,db-two/clinic",

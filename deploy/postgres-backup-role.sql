@@ -22,6 +22,37 @@ ALTER ROLE before_after_backup
     NOREPLICATION
     NOBYPASSRLS
     NOINHERIT;
+ALTER ROLE before_after_backup SET default_transaction_read_only = on;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_roles
+        WHERE rolname = 'before_after_backup'
+          AND (
+              NOT rolcanlogin
+              OR rolsuper
+              OR rolcreatedb
+              OR rolcreaterole
+              OR rolreplication
+              OR rolbypassrls
+              OR rolinherit
+          )
+    ) THEN
+        RAISE EXCEPTION 'before_after_backup role attributes are not least privilege';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_roles AS role
+        CROSS JOIN LATERAL unnest(COALESCE(role.rolconfig, ARRAY[]::text[])) AS setting
+        WHERE role.rolname = 'before_after_backup'
+          AND setting = 'default_transaction_read_only=on'
+    ) THEN
+        RAISE EXCEPTION 'before_after_backup is not default_transaction_read_only';
+    END IF;
+END
+$$;
 
 -- Remove every inherited membership. A membership that survives is a
 -- provisioning failure, never an acceptable way to grant backup access.
@@ -65,13 +96,15 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'before_after_backup owns an object; transfer ownership before provisioning';
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = role_oid) THEN
+        RAISE EXCEPTION 'before_after_backup owns a database; transfer ownership before provisioning';
+    END IF;
 END
 $$;
 
--- Clear every explicit grant to the role in this database. PUBLIC CREATE and
--- TEMPORARY are removed too, so PUBLIC CONNECT cannot become a write/DDL path.
+-- Clear every explicit grant to the role in this database. Do not change
+-- PUBLIC ACLs here: database isolation is enforced by ordered pg_hba rules.
 REVOKE ALL PRIVILEGES ON DATABASE :"database_name" FROM before_after_backup;
-REVOKE TEMPORARY ON DATABASE :"database_name" FROM PUBLIC;
 
 DO $$
 DECLARE
@@ -88,7 +121,6 @@ BEGIN
         EXECUTE format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I', schema_name, 'before_after_backup');
         EXECUTE format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM %I', schema_name, 'before_after_backup');
         EXECUTE format('REVOKE ALL PRIVILEGES ON ALL PROCEDURES IN SCHEMA %I FROM %I', schema_name, 'before_after_backup');
-        EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC', schema_name);
     END LOOP;
 END
 $$;
@@ -151,10 +183,15 @@ $$;
     GRANT USAGE ON SCHEMA public TO before_after_backup;
     GRANT SELECT ON ALL TABLES IN SCHEMA public TO before_after_backup;
     GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO before_after_backup;
+    -- SECURITY DEFINER routines can mutate through their owner. Remove their
+    -- default PUBLIC EXECUTE only in this target database.
+    REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA public FROM PUBLIC;
     ALTER DEFAULT PRIVILEGES FOR ROLE :"app_owner" IN SCHEMA public
         GRANT SELECT ON TABLES TO before_after_backup;
     ALTER DEFAULT PRIVILEGES FOR ROLE :"app_owner" IN SCHEMA public
         GRANT SELECT ON SEQUENCES TO before_after_backup;
+    ALTER DEFAULT PRIVILEGES FOR ROLE :"app_owner" IN SCHEMA public
+        REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
 \endif
 
 -- Verify the effective boundary, including PUBLIC and any future stale ACL.
@@ -197,6 +234,17 @@ BEGIN
                     RAISE EXCEPTION 'backup role has unsafe % privilege on %.%', privilege_name, object_row.nspname, object_row.relname;
                 END IF;
             END LOOP;
+        END LOOP;
+        FOR object_row IN
+            SELECT p.oid, n.nspname, p.proname
+            FROM pg_proc AS p
+            JOIN pg_namespace AS n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.prosecdef
+        LOOP
+            IF has_function_privilege('before_after_backup', object_row.oid, 'EXECUTE') THEN
+                RAISE EXCEPTION 'backup role can EXECUTE SECURITY DEFINER routine %.%', object_row.nspname, object_row.proname;
+            END IF;
         END LOOP;
     ELSE
         FOR object_row IN

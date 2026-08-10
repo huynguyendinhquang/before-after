@@ -28,7 +28,7 @@ import time
 from typing import Callable, Iterator
 import uuid
 
-from app.db import postgres_route, sanitized_postgres_environment
+from app.db import postgres_route, ops_postgres_environment, credential_free_database_url
 
 
 GENERATION_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$")
@@ -345,7 +345,7 @@ def _validate_backup_storage(
 
 def _native_postgres_url(value: object) -> str:
     try:
-        return postgres_route(value).sqlalchemy_url
+        return credential_free_database_url(value)
     except RuntimeError as exc:
         raise OpsError(str(exc)) from exc
 
@@ -368,7 +368,7 @@ def _postgres_environment(value: str, *, base: dict[str, str] | None = None) -> 
     try:
         route = postgres_route(value)
         settings = dict(route.environment())
-        environment = sanitized_postgres_environment(
+        environment = ops_postgres_environment(
             value,
             base=base,
             include_database_url=False,

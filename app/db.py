@@ -54,9 +54,10 @@ _ROUTING_QUERY_KEYS = frozenset({"host", "hostaddr", "port", "target_session_att
 
 @dataclass(frozen=True)
 class PostgresRoute:
-    """One credential-free route shared by SQLAlchemy, psycopg, and libpq."""
+    """One canonical route with explicit normal and credential-free URLs."""
 
     sqlalchemy_url: str
+    credential_free_url: str
     settings: tuple[tuple[str, str], ...]
     connect_kwargs: tuple[tuple[str, str], ...]
     _password: str | None = field(default=None, repr=False, compare=False)
@@ -239,7 +240,11 @@ def _route(value: object) -> PostgresRoute:
             kwargs[key] = setting
 
     username = quote(user, safe="") if user is not None else ""
-    userinfo = f"{username}@" if user is not None and authority_host is not None else ""
+    encoded_password = quote(password, safe="") if password is not None else ""
+    if authority_host is not None and (user is not None or password is not None):
+        userinfo = f"{username}:{encoded_password}@" if password is not None else f"{username}@"
+    else:
+        userinfo = ""
     if authority_host is None:
         netloc = ""
     else:
@@ -252,6 +257,8 @@ def _route(value: object) -> PostgresRoute:
         canonical_query.append(("host", query_host))
     if authority_host is None and user is not None:
         canonical_query.append(("user", user))
+    if authority_host is None and password is not None:
+        canonical_query.append(("password", password))
     if query_hostaddr is not None:
         canonical_query.append(("hostaddr", query_hostaddr))
     if authority_host is None:
@@ -262,23 +269,43 @@ def _route(value: object) -> PostgresRoute:
             canonical_query.append((key, setting))
     canonical_query.append(("target_session_attrs", "any"))
     encoded_database = quote(database, safe="")
-    query_string = urlencode(canonical_query)
-    if authority_host is None:
-        # urlunsplit emits scheme:/path for an empty netloc. SQLAlchemy needs
-        # the authority-less PostgreSQL form with three slashes instead.
-        canonical = f"postgresql+psycopg:///{encoded_database}?{query_string}"
-    else:
-        canonical = urlunsplit(
+    def build_url(*, include_password: bool) -> str:
+        query_values = list(canonical_query)
+        if not include_password and password is not None:
+            query_values = [item for item in query_values if item[0] != "password"]
+        query_string = urlencode(query_values)
+        if authority_host is None:
+            # urlunsplit emits scheme:/path for an empty netloc. SQLAlchemy needs
+            # the authority-less PostgreSQL form with three slashes instead.
+            query_values = [item for item in query_values if item[0] not in {"user", "password"}]
+            query_string = urlencode(query_values)
+            if user is not None or (include_password and password is not None):
+                socket_userinfo = username
+                if include_password and password is not None:
+                    socket_userinfo += ":" + encoded_password
+                socket_userinfo += "@"
+            else:
+                socket_userinfo = ""
+            return f"postgresql+psycopg://{socket_userinfo}/{encoded_database}?{query_string}"
+        credentialed_netloc = netloc
+        if not include_password and password is not None:
+            credentialed_userinfo = f"{username}@" if user is not None else ""
+            credentialed_netloc = f"{credentialed_userinfo}{authority_name}:{port}"
+        return urlunsplit(
             (
                 "postgresql+psycopg",
-                netloc,
+                credentialed_netloc,
                 "/" + encoded_database,
                 query_string,
                 "",
             )
         )
+
+    canonical = build_url(include_password=True)
+    credential_free = build_url(include_password=False)
     return PostgresRoute(
         sqlalchemy_url=canonical,
+        credential_free_url=credential_free,
         settings=tuple(sorted(settings.items())),
         connect_kwargs=tuple(sorted(kwargs.items())),
         _password=password,
@@ -292,6 +319,11 @@ def postgres_route(value: object) -> PostgresRoute:
 
 def normalize_database_url(value: object) -> str:
     return postgres_route(value).sqlalchemy_url
+
+
+def credential_free_database_url(value: object) -> str:
+    """Return the URL safe for native-ops child processes."""
+    return postgres_route(value).credential_free_url
 
 
 def _pgpass_escape(value: str) -> str:
@@ -359,14 +391,14 @@ def _cleanup_ephemeral_passfiles() -> None:
 atexit.register(_cleanup_ephemeral_passfiles)
 
 
-def sanitized_postgres_environment(
+def ops_postgres_environment(
     value: object,
     *,
     base: dict[str, str] | None = None,
     include_database_url: bool = True,
     create_passfile: bool = True,
 ) -> dict[str, str]:
-    """Return child settings with a credential-free URL and no PGPASSWORD."""
+    """Return native-ops child settings with a protected password file."""
     route = postgres_route(value)
     source = dict(os.environ if base is None else base)
     existing_passfile = source.get("PGPASSFILE")
@@ -377,7 +409,7 @@ def sanitized_postgres_environment(
     }
     environment.update(route.environment())
     if include_database_url:
-        environment["DATABASE_URL"] = route.sqlalchemy_url
+        environment["DATABASE_URL"] = route.credential_free_url
     if route._password is not None and create_passfile:
         inherited = _inherited_pgpass(existing_passfile)
         passfile = _write_pgpass(route, inherited=inherited)
@@ -387,6 +419,22 @@ def sanitized_postgres_environment(
         environment["PGPASSFILE"] = existing_passfile
     environment.pop("PGPASSWORD", None)
     return environment
+
+
+def sanitized_postgres_environment(
+    value: object,
+    *,
+    base: dict[str, str] | None = None,
+    include_database_url: bool = True,
+    create_passfile: bool = True,
+) -> dict[str, str]:
+    """Backward-compatible alias for the ops child environment."""
+    return ops_postgres_environment(
+        value,
+        base=base,
+        include_database_url=include_database_url,
+        create_passfile=create_passfile,
+    )
 
 
 @contextmanager
@@ -401,7 +449,7 @@ def scoped_postgres_environment(value: object):
     passfile: Path | None = None
     if route._password is not None:
         passfile = _write_pgpass(route)
-    environment = sanitized_postgres_environment(
+    environment = ops_postgres_environment(
         value,
         base=previous,
         create_passfile=False,

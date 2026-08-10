@@ -51,11 +51,13 @@ CHECK_COMMANDS = {
         'for script in "$@"; do bash -n "$script" || exit; done',
         "bash",
         "deploy/bootstrap.sh",
+        "deploy/bootstrap-postgres-backup-role.sh",
         "ops/backup.sh",
         "deploy/normalize-media-permissions.sh",
         "deploy/verify-permissions.sh",
         "scripts/test-dac.sh",
         "scripts/test-postgres.sh",
+        "scripts/test-postgres-hba.sh",
     ],
     "python_compile": [sys.executable, "-m", "compileall", "-q", "app", "deploy", "migrations", "ops", "tests"],
 }

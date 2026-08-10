@@ -110,12 +110,34 @@ sudoedit /etc/before-after/before-after-backup.env
 # Add the protected libpq entry to before-after-backup.pgpass:
 # 127.0.0.1:5432:before_after:before_after_backup:<backup-password>
 sudoedit /etc/before-after/before-after-backup.pgpass
+# Install the HBA isolation block before any general local/host rules. The
+# template is a snippet, not a replacement for the cluster's existing rules.
+export DATABASE_NAME=before_after BACKUP_HBA_SOURCE_CIDR=127.0.0.1/32
+template=/opt/before-after/deploy/postgres-backup-role.pg_hba.conf.template
+hba_file=$(sudo -u postgres psql --no-psqlrc --tuples-only --no-align \
+  --dbname "$DATABASE_NAME" --command 'SHOW hba_file' | tr -d '[:space:]')
+sudo cp -- "$hba_file" "$hba_file.before-after-backup.previous"
+rendered_hba=$(mktemp /tmp/before-after-pg-hba.XXXXXX)
+sed -e "s|__PRODUCTION_DATABASE__|$DATABASE_NAME|g" \
+  -e "s|__BACKUP_SERVICE_CIDR__|$BACKUP_HBA_SOURCE_CIDR|g" \
+  "$template" > "$rendered_hba"
+sudo sh -c 'cat "$1" "$2" > "$2.tmp" && install -o postgres -g postgres -m 0640 "$2.tmp" "$2" && rm -f "$2.tmp"' \
+  sh "$rendered_hba" "$hba_file"
+rm -f "$rendered_hba"
+sudo -u postgres psql --no-psqlrc --dbname "$DATABASE_NAME" \
+  --command 'SELECT pg_reload_conf()'
+
 # Create the dedicated read-only PostgreSQL role as an administrator. The
-# helper reads the password from a mode-0600 file, not from argv.
+# helper reads the password from a mode-0600 file, not from argv, and refuses
+# completion unless pg_hba_file_rules plus live target/denial tests pass.
 export BACKUP_DB_PASSWORD_FILE=/var/lib/postgresql/before-after-backup.password
 sudo install -o postgres -g postgres -m 0600 /dev/null "$BACKUP_DB_PASSWORD_FILE"
 sudoedit "$BACKUP_DB_PASSWORD_FILE"
-sudo -u postgres env BACKUP_DB_PASSWORD_FILE="$BACKUP_DB_PASSWORD_FILE" \
+sudo -u postgres env \
+  DATABASE_NAME="$DATABASE_NAME" \
+  BACKUP_DB_HOST=127.0.0.1 BACKUP_DB_PORT=5432 \
+  BACKUP_HBA_SOURCE_CIDR="$BACKUP_HBA_SOURCE_CIDR" \
+  BACKUP_DB_PASSWORD_FILE="$BACKUP_DB_PASSWORD_FILE" \
   /opt/before-after/deploy/bootstrap-postgres-backup-role.sh
 sudo rm -f "$BACKUP_DB_PASSWORD_FILE"
 
@@ -139,9 +161,13 @@ The backup service runs as `before-after-backup` and connects with the
 That role is scoped to the production database and receives only CONNECT,
 public-schema USAGE, and SELECT on current tables/sequences plus matching
 future defaults; it has no write, ownership, role-management, or
-database-creation privileges. Verify
-with `pg_dump` and explicitly test that DELETE and DDL fail before enabling
-production backups. Only its `ExecStartPre`/`ExecStopPost` commands stop and
+database-creation privileges. PostgreSQL ACLs cannot deny the CONNECT granted
+through `PUBLIC`, so the ordered HBA block is part of the security boundary.
+The bootstrap helper reads `pg_hba_file_rules`, connects as the backup role to
+the production database, runs `pg_dump`, and confirms that a second database
+is rejected; it refuses completion if any proof fails. Verify
+with `pg_dump` and explicitly test that DELETE, DDL, and SECURITY DEFINER
+mutation fail before enabling production backups. Only its `ExecStartPre`/`ExecStopPost` commands stop and
 start the app; the Python backup process never runs as root. Gunicorn holds a shared flock on the
 persistent media lock for its whole lifetime. `ops/backup.sh` takes the same
 lock exclusively before checking `systemctl is-active`, and keeps it through
@@ -349,8 +375,17 @@ docker run --detach --rm --name before-after-postgres-test \
 trap 'docker rm --force before-after-postgres-test >/dev/null 2>&1 || true' EXIT
 until docker exec before-after-postgres-test pg_isready -U postgres -d before_after_test >/dev/null; do sleep 1; done
 export TEST_DATABASE_URL=postgresql+psycopg://postgres:test@127.0.0.1:55433/before_after_test
-POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python ./scripts/test-postgres.sh
+POSTGRES_HBA_DOCKER_CONTAINER=before-after-postgres-test \
+  POSTGRES_CLIENT_MAJOR=16 PYTHON_BIN=/opt/before-after/.venv/bin/python \
+  ./scripts/test-postgres.sh
 ```
+
+When `POSTGRES_HBA_DOCKER_CONTAINER` is set, the fixed gate temporarily
+prepends the rendered `pg_hba.conf` block, reloads the PostgreSQL 16 cluster,
+creates a disposable second database, and proves target connection/`pg_dump`
+success plus second-database rejection. It always restores the original HBA
+file on exit. Do not declare the PostgreSQL certification gate complete
+without this HBA invocation.
 
 `test-postgres.sh` fails closed when a native client major or Docker DAC proof
 is unavailable; no mandatory PostgreSQL test is converted into a skip. The
@@ -419,9 +454,10 @@ The acceptance tests use an injected storage policy only for their same-device
 temporary test directory; production policy is never bypassed. Also run:
 
 ```bash
-bash -n deploy/bootstrap.sh ops/backup.sh deploy/normalize-media-permissions.sh \
-  deploy/verify-permissions.sh scripts/test-dac.sh scripts/test-postgres.sh
-python3 -m compileall -q app migrations ops tests
+bash -n deploy/bootstrap.sh deploy/bootstrap-postgres-backup-role.sh ops/backup.sh \
+  deploy/normalize-media-permissions.sh deploy/verify-permissions.sh \
+  scripts/test-dac.sh scripts/test-postgres.sh scripts/test-postgres-hba.sh
+python3 -m compileall -q app deploy migrations ops tests
 sudo systemd-analyze verify /etc/systemd/system/before-after*.service \
   /etc/systemd/system/before-after-backup.timer
 ```

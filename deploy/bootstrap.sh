@@ -216,7 +216,7 @@ run_as_app() {
 import sys
 from app.db import _pgpass_line, postgres_route
 route = postgres_route(sys.stdin.read())
-print(route.sqlalchemy_url)
+print(route.credential_free_url)
 if route._password is None:
     print("0")
 else:

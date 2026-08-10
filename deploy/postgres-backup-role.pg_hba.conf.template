@@ -1,0 +1,16 @@
+# before-after backup role isolation. Render the two placeholders and install
+# these lines before every general/local rule in pg_hba.conf.
+#
+# __PRODUCTION_DATABASE__ is the one production database.
+# __BACKUP_SERVICE_CIDR__ is the exact address of the backup service (for a
+# same-host service this is normally 127.0.0.1/32; use a separately rendered
+# IPv6 block only when the service actually connects over IPv6).
+#
+# The local rule is intentionally followed immediately by its database-wide
+# reject. The host allow is immediately followed by rejects for every other
+# host source. PostgreSQL uses the first matching rule.
+local   __PRODUCTION_DATABASE__  before_after_backup  scram-sha-256
+local   all                      before_after_backup  reject
+host    __PRODUCTION_DATABASE__  before_after_backup  __BACKUP_SERVICE_CIDR__  scram-sha-256
+host    all                      before_after_backup  0.0.0.0/0                reject
+host    all                      before_after_backup  ::/0                     reject

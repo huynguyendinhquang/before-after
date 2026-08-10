@@ -19,7 +19,7 @@ from app.captures import captures_bp
 from app.comparisons import comparisons_bp
 from app.exports import exports_bp
 from app.lifecycle import lifecycle_bp
-from app.db import db, postgres_route, sanitized_postgres_environment
+from app.db import db, postgres_route
 from app.image_policy import configured_request_limit
 from app.models import Capture, Export
 from app.patients import patients_bp
@@ -52,32 +52,6 @@ def _trusted_proxy_count(value: object) -> int:
 def _validate_configuration(app: Flask) -> None:
     database_url = app.config.get("DATABASE_URL") or app.config.get("SQLALCHEMY_DATABASE_URI")
     route = postgres_route(database_url)
-    if route._password is not None:
-        app_environment = sanitized_postgres_environment(database_url, base=os.environ)
-        passfile = app_environment.get("PGPASSFILE")
-        if passfile:
-            engine_options = dict(app.config.get("SQLALCHEMY_ENGINE_OPTIONS") or {})
-            connect_args = dict(engine_options.get("connect_args") or {})
-            connect_args["passfile"] = passfile
-            engine_options["connect_args"] = connect_args
-            app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_options
-        environment = app_environment
-        ambient_database_url = os.environ.get("DATABASE_URL")
-        if ambient_database_url and ambient_database_url != database_url:
-            try:
-                environment = sanitized_postgres_environment(ambient_database_url, base=os.environ)
-            except RuntimeError:
-                pass
-        for key in tuple(os.environ):
-            if key.startswith("PG") or key == "DATABASE_URL":
-                os.environ.pop(key, None)
-        os.environ.update(
-            {
-                key: value
-                for key, value in environment.items()
-                if key.startswith("PG") or key == "DATABASE_URL"
-            }
-        )
     database_url = route.sqlalchemy_url
     media_root = _required_text(app.config, "MEDIA_ROOT")
     secret_key = _required_text(app.config, "SECRET_KEY")
