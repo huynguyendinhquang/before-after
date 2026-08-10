@@ -61,6 +61,16 @@ def _validate_configuration(app: Flask) -> None:
             connect_args["passfile"] = passfile
             engine_options["connect_args"] = connect_args
             app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_options
+        for key in tuple(os.environ):
+            if key.startswith("PG") or key == "DATABASE_URL":
+                os.environ.pop(key, None)
+        os.environ.update(
+            {
+                key: value
+                for key, value in environment.items()
+                if key.startswith("PG") or key == "DATABASE_URL"
+            }
+        )
     database_url = route.sqlalchemy_url
     media_root = _required_text(app.config, "MEDIA_ROOT")
     secret_key = _required_text(app.config, "SECRET_KEY")

@@ -8,6 +8,7 @@ import atexit
 import ipaddress
 import os
 from pathlib import Path
+import stat
 import tempfile
 from urllib.parse import parse_qs, quote, urlencode, unquote, urlsplit, urlunsplit
 
@@ -309,12 +310,31 @@ def _pgpass_line(route: PostgresRoute) -> str:
     )
 
 
-def _write_pgpass(route: PostgresRoute) -> Path:
+def _inherited_pgpass(path_value: str | None) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.geteuid()
+        ):
+            return ""
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _write_pgpass(route: PostgresRoute, *, inherited: str = "") -> Path:
     try:
         descriptor, filename = tempfile.mkstemp(prefix="before-after-pgpass-")
         path = Path(filename)
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            if inherited:
+                stream.write(inherited.rstrip("\n") + "\n")
             stream.write(_pgpass_line(route) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -359,7 +379,8 @@ def sanitized_postgres_environment(
     if include_database_url:
         environment["DATABASE_URL"] = route.sqlalchemy_url
     if route._password is not None and create_passfile:
-        passfile = _write_pgpass(route)
+        inherited = _inherited_pgpass(existing_passfile)
+        passfile = _write_pgpass(route, inherited=inherited)
         _EPHEMERAL_PASSFILES.add(passfile)
         environment["PGPASSFILE"] = str(passfile)
     elif existing_passfile and route._password is None:
